@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <data name="PluginDescription" xml:space="preserve"><value>安全擷取本機 STRM 檔案的媒體資訊，並準備短期重新導向。</value></data>
+  <data name="EditorTitle" xml:space="preserve"><value>STRM 橋接</value></data>
+  <data name="EditorDescription" xml:space="preserve"><value>安全擷取技術媒體資訊，並可選提供短期重新導向播放來源。</value></data>
+  <data name="Enabled" xml:space="preserve"><value>啟用外掛程式</value></data>
+  <data name="EnablePlaybackSource" xml:space="preserve"><value>啟用 STRM Bridge 播放</value></data>
+  <data name="EnablePlaybackSourceDescription" xml:space="preserve"><value>預設啟用。關閉後外掛程式只擷取媒體資訊，伺服器及用戶端仍使用原始 STRM 來源。</value></data>
+  <data name="ExtractAfterLibraryScan" xml:space="preserve"><value>媒體庫掃描後擷取</value></data>
+  <data name="OnlyMissingMediaInfo" xml:space="preserve"><value>僅擷取缺少的媒體資訊</value></data>
+  <data name="OnlyMissingMediaInfoDescription" xml:space="preserve"><value>啟用時略過未變更且完整的技術資訊，並可用相符快照還原缺少的資料；播放分類仍可能執行一次不呼叫 FFmpeg 的僅回應標頭檢查。關閉時重新探測所有已選 STRM，並取代原快照。</value></data>
+  <data name="EnablePersistence" xml:space="preserve"><value>保存媒體資訊</value></data>
+  <data name="MaximumExtractionConcurrency" xml:space="preserve"><value>最大擷取並行數</value></data>
+  <data name="ExtractionTimeoutSeconds" xml:space="preserve"><value>單項逾時（秒）</value></data>
+  <data name="IncludedLibraryIds" xml:space="preserve"><value>參與處理的媒體庫</value></data>
+  <data name="IncludedLibraryIdsDescription" xml:space="preserve"><value>可多選一個或多個 Emby 媒體庫；留空表示不處理任何媒體庫。</value></data>
+  <data name="DetectedRedirectHosts" xml:space="preserve"><value>偵測到的重新導向主機</value></data>
+  <data name="DetectedRedirectHostsDescription" xml:space="preserve"><value>提示：僅選擇你信任的待確認主機並儲存；已信任的偵測結果會繼續顯示並標記，新增信任儲存後會自動重試等待處理的媒體。也可在下方手動輸入精確主機名稱，或使用 *.example.com 明確信任其全部子網域。不會保留完整 URL、路徑或查詢參數；可辨識的長查詢值在進入偵測清單前會被拒絕。</value></data>
+  <data name="TrustedHostSuffix" xml:space="preserve"><value>（已信任）</value></data>
+  <data name="AllowedRedirectHosts" xml:space="preserve"><value>額外信任的重新導向主機</value></data>
+  <data name="AllowedRedirectHostsDescription" xml:space="preserve"><value>允許伺服器端探測的跨主機重新導向目標。可填寫精確主機名稱，或填寫 *.example.com 信任其全部子網域；萬用字元規則不包含 example.com 裸網域。同主機重新導向一律允許；留空將拒絕其他主機。</value></data>
+  <data name="AwaitingApprovalNotificationTitle" xml:space="preserve"><value>STRM Bridge 等待確認</value></data>
+  <data name="AwaitingApprovalNotificationDescription" xml:space="preserve"><value>偵測到 {0} 個尚未信任的重新導向主機，部分媒體正在等待處理。請開啟 STRM Bridge 設定進行確認。</value></data>
+  <data name="RetryCompletedNotificationTitle" xml:space="preserve"><value>STRM Bridge 自動重試完成</value></data>
+  <data name="RetryCompletedNotificationDescription" xml:space="preserve"><value>成功擷取 {0} 項，還原 {1} 項，略過 {2} 項，失敗 {3} 項。</value></data>
+  <data name="ConcurrencyValidation" xml:space="preserve"><value>並行數必須為 1 或 2。</value></data>
+  <data name="TimeoutValidation" xml:space="preserve"><value>逾時必須介於 30 到 180 秒之間。</value></data>
+  <data name="LibraryValidation" xml:space="preserve"><value>每個媒體庫 ID 都必須是 GUID。</value></data>
+  <data name="RedirectHostValidation" xml:space="preserve"><value>每一項必須是精確 DNS 主機名稱、IP 位址，或 *.example.com 形式的明確子網域規則；不允許通訊協定、路徑、連接埠及其他萬用字元形式。</value></data>
+  <data name="RedirectHostCapacityValidation" xml:space="preserve"><value>最多只能設定 256 條重新導向主機規則。</value></data>
+  <data name="ScheduledTaskName" xml:space="preserve"><value>擷取缺少的 STRM 媒體資訊</value></data>
+  <data name="ScheduledTaskDescription" xml:space="preserve"><value>安全探測受支援本機 STRM 檔案缺少的技術媒體資訊。</value></data>
+  <data name="ClearStoredMediaInfoTaskName" xml:space="preserve"><value>清除 STRM Bridge 既有媒體資訊</value></data>
+  <data name="ClearStoredMediaInfoTaskDescription" xml:space="preserve"><value>手動清除 STRM Bridge 快照、擷取狀態及已選媒體庫中的內部技術媒體資訊；保留外部串流和媒體檔案。</value></data>
+  <data name="ScheduledTaskCategory" xml:space="preserve"><value>媒體庫</value></data>
+  <data name="TaskInitializationError" xml:space="preserve"><value>STRM Bridge 尚未完成初始化。</value></data>
+  <data name="InvalidItemIdError" xml:space="preserve"><value>媒體項目 ID 必須是 GUID。</value></data>
+  <data name="InvalidLibraryIdError" xml:space="preserve"><value>媒體庫 ID 必須是 GUID。</value></data>
+  <data name="AuthenticatedUserRequiredError" xml:space="preserve"><value>需要已登入的 Emby 使用者。</value></data>
+  <data name="AdministratorRequiredError" xml:space="preserve"><value>需要 Emby 管理員權限。</value></data>
+</root>

@@ -1,0 +1,7 @@
+.local/
+artifacts/
+TestResults/
+*.user
+*.suo
+*.log
+.DS_Store
