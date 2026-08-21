@@ -111,6 +111,24 @@ public sealed class PluginRuntimeTests
     }
 
     [TestMethod]
+    public void UpdateOptions_DropsMemoryOnlyManagedPrototypeRecords()
+    {
+        using var workspace = new TestWorkspace();
+        using var runtime = new PluginRuntime();
+        runtime.Initialize(
+            workspace.Path,
+            new ManualClock(),
+            new StubRedirectClient((_, _, _, _) =>
+                Task.FromResult(new RedirectSourceResponse(404, null, null))));
+        runtime.CreateManagedPrototype("https://source.invalid/entry", "mkv");
+        Assert.AreEqual(1, runtime.ManagedPrototypes!.Count);
+
+        runtime.UpdateOptions(new PluginConfiguration { Enabled = true }, invalidateSensitiveState: true);
+
+        Assert.AreEqual(0, runtime.ManagedPrototypes.Count);
+    }
+
+    [TestMethod]
     public void UpdateOptions_RetainsDetectedHostsUntilPluginIsDisabled()
     {
         using var runtime = new PluginRuntime();

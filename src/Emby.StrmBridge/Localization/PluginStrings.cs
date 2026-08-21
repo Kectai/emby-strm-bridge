@@ -54,6 +54,12 @@ public static class PluginStrings
     public static string InvalidLibraryIdError => Get(nameof(InvalidLibraryIdError));
     public static string AuthenticatedUserRequiredError => Get(nameof(AuthenticatedUserRequiredError));
     public static string AdministratorRequiredError => Get(nameof(AdministratorRequiredError));
+    public static string ManagedPrototypeConfirmationRequiredError =>
+        Get(nameof(ManagedPrototypeConfirmationRequiredError));
+    public static string ManagedPrototypeInvalidSourceError => Get(nameof(ManagedPrototypeInvalidSourceError));
+    public static string ManagedPrototypeInvalidContainerError => Get(nameof(ManagedPrototypeInvalidContainerError));
+    public static string ManagedPrototypeCapacityError => Get(nameof(ManagedPrototypeCapacityError));
+    public static string ManagedPrototypeUnavailableError => Get(nameof(ManagedPrototypeUnavailableError));
 
     private static string Get(string key)
     {

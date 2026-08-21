@@ -10,6 +10,7 @@
 6. `RedirectResolver` requests only the first source URL with automatic redirects and cookies disabled. It validates the first returned `Location`; cross-host targets require an administrator-configured exact-host entry or an explicit label-bounded `*.example.com` subdomain rule. Later redirects followed by Emby or FFmpeg are part of the trusted target boundary.
 7. The gateway returns 302 to an approved redirect target. The playback consumer transfers the media directly; direct-media STRM sources are not offered a bridge candidate.
 8. An untrusted cross-host result is classified as awaiting approval rather than a generic extraction failure. A deduplicated counts-only warning is persisted in Emby's administrator dashboard activity log; configured external notification services also receive a local configuration-page link. A newly observed host rearms the warning without repeating it for an unchanged pending set. Saving newly trusted hosts cancels stale work, clears extraction backoff, and queues one coalesced retry; a counts-only completion activity and optional external notification are emitted when no further hosts await approval.
+9. The M5.0 feasibility rail accepts an explicitly confirmed administrator request and creates a memory-only managed source record. Its static route contains a 256-bit random capability plus an optional allowlisted container hint, reuses the redirect resolver, and rejects direct 200/206. It has no scanner, durable catalog, journal, mirror writer, or in-place writer; those remain gated by the managed design milestones.
 
 ## Hard bounds
 
@@ -29,6 +30,7 @@
 - Snapshot: 512 KiB and at most 256 non-external streams.
 - Extraction state: 16,384 entries and 16 MiB. A redirect classification becomes eligible for revalidation after 1 hour and is checked on the next scheduled, post-scan, or manual extraction run; this does not create an hourly timer. Saturation fails conservative by checking unknown complete items instead of silently baselining them.
 - Maintenance sweep: every 30 seconds.
+- M5.0 managed prototypes: 8 memory-only records, fixed one-hour lifetime, 4096-character source-input limit, 256-bit random route capability, and a fixed media-container hint allowlist.
 
 ## Emby integration
 
@@ -48,6 +50,8 @@ Only public SDK contracts are used:
 Technical media streams are read from Emby's media-stream repository before each update rather than assuming the `BaseItem` instance is hydrated. Newly probed video, audio, and internal subtitle streams replace prior internal streams; embedded cover images, attachments, and other non-playback stream types are excluded. External subtitle and other external streams are retained and reindexed only when needed to avoid repository key collisions, with selected subtitle/audio indexes updated to match. The manually invoked clear task applies the same repository rule, removes only internal technical information from selected libraries, and selectively removes the corresponding plugin snapshots and extraction-state entries.
 
 There is no provider-priority setting in the public contract. Playback bridging is enabled by default and can be disabled independently for extraction-only operation, but actual provider selection remains host-dependent pending the real-host M0 matrix documented in [COMPATIBILITY.md](COMPATIBILITY.md). Privacy-safe provider lifecycle events allow that distinction to be diagnosed without logging a source, target, ticket, path, or client identifier.
+
+The M5.0 managed route is deliberately independent of `IMediaSourceProvider`: a synthetic STRM contains that route as its only static source. Prototype creation and clearing are administrator-only operations, while GET/HEAD uses the expiring random path as a bounded compatibility capability. This is test infrastructure for the real-host matrix, not a durable media-library feature.
 
 Before offering an alternate source, the provider also requires Emby's current static source to match the validated STRM URL and rejects sources that require opening, an open token, or request headers.
 

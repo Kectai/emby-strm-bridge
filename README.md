@@ -10,6 +10,7 @@ The plugin never proxies media bodies. Its gateway reads only the first source r
 - Implements scheduled extraction, bounded scan-completion queuing, direct-media and redirect-based probing, safe persistence/recovery, maintenance APIs, alternate media-source discovery, authorized playback tickets, redirect leases, source-level limiting, and cleanup.
 - STRM Bridge playback is enabled by default. Configuration schema version 1 performs a one-time migration of earlier configurations that inherited the old disabled default; administrators can still disable playback independently for extraction-only use.
 - Provider selection remains host-dependent until the M0 matrix is completed on the installed server release. Privacy-safe `REQUESTED`, `ISSUED`, and fixed-reason `SKIPPED` events distinguish provider discovery from gateway failures without logging paths, URLs, tickets, or client names.
+- The first managed-STRM feasibility rail is implemented but not production-enabled: an administrator can explicitly create up to eight one-hour, memory-only synthetic records for M5.0 host testing. It does not scan, generate, mirror, or replace media-library files, and every record disappears on configuration invalidation, explicit clearing, restart, or shutdown.
 - No private hooks, reflection patches, direct database writes, media proxying, vendor APIs, fixed remote endpoints, or vendor-specific production logic are used.
 
 ## Build and test
@@ -35,6 +36,13 @@ After installation, Emby exposes the native scheduled tasks **Extract missing ST
 - `POST /StrmBridge/Maintenance/Cleanup`
 - `POST /StrmBridge/Maintenance/Clear`
 
+The experimental M5.0 feasibility API is intentionally separate from normal settings:
+
+- `POST /StrmBridge/Managed/Prototype` accepts one bounded `SourceUrl`, an optional allowlisted `ContainerHint`, and `ConfirmExperimental=true`; it returns only a relative managed path and expiry time.
+- `DELETE /StrmBridge/Managed/Prototype` clears every memory-only prototype record.
+
+Both management operations require an authenticated administrator. The returned managed path is a one-hour bearer capability intended only for a synthetic test library; do not publish it or use it for a production library. The managed GET/HEAD route accepts only supported redirects and never returns the original source for a direct 200/206 response. See [the managed STRM design](docs/MANAGED_STRM_DESIGN.md) for the M5.0 host gate and the mirror-first implementation order.
+
 Configuration is rendered through Emby's native `BasePluginSimpleUI` editor, including native multi-select controls for media libraries and detected redirect hosts. Leaving the media-library selection empty disables extraction, restoration, and alternate playback for every library; select at least one library to activate processing. Cleanup still enumerates all STRM files so an empty selection cannot erase valid snapshots as orphans. The persisted configuration contains canonical library IDs rather than display names. Server-side validation constrains extraction concurrency to 1–2, per-item timeout to 30–180 seconds, and selected IDs to the current media-library catalog when it is available.
 
 Administrator-facing configuration, validation, scheduled-task, notification, activity, and plugin-description text follows Emby's current UI culture. The package includes English, Simplified Chinese, and Traditional Chinese resources; unsupported locales fall back to English. Stable diagnostic event codes and API route identifiers remain language-neutral.
@@ -47,7 +55,7 @@ The **Detected redirect hosts** control is always visible. When extraction encou
 
 ## Scope
 
-The plugin does not create STRM files, scrape metadata, call storage-provider APIs, inspect proprietary signing formats, alter FFmpeg arguments, transcode, generate thumbnails, launch external players, or report playback progress.
+The plugin does not yet create or replace STRM files. It does not scrape metadata, call storage-provider APIs, inspect proprietary signing formats, alter FFmpeg arguments, transcode, generate thumbnails, launch external players, or report playback progress.
 
 ## License
 

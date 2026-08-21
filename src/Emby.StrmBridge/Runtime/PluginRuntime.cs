@@ -6,6 +6,7 @@ using System.Threading;
 using Emby.StrmBridge.Configuration;
 using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Extraction;
+using Emby.StrmBridge.Managed;
 using Emby.StrmBridge.Persistence;
 using Emby.StrmBridge.Playback;
 using Emby.StrmBridge.Policy;
@@ -36,13 +37,15 @@ public sealed class PluginRuntime : IDisposable
 
     public RedirectResolver? Redirects { get; private set; }
 
+    internal ManagedPrototypeRegistry? ManagedPrototypes { get; private set; }
+
     public ExtractionCoordinator? Extraction { get; internal set; }
 
     internal MaintenanceService? Maintenance { get; set; }
 
     public string? DataDirectory { get; private set; }
 
-    public bool IsInitialized => SourcePolicy is not null && Redirects is not null;
+    public bool IsInitialized => SourcePolicy is not null && Redirects is not null && ManagedPrototypes is not null;
 
     public PluginConfiguration GetOptionsSnapshot()
     {
@@ -67,6 +70,7 @@ public sealed class PluginRuntime : IDisposable
             operationCancellation = new CancellationTokenSource();
             Tickets.Clear();
             Redirects?.Clear();
+            ManagedPrototypes?.Clear();
             if (!options.Enabled) ClearDetectedRedirectHosts();
         }
         previous.Cancel();
@@ -87,6 +91,7 @@ public sealed class PluginRuntime : IDisposable
             MediaInfoStore = new MediaInfoStore(Path.Combine(DataDirectory, "mediainfo"), new SnapshotSerializer());
             ExtractionState = new ExtractionStateStore(Path.Combine(DataDirectory, "state", "extraction-state.json"));
             Tickets = new TicketStore(Clock);
+            ManagedPrototypes = new ManagedPrototypeRegistry(Clock);
             Redirects = new RedirectResolver(
                 sourceClient ?? new HttpRedirectSourceClient(() =>
                     TimeSpan.FromSeconds(GetOptionsSnapshot().ExtractionTimeoutSeconds)),
@@ -177,10 +182,39 @@ public sealed class PluginRuntime : IDisposable
             operationCancellation = new CancellationTokenSource();
             Tickets.Clear();
             Redirects?.Clear();
+            ManagedPrototypes?.Clear();
             ClearDetectedRedirectHosts();
         }
         previous.Cancel();
         previous.Dispose();
+    }
+
+    internal ManagedPrototypeRegistration CreateManagedPrototype(string sourceUrl, string? containerHint)
+    {
+        lock (sync)
+        {
+            if (disposed || !options.Enabled || ManagedPrototypes is null)
+                throw new ManagedPrototypeUnavailableException();
+            return ManagedPrototypes.Create(sourceUrl, containerHint);
+        }
+    }
+
+    internal int ClearManagedPrototypes()
+    {
+        CancellationTokenSource previous;
+        int cleared;
+        lock (sync)
+        {
+            if (disposed || ManagedPrototypes is null) return 0;
+            generation++;
+            previous = operationCancellation;
+            operationCancellation = new CancellationTokenSource();
+            cleared = ManagedPrototypes.Clear();
+            Redirects?.Clear();
+        }
+        previous.Cancel();
+        previous.Dispose();
+        return cleared;
     }
 
     public void Dispose()
@@ -204,7 +238,9 @@ public sealed class PluginRuntime : IDisposable
         previous.Dispose();
         Tickets.Clear();
         Redirects?.Dispose();
+        ManagedPrototypes?.Dispose();
         ClearDetectedRedirectHosts();
+        ManagedPrototypes = null;
         Extraction = null;
     }
 }

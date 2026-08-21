@@ -42,4 +42,9 @@
   <data name="InvalidLibraryIdError" xml:space="preserve"><value>The library ID must be a GUID.</value></data>
   <data name="AuthenticatedUserRequiredError" xml:space="preserve"><value>An authenticated Emby user is required.</value></data>
   <data name="AdministratorRequiredError" xml:space="preserve"><value>An Emby administrator is required.</value></data>
+  <data name="ManagedPrototypeConfirmationRequiredError" xml:space="preserve"><value>Explicit confirmation is required because the managed STRM feasibility route is experimental.</value></data>
+  <data name="ManagedPrototypeInvalidSourceError" xml:space="preserve"><value>The prototype source must be one bounded absolute HTTP(S) URL without user information, a fragment, or control characters.</value></data>
+  <data name="ManagedPrototypeInvalidContainerError" xml:space="preserve"><value>The optional container hint is not supported.</value></data>
+  <data name="ManagedPrototypeCapacityError" xml:space="preserve"><value>The memory-only managed STRM prototype limit has been reached.</value></data>
+  <data name="ManagedPrototypeUnavailableError" xml:space="preserve"><value>The managed STRM feasibility record is unavailable or expired.</value></data>
 </root>

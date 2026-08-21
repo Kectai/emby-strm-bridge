@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Refined the managed STRM architecture after comparing static STRM generation, stable redirect services, reverse-proxy interception, and body-proxy approaches; mirror mode is now the only first-release write path and in-place takeover is deferred.
+- Added the M5.0 memory-only managed STRM feasibility rail: administrator-confirmed bounded registration, 256-bit one-hour capabilities, optional allowlisted container hints, GET/HEAD redirect resolution, direct 200/206 rejection, lifecycle invalidation, localized errors, and privacy-focused tests. It does not scan or modify media-library files.
+
 ## 0.1.0
 
 - Initial implementation of strict local STRM policy and HMAC identities.

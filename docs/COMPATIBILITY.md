@@ -25,6 +25,10 @@ Run these before relying on the playback bridge in production:
 11. After successful, failed, and timed-out probes, audit Emby and FFmpeg logs to confirm full source/final URLs, query values, headers, and gateway tickets are absent or operationally redacted.
 12. Race a library-file replacement and confirm the deployment's filesystem permissions keep untrusted local writers outside the STRM and plugin-configuration directories.
 13. Confirm pending-host warnings appear once in the administrator dashboard activity log without any external notification service configured; when such a service is configured, confirm its link opens the native STRM Bridge settings page. Saving newly trusted hosts must queue one automatic retry and record a counts-only completion activity.
+14. With only the memory-only M5.0 prototype enabled, create a synthetic managed STRM and confirm its default static source reaches the managed route for direct play, direct stream, and transcode without selecting an alternate provider.
+15. Repeat the prototype test through the current external-player plugin: it must obtain the managed address from `GetStaticMediaSources`, complete both control-plane redirects within the timeout, and expose only the final temporary target to the launched player.
+16. Confirm optional `.mkv`, `.mp4`, and `.m2ts` hints improve or preserve target-client behavior, while no-suffix routes remain valid and unknown suffixes fail closed.
+17. Confirm prototype direct 200/206 sources fail without returning the original source URL, and scan plugin, Emby, FFmpeg, and reverse-proxy logs for both the source and managed capability.
 
 If any playback-related check fails on a host, turn off **Enable STRM Bridge playback** and use media-information extraction and URL-free persistence independently until that host integration is corrected.
 

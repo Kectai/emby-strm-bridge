@@ -42,4 +42,9 @@
   <data name="InvalidLibraryIdError" xml:space="preserve"><value>媒体库 ID 必须是 GUID。</value></data>
   <data name="AuthenticatedUserRequiredError" xml:space="preserve"><value>需要已登录的 Emby 用户。</value></data>
   <data name="AdministratorRequiredError" xml:space="preserve"><value>需要 Emby 管理员权限。</value></data>
+  <data name="ManagedPrototypeConfirmationRequiredError" xml:space="preserve"><value>托管 STRM 可行性入口仍属实验功能，必须明确确认后才能创建。</value></data>
+  <data name="ManagedPrototypeInvalidSourceError" xml:space="preserve"><value>原型源必须是长度受限的单个绝对 HTTP(S) URL，且不能包含用户信息、片段或控制字符。</value></data>
+  <data name="ManagedPrototypeInvalidContainerError" xml:space="preserve"><value>不支持填写的容器提示。</value></data>
+  <data name="ManagedPrototypeCapacityError" xml:space="preserve"><value>仅内存托管 STRM 原型已达到容量上限。</value></data>
+  <data name="ManagedPrototypeUnavailableError" xml:space="preserve"><value>托管 STRM 可行性记录不可用或已经过期。</value></data>
 </root>
