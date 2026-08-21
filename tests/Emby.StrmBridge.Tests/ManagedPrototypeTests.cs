@@ -160,4 +160,38 @@ public sealed class ManagedPrototypeTests
             typeof(UnauthenticatedAttribute),
             inherit: true));
     }
+
+    [TestMethod]
+    public void ManagementAuthorization_AcceptsBoundedServerIntegrationCredential()
+    {
+        Assert.IsTrue(ManagedPrototypeService.HasAuthenticatedServerToken(new AuthorizationInfo
+        {
+            Token = "synthetic-server-integration-key",
+        }, CreateRequest(null)));
+        Assert.IsTrue(ManagedPrototypeService.HasAuthenticatedServerToken(
+            new AuthorizationInfo(),
+            CreateRequest("synthetic-server-integration-key")));
+        Assert.IsFalse(ManagedPrototypeService.HasAuthenticatedServerToken(
+            new AuthorizationInfo(),
+            CreateRequest(null)));
+        Assert.IsFalse(Attribute.IsDefined(
+            typeof(CreateManagedStrmPrototype),
+            typeof(UnauthenticatedAttribute),
+            inherit: true));
+        Assert.IsFalse(Attribute.IsDefined(
+            typeof(ClearManagedStrmPrototypes),
+            typeof(UnauthenticatedAttribute),
+            inherit: true));
+    }
+
+    private static IRequest CreateRequest(string? serverToken)
+    {
+        var headers = new QueryParamCollection();
+        if (serverToken is not null) headers.Add("X-Emby-Token", serverToken);
+        return TestProxy.Create<IRequest>((method, _) => method.Name switch
+        {
+            "get_Headers" => headers,
+            _ => TestDispatchProxy.DefaultValue(method.ReturnType),
+        });
+    }
 }

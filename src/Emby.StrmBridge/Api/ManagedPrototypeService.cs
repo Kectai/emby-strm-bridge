@@ -153,10 +153,24 @@ public sealed class ManagedPrototypeService : IService, IRequiresRequest
 
     private void RequireAdministrator()
     {
-        var user = authorizationContext.GetAuthorizationInfo(Request).User
-            ?? throw new UnauthorizedAccessException(PluginStrings.AuthenticatedUserRequiredError);
-        if (!user.Policy.IsAdministrator)
+        var authorization = authorizationContext.GetAuthorizationInfo(Request);
+        var user = authorization.User;
+        if (user is not null && !user.Policy.IsAdministrator)
             throw new UnauthorizedAccessException(PluginStrings.AdministratorRequiredError);
+        if (user is null && !HasAuthenticatedServerToken(authorization, Request))
+            throw new UnauthorizedAccessException(PluginStrings.AuthenticatedUserRequiredError);
+    }
+
+    internal static bool HasAuthenticatedServerToken(AuthorizationInfo authorization, IRequest request)
+    {
+        if (authorization is null || request is null) return false;
+        if (!string.IsNullOrWhiteSpace(authorization.Token)) return true;
+
+        // Emby 4.9.5 validates server API keys in the route filter but leaves
+        // AuthorizationInfo.Token empty for that credential type. These DTOs
+        // deliberately remain authenticated routes, so only the standard
+        // header is accepted here; query-string credentials are not supported.
+        return !string.IsNullOrWhiteSpace(request.Headers.Get("X-Emby-Token"));
     }
 
     private void AddRetryAfter(int seconds) => Request.Response.AddHeader(
