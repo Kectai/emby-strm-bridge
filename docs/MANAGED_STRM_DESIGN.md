@@ -4,7 +4,7 @@
 
 - 功能名称：STRM Bridge 批量托管模式（Managed STRM Mode）
 - 所属项目：`Emby.StrmBridge`
-- 文档状态：详细设计，尚未实现
+- 文档状态：详细设计，经开源实现对比修订；M5.0/M5.2 待实施
 - 适用阶段：现有提取/播放功能之后的可选 M5
 - 目标宿主：Emby Server 4.9.x，首要实机版本 4.9.5.0
 - 目标框架：沿用插件 `netstandard2.1`
@@ -18,6 +18,12 @@
 
 批量托管模式采用不同路径：把媒体库实际读取的 STRM 内容改为插件自己的稳定 HTTP(S) 入口。这样 Emby 内置静态源本身就是桥接入口，不再依赖客户端选择备用媒体源。插件收到请求后，读取受保护目录中的原始源记录，按现有安全策略解析短期重定向并返回 302；媒体正文仍由播放器或 Emby FFmpeg 直接读取。
 
+本方案不是所有部署形态中的绝对最优方案。若管理员已经统一使用可编程反向代理，拦截 Emby 播放 API 可以避免写入媒体目录；若上游能够直接生成稳定网关 URL，独立重定向服务也可能更简单。本设计的架构结论限定为：
+
+> 在“必须以 Emby 插件交付、只使用公开插件边界、不要求客户端选择动态备用源、不依赖额外反向代理、默认不代理媒体正文、需要通用上游和可回滚”这些约束同时成立时，双根镜像托管是首选路径。
+
+原位接管不是首发实现。它只解决“既有库无法迁移且必须保留当前目录身份”的兼容问题，不能与镜像模式共享默认风险等级。
+
 对“上游目录程序生成长期有效入口、STRM 数量很多、文件已保存到本地”的场景，本方案可行。文件数量不是核心瓶颈，因为每个 STRM 很小；真正需要解决的是：
 
 1. 不能要求管理员逐个编辑。
@@ -26,7 +32,30 @@
 4. 原始 URL 含长期能力凭据时不得写入插件日志、普通配置或明文备份。
 5. 托管入口必须对通用客户端和服务端 FFmpeg 都可达。
 
-## 3. 官方行为依据与限定
+## 3. 官方行为、开源实践与架构决策
+
+### 3.1 Emby 静态源与动态源边界
+
+Emby 官方播放指南说明一个项目可以有多个 `MediaSource`，但最终选择由客户端完成；多个可直放源是否呈现选择界面也由客户端决定。公开插件接口同时区分静态媒体源与完整播放媒体源：宿主先生成静态源，再在播放聚合路径中调用 `IMediaSourceProvider` 追加动态源。
+
+由此得到以下硬结论：
+
+1. `IMediaSourceProvider` 适合补充播放能力，但不能成为“所有客户端一定选择此源”的兼容性边界。
+2. 调用 `GetStaticMediaSources` 的插件、外部播放工具或客户端链路看不到后来追加的动态源。
+3. 要使不理解插件候选源的消费者稳定工作，Bridge 必须成为 STRM 自身的静态地址，而不是并列候选。
+
+### 3.2 代表性开源路线
+
+| 路线 | 代表实现 | 已验证的设计价值 | 不作为本项目主路径的原因 |
+| --- | --- | --- | --- |
+| 反向代理拦截播放 API | `embyExternalUrl/emby2Alist`、`go-emby2openlist` | 不改 STRM，客户端仍走原 Emby 入口，可集中改写直链和部分 PlaybackInfo | 需要所有客户端统一经过额外反向代理；依赖 Emby 路由和请求形态；字幕、转码、seek 与客户端规则复杂 |
+| 插件生成原生 STRM 库 | `AniLibriaStrmPlugin`、`jellyfin-xtream-library`、`emby-xtream` | 静态 STRM 能被普通媒体库和更多客户端识别；清单可限定插件只管理自身文件 | 多数实现绑定特定上游或同时生成 NFO/图片，不提供通用既有 STRM 接管与加密回滚 |
+| 独立稳定重定向服务 | `STRMhub` | 稳定 `/d/{opaque}[.ext]` 入口可在请求时按 UA 解析短期 302；文件扩展提示有助于部分播放器识别 | 需要额外常驻服务，且实现通常绑定特定供应商；某些边界会回退到正文代理 |
+| 服务端正文代理 | 上述项目中的 HLS/UA 兼容分支 | 能处理直达 200/206、Cookie、Header、HLS 分片和不跟随 302 的客户端 | 占用服务器带宽、连接和 CPU，不符合本项目轻量且默认不承载媒体正文的目标 |
+
+这些项目证明了“静态 STRM 指向稳定入口”这一组合的可行性，但没有一个实现同时满足本设计的通用上游、加密目录、双根镜像、原位回滚、隐私门禁和 Emby 4.9 插件约束。因此只能复用架构经验，不能把任一项目的客户端声明视为本插件的实机证明。
+
+### 3.3 上游长期入口限定
 
 根据 OpenList 当前官方文档：
 
@@ -43,6 +72,14 @@
 4. 生产代码只实现通用“上游 STRM 根目录”协议，不出现厂商域名、路径前缀或签名字段分支。
 5. OpenList 只作为兼容性样例；同样设计适用于任何生成单条 HTTP(S) URL 的工具。
 
+### 3.4 架构决策 ADR-M5-001
+
+- 首发目标是 `M5.0 -> M5.1 -> M5.2`，即先证明静态源链路，再完成 Catalog，最后开放双根镜像。
+- `M5.3` 原位接管至少延后一个实验版本，并且不得阻塞镜像模式发布。
+- 首发不实现媒体正文代理，不修改 Emby PlaybackInfo 响应，不拦截宿主路由，不调用宿主私有方法。
+- 任一客户端需要正文代理才能播放时，将其记录为不兼容，不允许静默改变全局数据链路。
+- M5.0 未通过前，托管功能不出现在普通启用流程中；M5.2 完成后仍默认关闭。
+
 ## 4. 目标、非目标与成功标准
 
 ### 4.1 必须实现
@@ -58,6 +95,7 @@
 - 上游内容变化后可对账并更新加密源记录。
 - 删除行为默认进入隔离区，不直接删除媒体目录中的文件或元数据。
 - 托管入口经现有重定向安全策略解析，不代理媒体正文。
+- 预检持久记录首跳类型；只有已确认返回受支持重定向的源才能进入首发镜像计划。
 - 提取任务理解托管源，避免对自身 Gateway 形成递归。
 - 卸载或禁用前明确提示仍有多少托管项，提供紧急恢复方法。
 
@@ -71,6 +109,7 @@
 - 不在未确认的情况下删除目录、回滚用户主动修改的文件或覆盖冲突。
 - 不把稳定托管 ID 描述为短期票据；它具有不同的风险模型。
 - 不承诺在插件未加载时托管 STRM 仍可播放。
+- 首发不为直达 `200/206` 源返回原始长期 URL，也不以正文代理兜底。
 
 ### 4.3 成功标准
 
@@ -80,6 +119,7 @@
 - 任意已提交批次都能在不依赖远程源的情况下恢复原始 STRM 内容。
 - 注入崩溃、取消或磁盘满后，不出现既无法播放又无法恢复的未知状态。
 - 插件自有日志、活动记录和普通配置中不存在原始 URL、查询参数、文件名或稳定托管 ID。
+- 当前外部播放项目通过静态媒体源能够取得托管地址，不再依赖动态候选源。
 
 ## 5. 推荐部署拓扑
 
@@ -105,8 +145,9 @@ Emby 托管根目录（插件写入）
 - Emby 的 NFO、图片和字幕留在托管根目录，由 Emby 自己管理。
 - 插件只镜像 `.strm`，不复制其他文件。
 - 上游删除只把托管项标记为孤立；默认等待管理员确认，不删除托管目录或旁文件。
+- 新托管根不会自动继承旧库的 Emby ItemId、观看记录、收藏或旁文件。切换物理根前必须完成实机身份测试；需要保留既有目录身份时继续使用原库，不能把镜像描述成无损迁移。
 
-这是新部署和大规模库的推荐模式。
+这是新部署和大规模库的推荐模式，也是第一个允许进入实验发布的写入模式。
 
 ### 5.2 模式 B：原位接管，兼容既有库
 
@@ -118,6 +159,7 @@ Emby 托管根目录（插件写入）
 - 最佳做法是把上游后续输出改到独立输入根目录，再由插件对账到现有 Emby 根目录。
 - 原位模式扩大 Emby 服务账号的写权限，必须由管理员显式启用。
 - 插件卸载前必须先回滚，或保留离线恢复所需的密钥和目录。
+- M5.2 稳定并完成至少一个版本周期的恢复演练前，管理界面不得提供原位执行入口。
 
 ### 5.3 选择规则
 
@@ -168,12 +210,15 @@ flowchart TD
 
 ```text
 https://<administrator-configured-base>/StrmBridge/Managed/v1/<managed-id>
+https://<administrator-configured-base>/StrmBridge/Managed/v1/<managed-id>.<container-hint>
 ```
 
 - `administrator-configured-base` 必须由管理员设置，不能硬编码服务器名、端口或反向代理前缀。
 - `managed-id` 为 256 位密码学随机数，使用无填充 Base64Url 或等价编码。
 - URL 不包含原文件路径、ItemId、库 ID、原始 host、查询参数或签名。
-- 插件只接受固定版本、固定段数和固定长度的路由。
+- `container-hint` 可选，只能来自受限小写扩展 allowlist；它是播放器提示，不参与记录身份，不能使用真实文件名。
+- 未知或不可信容器不添加后缀。后缀与已提取容器冲突时省略，不猜测。
+- 插件只接受固定版本、固定段数、固定长度和固定扩展 allowlist 的路由。
 
 ### 7.2 公共基址
 
@@ -185,6 +230,7 @@ https://<administrator-configured-base>/StrmBridge/Managed/v1/<managed-id>
 - 默认要求 HTTPS；仅在管理员明确启用局域网 HTTP 时允许 HTTP。
 - 不能是通配主机。
 - 从 Emby Server 本机能够访问健康检查端点。
+- 从所有目标播放设备能够访问；如果使用分离 DNS 或反向代理，必须同时验证客户端路径和服务器自访问路径。
 
 变更公共基址不修改托管 ID，只运行独立“重新定址”计划，批量原子改写 STRM。旧基址可配置短期迁移跳转，但不得无限期保留。
 
@@ -481,7 +527,7 @@ sequenceDiagram
     Gateway->>Catalog: 解密原始源（仅内存）
     Gateway->>Resolver: 解析，key = entry revision + UA hash
     Resolver->>Source: Range bytes=0-0，不自动跟随
-    Source-->>Resolver: 200/206 或 3xx Location
+    Source-->>Resolver: 3xx Location
     Resolver-->>Gateway: 已批准的短期结果
     Gateway-->>Client: 302/受控失败
 ```
@@ -491,7 +537,8 @@ sequenceDiagram
 - 仅 GET/HEAD；其他方法返回 405。
 - 3xx 只接受现有 `RedirectPolicy` 允许的绝对 HTTP(S) Location。
 - 同 host 默认允许；跨 host 必须匹配管理员精确或显式子域规则。
-- 对 200/206 直达媒体源，Gateway 可以返回到原始源的受控 307，前提是实机验证 Range/HEAD 行为；若未验证则标记不支持，不代理正文。
+- 首发只接受带受支持 `Location` 的 3xx。首跳 `200/206` 标记为 `DirectSourceUnsupported`，不返回原始长期 URL，也不代理正文。
+- 未来若增加直达源模式，必须作为单独 ADR 和显式功能实现；不能以“临时兼容”形式把原始带查询凭据 URL 放入 307 `Location`。
 - 临时 Location 只进入 30 秒内存租约，不写 Catalog。
 - 租约按 `ManagedId + EntryRevision + User-Agent hash` 隔离。
 - EntryRevision 变化、规则变化、插件禁用或清理时立即清租约。
@@ -557,7 +604,27 @@ ILogicalStrmSourceResolver
 - 对普通 STRM，保持现有候选源行为。
 - 托管模式可单独开关，不改变媒体信息提取开关。
 
-### 17.4 清理存量信息
+### 17.4 外部播放与其他静态源消费者
+
+当前外部播放项目通过 `GetStaticMediaSources` 构建版本列表。Active 托管项实施后，它取得的是托管 Gateway 静态地址，因此不再依赖 `IMediaSourceProvider` 候选。
+
+默认兼容链为：
+
+```text
+外部播放入口 -> 外部播放短期 Remote URL -> Managed Gateway -> 临时上游 Location -> 播放器
+```
+
+该链路包含两个控制面跳转但不包含两个媒体正文代理。M5.0 必须验证：
+
+- 外部播放服务端能够访问托管公共基址，且不会发生 Gateway 自递归。
+- 外部播放的解析超时大于 Managed Gateway 单次解析上限并保留取消传播。
+- 外部播放得到的是最终短期 Location，不把 ManagedId 或原始长期源写入日志。
+- 外部播放选择的 `MediaSourceId` 仍对应当前静态源；扫描或切换根后旧票据失败关闭。
+- 外部播放、普通客户端和 Emby FFmpeg 的 UA 分别形成独立租约。
+
+插件之间不共享数据库、密钥或可变内部类型。若 HTTP 链路无法通过 M5.0，再设计版本化的最小只读解析契约；首发不直接引用另一插件程序集。
+
+### 17.5 清理存量信息
 
 现有“清理 STRM Bridge 存量媒体信息”只清技术媒体信息、快照和提取状态，不得删除 Managed Catalog、密钥或托管文件。托管回滚是独立操作，使用独立确认。
 
@@ -791,7 +858,7 @@ ILogicalStrmSourceResolver
 使用本地合成服务覆盖：
 
 - 长期入口返回 302 到短期媒体地址。
-- 200/206 直达源。
+- 200/206 直达源稳定返回 `DirectSourceUnsupported`，且响应和日志均不出现原始 URL。
 - HEAD、GET、Range、seek、重连。
 - 301/302/303/307/308。
 - Location 缺失、非法 scheme、控制字符和多跳。
@@ -799,6 +866,7 @@ ILogicalStrmSourceResolver
 - 相同 Entry 不同 User-Agent。
 - EntryRevision 变化立即使旧 lease 失效。
 - 严格用户、本机 loopback、转发头伪造和兼容能力模式。
+- 无后缀和受限容器后缀路由指向同一记录；未知、过长或伪造后缀失败关闭。
 
 测试只使用 `.invalid` 域名或 loopback，不放真实路径、账号、媒体名或签名。
 
@@ -824,6 +892,9 @@ ILogicalStrmSourceResolver
 7. 插件日志、Emby 日志、FFmpeg 日志和反向代理 access log 隐私扫描。
 8. 插件禁用、崩溃、升级和缺少 Catalog 时的用户可见错误。
 9. 回滚后无需插件即可恢复原始 STRM 播放路径。
+10. 当前外部播放项目能从静态源列表看到托管版本，并完成双控制面 302 链路；旧票据在项目或源变化后失效。
+11. 切换到镜像根前后，记录 Emby ItemId、观看记录、收藏、外挂字幕和本地图片的变化；不能保持的内容必须在页面和迁移报告中明确列出。
+12. 带正确容器提示和不带后缀两种 URL 在目标客户端的表现；只有实测证明有收益时才默认生成后缀。
 
 其中任一核心播放链路失败，M5 不进入默认启用状态。
 
@@ -831,11 +902,14 @@ ILogicalStrmSourceResolver
 
 ### M5.0：只读可行性原型
 
-- 手工创建一个合成 Managed URL STRM。
-- 验证内置静态源、Gateway、认证和各播放模式。
+- 实现仅接受内存/测试配置合成记录的 Managed Gateway，不扫描和改写用户目录。
+- 手工创建一个合成 Managed URL STRM；测试记录只使用 loopback 或 `.invalid` 地址。
+- 验证内置静态源、Gateway、认证、受限容器后缀和各播放模式。
+- 验证当前外部播放项目、普通客户端与服务端 FFmpeg；分别记录请求身份、UA、HEAD、Range、seek 和重连行为。
+- 首跳 200/206 必须返回固定不支持错误，不得把原始 URL重定向给消费者。
 - 不接触用户真实媒体库。
 
-完成标准：第 25.5 节 1–5 有可重复证据。
+完成标准：第 25.5 节 1–5、7、10、12 有可重复证据。纯代码和本地 HTTP 测试只能完成 M5.0 的实现准备，不能替代 Emby 4.9.5.0 实机门槛。
 
 ### M5.1：Catalog 与离线恢复
 
@@ -849,6 +923,7 @@ ILogicalStrmSourceResolver
 - 双根扫描、计划、托管文件创建。
 - 对账、孤立标记和隔离。
 - 大型库性能测试。
+- 根切换前后 ItemId、用户数据和旁文件影响报告。
 
 镜像模式先发布为实验功能，因为它保留原始输入根，恢复风险最低。
 
@@ -859,6 +934,7 @@ ILogicalStrmSourceResolver
 - 明确上游输出迁移流程。
 
 原位模式必须比镜像模式多一个版本周期的实验验证。
+在此之前即使底层组件已存在，也不得通过隐藏配置、API 或手工 XML 开启。
 
 ### M5.4：对账与生命周期
 
@@ -906,7 +982,9 @@ ILogicalStrmSourceResolver
 | Catalog/key 丢失 | 无法解密回滚 | 输入根、加密恢复导出、离线恢复演练 |
 | 公共基址改变 | 全部托管 URL 失效 | 独立重新定址计划，ID 不变 |
 | 客户端不带 Emby 身份 | 严格模式无法播放 | M0 先验证；必要时按根显式启用能力模式 |
-| 直达 200/206 无 Location | 无最终重定向可返回 | 验证 307 到原始源；失败则标记不支持，不代理正文 |
+| 直达 200/206 无 Location | 无安全的临时目标可返回 | 首发标记不支持；不返回原始长期 URL，不代理正文 |
+| 镜像根触发项目重建 | ItemId、观看记录、收藏或旁文件关联变化 | 切换前实机报告；无法保持时不宣称无损迁移，保留原库 |
+| 外部播放形成双控制跳转 | 超时、身份或 UA 不一致 | M5.0 纳入当前外部播放项目；不共享密钥和私有程序集 |
 | 跨平台原子替换差异 | 崩溃一致性不同 | 目标系统实测，无法证明的平台不开放原位模式 |
 
 ## 29. 最终建议
@@ -914,10 +992,11 @@ ILogicalStrmSourceResolver
 建议采用以下落地顺序：
 
 1. 先做单文件、合成 URL 的 M5.0 原型，证明默认静态 STRM 确实经过 Gateway，并验证通用客户端和 FFmpeg 的认证/Range 行为。
-2. 优先实现双根镜像模式。它不会覆盖上游原文件，最适合文件多且上游可能重新生成的情况。
+2. 优先实现双根镜像模式。它不会覆盖上游原文件，最适合文件多且上游可能重新生成的情况；首版不同时交付原位接管。
 3. 现有媒体库确实无法迁移时，再开放原位接管；在此之前必须完成加密 Catalog、崩溃恢复和离线回滚。
 4. 永远保留播放时短租约解析，不把 CDN Location 写进托管 STRM。
 5. 把 OpenList 当作符合“单条长期 HTTP(S) 入口”协议的一个上游，不在生产代码中增加任何 OpenList 专用判断。
+6. 把反向代理拦截和独立重定向服务保留为部署替代方案，而不是在插件内重写 PlaybackInfo 或承载完整媒体流。
 
 该方案可以绕开候选媒体源不被选择的问题，但代价是插件成为托管 STRM 的运行依赖，并引入媒体目录写权限与稳定能力 URL。只有在回滚、卸载和实机播放门槛完成后，才适合用于真实大库。
 
@@ -947,4 +1026,12 @@ ILogicalStrmSourceResolver
 - [Emby：Automatic Type Discovery](https://dev.emby.media/doc/plugins/dev/Automatic-Type-Discovery.html)
 - [Emby：IScheduledTask](https://dev.emby.media/reference/pluginapi/MediaBrowser.Model.Tasks.IScheduledTask.html)
 - [Emby：IMediaSourceManager](https://dev.emby.media/reference/pluginapi/MediaBrowser.Controller.Library.IMediaSourceManager.html)
+- [Emby：Playback Guidelines](https://dev.emby.media/doc/restapi/Playback-Guidelines.html)
+- [Emby：MediaSourceManager 参考实现](https://github.com/MediaBrowser/Emby/blob/master/Emby.Server.Implementations/Library/MediaSourceManager.cs)
+- [embyExternalUrl：emby2Alist](https://github.com/bpking1/embyExternalUrl/tree/main/emby2Alist)
+- [go-emby2openlist](https://github.com/AmbitiousJun/go-emby2openlist)
+- [STRMhub：稳定入口与 302/UA 解析参考](https://github.com/DaisyYijin/STRMhub)
+- [AniLiberty STRM Plugin：镜像清单与托管文件边界参考](https://github.com/queukat/AniLibriaStrmPlugin/tree/aniLiberty-v2)
+- [Jellyfin Xtream Library：原生 STRM 库参考](https://github.com/andreadegiovine/jellyfin-xtream-library)
+- [Emby Xtream：插件生成 STRM 库参考](https://github.com/firestaerter3/emby-xtream)
 - [Emby.StrmBridge 基础设计](../../Emby.StrmBridge-DESIGN.md)
