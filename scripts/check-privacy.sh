@@ -4,19 +4,15 @@ set -eu
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_root"
 
-symlinks=$(find . -path './.local' -prune -o -path './artifacts' -prune -o -type l -print)
+symlinks=$(find . -path './.git' -prune -o -path './.local' -prune -o \
+  -path './artifacts' -prune -o -type l -print)
 if [ -n "$symlinks" ]; then
   echo "Privacy check failed: symbolic links are not allowed in source or release inputs."
   echo "$symlinks"
   exit 1
 fi
 
-# Finder can recreate these while the project is open on macOS. Remove them before
-# evaluating source and release inputs; the package also uses an explicit allowlist.
-find . -path './.local' -prune -o -path './artifacts' -prune -o \
-  -name '.DS_Store' -type f -delete
-finder_metadata=$(find . -path './.local' -prune -o -path './artifacts' -prune -o \
-  -name '.DS_Store' -type f -print)
+finder_metadata=$(git ls-files | rg '(^|/)\.DS_Store$' || true)
 if [ -n "$finder_metadata" ]; then
   echo "Privacy check failed: Finder metadata is not allowed in source or release inputs."
   echo "$finder_metadata"
