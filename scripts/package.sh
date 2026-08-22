@@ -4,6 +4,11 @@ set -eu
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_root"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "Package validation failed: ripgrep is required."
+  exit 1
+fi
+
 "$project_root/scripts/verify.sh"
 
 version=$(sed -n 's:.*<Version>\([^<]*\)</Version>.*:\1:p' src/Emby.StrmBridge/Emby.StrmBridge.csproj)

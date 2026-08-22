@@ -4,6 +4,11 @@ set -eu
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_root"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "Privacy check failed: ripgrep is required."
+  exit 1
+fi
+
 symlinks=$(find . -path './.git' -prune -o -path './.local' -prune -o \
   -path './artifacts' -prune -o -type l -print)
 if [ -n "$symlinks" ]; then

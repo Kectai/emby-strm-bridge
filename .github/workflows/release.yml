@@ -18,6 +18,8 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           dotnet-version: 10.0.203
+      - name: Install release prerequisites
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ripgrep
       - name: Verify and package
         run: ./scripts/package.sh
       - name: Verify tag matches package version
