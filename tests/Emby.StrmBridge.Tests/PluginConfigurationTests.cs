@@ -31,12 +31,15 @@ public sealed class PluginConfigurationTests
         CollectionAssert.IsSubsetOf(new[]
         {
             nameof(PluginConfiguration.Enabled),
-            nameof(PluginConfiguration.EnablePlaybackSource),
+            nameof(PluginConfiguration.PlaybackMode),
             nameof(PluginConfiguration.ExtractAfterLibraryScan),
             nameof(PluginConfiguration.OnlyMissingMediaInfo),
             nameof(PluginConfiguration.EnablePersistence),
             nameof(PluginConfiguration.MaximumExtractionConcurrency),
             nameof(PluginConfiguration.ExtractionTimeoutSeconds),
+            nameof(PluginConfiguration.GatewayTimeoutSeconds),
+            nameof(PluginConfiguration.RedirectHopLimit),
+            nameof(PluginConfiguration.RelayConcurrency),
             nameof(PluginConfiguration.IncludedLibraries),
             nameof(PluginConfiguration.DetectedRedirectHostsToTrust),
             nameof(PluginConfiguration.AllowedRedirectHostsText),
@@ -69,30 +72,28 @@ public sealed class PluginConfigurationTests
     }
 
     [TestMethod]
-    public void PlaybackBridge_DefaultsOnAndMigratesLegacyDisabledConfigurationOnce()
+    public void PlaybackGateway_DefaultsToAdaptiveAndNormalizesInvalidValues()
     {
         var fresh = new PluginConfiguration();
-        Assert.IsTrue(fresh.EnablePlaybackSource);
+        Assert.AreEqual(PlaybackRoutingMode.Adaptive, fresh.PlaybackMode);
         Assert.IsTrue(fresh.Normalize());
+        Assert.IsFalse(fresh.Normalize());
         Assert.AreEqual(PluginConfiguration.CurrentConfigurationVersion, fresh.ConfigurationVersion);
-        Assert.IsTrue(fresh.EnablePlaybackSource);
 
-        var legacy = new PluginConfiguration
+        var invalid = new PluginConfiguration
         {
             ConfigurationVersion = 0,
-            EnablePlaybackSource = false,
+            PlaybackMode = (PlaybackRoutingMode)99,
+            GatewayTimeoutSeconds = int.MaxValue,
+            RedirectHopLimit = int.MaxValue,
+            RelayConcurrency = int.MaxValue,
         };
-        Assert.IsTrue(legacy.Normalize());
-        Assert.AreEqual(PluginConfiguration.CurrentConfigurationVersion, legacy.ConfigurationVersion);
-        Assert.IsTrue(legacy.EnablePlaybackSource);
-
-        var explicitlyDisabled = new PluginConfiguration
-        {
-            ConfigurationVersion = PluginConfiguration.CurrentConfigurationVersion,
-            EnablePlaybackSource = false,
-        };
-        explicitlyDisabled.Normalize();
-        Assert.IsFalse(explicitlyDisabled.EnablePlaybackSource);
+        Assert.IsTrue(invalid.Normalize());
+        Assert.AreEqual(PluginConfiguration.CurrentConfigurationVersion, invalid.ConfigurationVersion);
+        Assert.AreEqual(PlaybackRoutingMode.Adaptive, invalid.PlaybackMode);
+        Assert.AreEqual(120, invalid.GatewayTimeoutSeconds);
+        Assert.AreEqual(5, invalid.RedirectHopLimit);
+        Assert.AreEqual(4, invalid.RelayConcurrency);
     }
 
     [TestMethod]
@@ -102,14 +103,11 @@ public sealed class PluginConfigurationTests
         var allowed = new[] { "*.CDN.EXAMPLE.INVALID" };
 
         var options = Plugin.CreateDetectedRedirectHostOptions(detected, allowed);
-        var selection = Plugin.CreateDetectedRedirectHostSelection(detected, allowed);
-
         Assert.AreEqual(2, options.Length);
         Assert.IsFalse(options[0].IsEnabled);
         Assert.IsTrue(options[0].Name.StartsWith("edge.cdn.example.invalid", StringComparison.Ordinal));
         Assert.IsTrue(options[1].IsEnabled);
         Assert.AreEqual("pending.invalid", options[1].Name);
-        Assert.AreEqual(string.Empty, selection);
     }
 
     [TestMethod]
@@ -183,7 +181,7 @@ public sealed class PluginConfigurationTests
     }
 
     [TestMethod]
-    public void RedirectHostValidation_AcceptsExactHostsAndExplicitSubdomainRules()
+    public void RedirectHostValidation_AcceptsExactHostsSubdomainRulesAndCidr()
     {
         foreach (var invalid in new[]
                  {
@@ -209,11 +207,12 @@ public sealed class PluginConfigurationTests
                 "media.invalid",
                 " *.CDN.EXAMPLE.INVALID. ",
                 "[::1]",
+                "192.0.2.0/24",
             },
         };
         Assert.IsTrue(options.Normalize());
         CollectionAssert.AreEqual(
-            new[] { "media.invalid", "*.cdn.example.invalid", "::1" },
+            new[] { "media.invalid", "*.cdn.example.invalid", "::1", "192.0.2.0/24" },
             options.AllowedRedirectHosts);
         options.ValidateOrThrow();
 
@@ -270,9 +269,7 @@ public sealed class PluginConfigurationTests
         var options = new PluginConfiguration
         {
             AllowedRedirectHostsText = string.Empty,
-            DetectedRedirectHostsToTrust = Plugin.CreateDetectedRedirectHostSelection(
-                new[] { "edge.cdn.example.invalid" },
-                new[] { "*.cdn.example.invalid" }),
+            DetectedRedirectHostsToTrust = string.Empty,
         };
 
         options.MergeDetectedRedirectHostsToTrust(new[] { "edge.cdn.example.invalid" });

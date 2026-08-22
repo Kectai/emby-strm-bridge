@@ -11,8 +11,7 @@ public sealed class ExtractionStateStore
 {
     internal const int DefaultMaximumEntries = 16384;
     private const int MaximumDocumentBytes = 16 * 1024 * 1024;
-    private const int MaximumObjectGraphItemsPerEntry = 12;
-    internal static readonly TimeSpan RedirectClassificationLifetime = TimeSpan.FromHours(1);
+    private const int MaximumObjectGraphItemsPerEntry = 8;
     private readonly object sync = new();
     private readonly string path;
     private readonly int maximumEntries;
@@ -67,65 +66,7 @@ public sealed class ExtractionStateStore
         }
     }
 
-    public bool? GetRedirectBridgeRequirement(string storageKey, string sourceFingerprint)
-    {
-        ValidateKey(storageKey, nameof(storageKey));
-        ValidateKey(sourceFingerprint, nameof(sourceFingerprint));
-        lock (sync)
-        {
-            return entriesByKey.TryGetValue(storageKey, out var entry) &&
-                   string.Equals(
-                       entry.RedirectClassificationSourceFingerprint,
-                       sourceFingerprint,
-                       StringComparison.Ordinal)
-                ? entry.RequiresRedirectBridge
-                : null;
-        }
-    }
-
-    public bool ShouldRefreshRedirectClassification(
-        string storageKey,
-        string sourceFingerprint,
-        DateTimeOffset now)
-    {
-        ValidateKey(storageKey, nameof(storageKey));
-        ValidateKey(sourceFingerprint, nameof(sourceFingerprint));
-        lock (sync)
-        {
-            return !entriesByKey.TryGetValue(storageKey, out var entry) ||
-                   !string.Equals(
-                       entry.RedirectClassificationSourceFingerprint,
-                       sourceFingerprint,
-                       StringComparison.Ordinal) ||
-                   !entry.RequiresRedirectBridge.HasValue ||
-                   now.UtcDateTime.Ticks >= entry.RedirectClassificationExpiresAtUtcTicks;
-        }
-    }
-
-    public void RecordRedirectBridgeRequirement(
-        string storageKey,
-        string sourceFingerprint,
-        bool requiresRedirectBridge,
-        DateTimeOffset now)
-    {
-        ValidateKey(storageKey, nameof(storageKey));
-        ValidateKey(sourceFingerprint, nameof(sourceFingerprint));
-        lock (sync)
-        {
-            var entry = GetOrCreateEntry(storageKey);
-            entry.RedirectClassificationSourceFingerprint = sourceFingerprint;
-            entry.RequiresRedirectBridge = requiresRedirectBridge;
-            entry.RedirectClassificationExpiresAtUtcTicks =
-                now.Add(RedirectClassificationLifetime).UtcDateTime.Ticks;
-            dirty = true;
-        }
-    }
-
-    public void RecordSuccess(
-        string storageKey,
-        string sourceFingerprint,
-        bool? requiresRedirectBridge = null,
-        DateTimeOffset? classifiedAtUtc = null)
+    public void RecordSuccess(string storageKey, string sourceFingerprint)
     {
         ValidateKey(storageKey, nameof(storageKey));
         ValidateKey(sourceFingerprint, nameof(sourceFingerprint));
@@ -136,14 +77,6 @@ public sealed class ExtractionStateStore
             entry.RetryAtUtcTicks = 0;
             entry.LastSuccessfulSourceFingerprint = sourceFingerprint;
             entry.LastFailureSourceFingerprint = null;
-            if (requiresRedirectBridge.HasValue)
-            {
-                var now = classifiedAtUtc ?? DateTimeOffset.UtcNow;
-                entry.RedirectClassificationSourceFingerprint = sourceFingerprint;
-                entry.RequiresRedirectBridge = requiresRedirectBridge;
-                entry.RedirectClassificationExpiresAtUtcTicks =
-                    now.Add(RedirectClassificationLifetime).UtcDateTime.Ticks;
-            }
             dirty = true;
         }
     }
@@ -329,9 +262,6 @@ public sealed class ExtractionStateStore
                 File.GetLastWriteTimeUtc(temporary) < DateTime.UtcNow.AddMinutes(-5))
                 File.Delete(temporary);
         }
-        var legacy = Path.Combine(directory, stateFileName + ".tmp");
-        if (File.Exists(legacy) && File.GetLastWriteTimeUtc(legacy) < DateTime.UtcNow.AddMinutes(-5))
-            File.Delete(legacy);
     }
 
     private bool TryLoad(string candidatePath, out ExtractionStateDocument? loaded)
@@ -363,15 +293,13 @@ public sealed class ExtractionStateStore
             }
             using var buffer = new MemoryStream(data, writable: false);
             loaded = serializer.ReadObject(buffer) as ExtractionStateDocument;
-            if (loaded?.SchemaVersion != 1 || loaded.Entries is null) return false;
+            if (loaded?.SchemaVersion != 2 || loaded.Entries is null) return false;
             loaded.Entries = loaded.Entries
                 .Where(entry => IsKey(entry.StorageKey) &&
                                 (string.IsNullOrEmpty(entry.LastSuccessfulSourceFingerprint) ||
                                  IsKey(entry.LastSuccessfulSourceFingerprint)) &&
                                 (string.IsNullOrEmpty(entry.LastFailureSourceFingerprint) ||
-                                 IsKey(entry.LastFailureSourceFingerprint)) &&
-                                (string.IsNullOrEmpty(entry.RedirectClassificationSourceFingerprint) ||
-                                 IsKey(entry.RedirectClassificationSourceFingerprint)))
+                                 IsKey(entry.LastFailureSourceFingerprint)))
                 .GroupBy(entry => entry.StorageKey, StringComparer.Ordinal)
                 .Select(group => group.First())
                 .Take(maximumEntries)
@@ -420,7 +348,7 @@ public sealed class ExtractionStateStore
     [DataContract]
     private sealed class ExtractionStateDocument
     {
-        [DataMember(Order = 1)] public int SchemaVersion { get; set; } = 1;
+        [DataMember(Order = 1)] public int SchemaVersion { get; set; } = 2;
         [DataMember(Order = 2)] public List<ExtractionStateEntry> Entries { get; set; } = new();
         [DataMember(Order = 3, EmitDefaultValue = false)] public bool CapacityExceeded { get; set; }
     }
@@ -433,10 +361,5 @@ public sealed class ExtractionStateStore
         [DataMember(Order = 3)] public long RetryAtUtcTicks { get; set; }
         [DataMember(Order = 4, EmitDefaultValue = false)] public string? LastSuccessfulSourceFingerprint { get; set; }
         [DataMember(Order = 5, EmitDefaultValue = false)] public string? LastFailureSourceFingerprint { get; set; }
-        [DataMember(Order = 6, EmitDefaultValue = false)] public bool? RequiresRedirectBridge { get; set; }
-        [DataMember(Order = 7, EmitDefaultValue = false)]
-        public string? RedirectClassificationSourceFingerprint { get; set; }
-        [DataMember(Order = 8, EmitDefaultValue = false)]
-        public long RedirectClassificationExpiresAtUtcTicks { get; set; }
     }
 }

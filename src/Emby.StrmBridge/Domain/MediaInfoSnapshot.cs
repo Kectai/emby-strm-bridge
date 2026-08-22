@@ -10,7 +10,7 @@ namespace Emby.StrmBridge.Domain;
 [DataContract]
 public sealed class MediaInfoSnapshot
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
     public const int MaximumMediaStreams = 256;
 
     [DataMember(Order = 1)]
@@ -49,14 +49,10 @@ public sealed class MediaInfoSnapshot
     [DataMember(Order = 12)]
     public List<MediaStreamSnapshot> MediaStreams { get; set; } = new();
 
-    [DataMember(Order = 13, EmitDefaultValue = false)]
-    public bool? RequiresRedirectBridge { get; set; }
-
     public static MediaInfoSnapshot FromMediaSource(
         SourceIdentity source,
         MediaSourceInfo mediaSource,
-        DateTimeOffset extractedAtUtc,
-        bool? requiresRedirectBridge = null)
+        DateTimeOffset extractedAtUtc)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (mediaSource is null) throw new ArgumentNullException(nameof(mediaSource));
@@ -72,7 +68,6 @@ public sealed class MediaInfoSnapshot
             RunTimeTicks = mediaSource.RunTimeTicks,
             DefaultAudioStreamIndex = mediaSource.DefaultAudioStreamIndex,
             DefaultSubtitleStreamIndex = mediaSource.DefaultSubtitleStreamIndex,
-            RequiresRedirectBridge = requiresRedirectBridge,
             MediaStreams = (mediaSource.MediaStreams ?? new List<MediaStream>())
                 .Where(stream => !stream.IsExternal && IsSupportedStreamType(stream.Type))
                 .Take(MaximumMediaStreams)

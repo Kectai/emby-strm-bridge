@@ -109,8 +109,15 @@
       "emby.strmbridge": {
         "type": "Project",
         "dependencies": {
+          "Lib.Harmony": "[2.4.2, )",
           "MediaBrowser.Server.Core": "[4.9.1.80, )"
         }
+      },
+      "Lib.Harmony": {
+        "type": "CentralTransitive",
+        "requested": "[2.4.2, )",
+        "resolved": "2.4.2",
+        "contentHash": "D2X9ojVjqbqdqWVK3VQETrEb56yVoXxtEp6tP5UvW0PP+bA4uJiswqOxF8GhH02ECwyevUa9vwhwdLzyXfksbw=="
       },
       "MediaBrowser.Server.Core": {
         "type": "CentralTransitive",

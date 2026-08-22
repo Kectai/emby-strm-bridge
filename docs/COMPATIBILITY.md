@@ -1,39 +1,43 @@
 # Compatibility
 
-## Compiled baseline
+## Current baseline
 
-- Target framework: `netstandard2.1`
-- Emby SDK: `MediaBrowser.Server.Core 4.9.1.80`
-- First intended host verification: Emby Server 4.9.5.0
+- target framework: `netstandard2.1`
+- compile-time Emby SDK: `MediaBrowser.Server.Core 4.9.1.80`
+- playback ABI: `Emby.Server.MediaEncoding 4.9.5.x`
+- Harmony runtime: `Lib.Harmony 2.4.2`, `net6.0`
 
-The repository compiles against the SDK baseline and tests its host-independent behavior. An Emby Server binary and configured media library are not present in this workspace, so the M0 real-host checks below are deliberately not marked complete.
+The local Emby Server 4.9.5.0 assemblies were inspected by `tools/Emby.ApiProbe`. The implementation verifies these runtime signatures:
 
-## Required M0 host checks
+```text
+Task<object> MediaInfoService.Get(GetPlaybackInfo)
+Task<object> MediaInfoService.Post(GetPostedPlaybackInfo)
+Task<object> BaseProgressiveStreamingService.ProcessRequest(StreamRequest, bool)
+Task<TranscodingJob> BaseStreamingService.StartFfMpeg(StreamState, string, CancellationToken, bool)
+PlaybackInfoResponse.MediaSources
+MediaSourceInfo.DirectStreamUrl
+```
 
-Run these before relying on the playback bridge in production:
+An ABI mismatch leaves playback native and logs one fixed compatibility event. Extraction, persistence and maintenance continue independently.
 
-1. Confirm automatic type discovery loads the entry point, post-scan task, scheduled task, API services, and exactly one alternate media-source provider without replacing built-in providers.
-2. Confirm redirecting movie and episode STRM items receive the provider's alternate source, while direct-media STRM items retain only their original source.
-3. Record source ordering in PlaybackInfo for direct play, direct stream, and transcode.
-4. Confirm `RequiredHttpHeaders` reaches Emby FFmpeg during technical probing.
-5. Confirm `RequiresOpening = false` avoids live-stream-only lifecycle assumptions.
-6. Measure PlaybackInfo wait behavior against FFmpeg input-validation timeouts.
-7. Confirm `AddMediaInfoWithProbeSafe` scalar results saved through `ILibraryManager.UpdateItems` with `saveMetadata = false` and streams saved through `IItemRepository.SaveMediaStreams` survive item reload and do not create or rewrite NFO files.
-8. Verify the gateway route works with the server's configured API base path, client requests retain their authenticated user context, and server-side consumers reach the absolute loopback URL without `X-Forwarded-For`, `X-Real-IP`, or RFC `Forwarded` headers.
-9. Exercise same-host and explicitly allowlisted cross-host redirects, including chained redirects, DNS changes, non-default ports, and rejection of an untrusted loopback/private first target.
-10. Exercise seek/reconnect after the two-minute unbound window and near the 24-hour bound-ticket limit with MP4, MKV multi-audio, and M2TS/PCM samples.
-11. After successful, failed, and timed-out probes, audit Emby and FFmpeg logs to confirm full source/final URLs, query values, headers, and gateway tickets are absent or operationally redacted.
-12. Race a library-file replacement and confirm the deployment's filesystem permissions keep untrusted local writers outside the STRM and plugin-configuration directories.
-13. Confirm pending-host warnings appear once in the administrator dashboard activity log without any external notification service configured; when such a service is configured, confirm its link opens the native STRM Bridge settings page. Saving newly trusted hosts must queue one automatic retry and record a counts-only completion activity.
-14. With only the memory-only M5.0 prototype enabled, create a synthetic managed STRM and confirm its default static source reaches the managed route for direct play, direct stream, and transcode without selecting an alternate provider.
-15. Repeat the prototype test through the current external-player plugin: it must obtain the managed address from `GetStaticMediaSources`, complete both control-plane redirects within the timeout, and expose only the final temporary target to the launched player.
-16. Confirm optional `.mkv`, `.mp4`, and `.m2ts` hints improve or preserve target-client behavior, while no-suffix routes remain valid and unknown suffixes fail closed.
-17. Confirm prototype direct 200/206 sources fail without returning the original source URL, and scan plugin, Emby, FFmpeg, and reverse-proxy logs for both the source and managed capability.
+## Playback clients
 
-If any playback-related check fails on a host, turn off **Enable STRM Bridge playback** and use media-information extraction and URL-free persistence independently until that host integration is corrected.
+The plugin exposes ordinary HTTP GET/HEAD routes with Range support. It supports clients that consume `DirectStreamUrl` and clients that request Emby's standard static-video route with an exact media-source ID. Client-specific names and vendor identifiers are absent from routing decisions.
 
-## Client expectations
+The standard-route adapter activates only for `Static=true` requests whose exact media source maps to a `.strm` item in a participating library. When Emby starts server-side transcoding, a separate adapter revalidates the per-job item, exact media-source ID and unchanged STRM source, then changes that job's `StreamState` input to a gateway URL using the local API origin reported by the running Emby instance. PlaybackInfo source and probe paths stay native. Local files, unmatched media versions and libraries outside the configured scope remain on Emby's native path.
 
-The gateway maintains User-Agent consistency by resolving only after the real gateway request arrives and forwarding that normalized User-Agent to the source. The same consumer should use its own User-Agent while following the 302. Clients that rewrite User-Agent between redirect hops may fail with sources that bind temporary URLs to that header.
+## Upstream behavior
 
-Browser-native support for M2TS, PCM, subtitle formats, and HDR is outside this plugin. Emby may still choose remuxing or transcoding based on the extracted stream information.
+Adaptive mode relays both redirected and direct-body sources. This keeps the actual playback User-Agent and request headers on the server-side redirect chain. RedirectOnly mode exposes the validated final URL to the client and therefore suits sources whose final URL is independent of the resolving request.
+
+Adaptive mode follows the chain and relays the final response within the same gateway request. Release validation uses the live 4.9.5.x matrix in [TESTING.md](TESTING.md).
+
+## Host verification
+
+Follow [TESTING.md](TESTING.md) after installation. The required first signal is:
+
+```text
+STRM_BRIDGE_PATCH_READY abi=4.9.5.0 targets=4
+```
+
+`Native` mode is the operational fallback for an unsupported host and keeps PlaybackInfo, standard-video execution and FFmpeg input unchanged.

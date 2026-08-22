@@ -7,29 +7,6 @@ namespace Emby.StrmBridge.Tests;
 public sealed class PersistenceSecurityTests
 {
     [TestMethod]
-    public void ExtractionState_RedirectClassificationIsVersionBoundAndRefreshesAtBoundary()
-    {
-        using var workspace = new TestWorkspace();
-        var store = new ExtractionStateStore(
-            Path.Combine(workspace.Path, "state", "extraction-state.json"));
-        var key = new string('a', 64);
-        var fingerprint = new string('b', 64);
-        var changedFingerprint = new string('c', 64);
-        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
-
-        store.RecordRedirectBridgeRequirement(key, fingerprint, true, now);
-
-        Assert.AreEqual(true, store.GetRedirectBridgeRequirement(key, fingerprint));
-        Assert.IsFalse(store.ShouldRefreshRedirectClassification(key, fingerprint, now));
-        Assert.IsTrue(store.ShouldRefreshRedirectClassification(
-            key,
-            fingerprint,
-            now.Add(ExtractionStateStore.RedirectClassificationLifetime)));
-        Assert.IsTrue(store.ShouldRefreshRedirectClassification(key, changedFingerprint, now));
-        Assert.IsNull(store.GetRedirectBridgeRequirement(key, changedFingerprint));
-    }
-
-    [TestMethod]
     public void IdentityKey_IsStablePrivateAndRepositoryLocalToConfiguredDirectory()
     {
         using var workspace = new TestWorkspace();
@@ -123,19 +100,15 @@ public sealed class PersistenceSecurityTests
     {
         using var workspace = new TestWorkspace();
         var store = new MediaInfoStore(workspace.Path, new SnapshotSerializer());
-        var matching = Path.Combine(workspace.Path, new string('b', 64) + ".json.tmp");
         var randomized = Path.Combine(
             workspace.Path,
             new string('c', 64) + ".json." + new string('d', 32) + ".tmp");
         var unrelated = Path.Combine(workspace.Path, "unrelated.json.tmp");
-        File.WriteAllText(matching, "temporary");
         File.WriteAllText(randomized, "temporary");
         File.WriteAllText(unrelated, "keep");
-        File.SetLastWriteTimeUtc(matching, DateTime.UtcNow.AddMinutes(-10));
         File.SetLastWriteTimeUtc(randomized, DateTime.UtcNow.AddMinutes(-10));
 
-        Assert.AreEqual(2, store.RemoveTemporaryFiles());
-        Assert.IsFalse(File.Exists(matching));
+        Assert.AreEqual(1, store.RemoveTemporaryFiles());
         Assert.IsFalse(File.Exists(randomized));
         Assert.IsTrue(File.Exists(unrelated));
     }
@@ -199,7 +172,7 @@ public sealed class PersistenceSecurityTests
     }
 
     [TestMethod]
-    public void ExtractionState_FullClassifiedCapacityCanBeSavedAndReloaded()
+    public void ExtractionState_FullCapacityCanBeSavedAndReloaded()
     {
         using var workspace = new TestWorkspace();
         var path = Path.Combine(workspace.Path, "state", "extraction-state.json");
@@ -209,11 +182,7 @@ public sealed class PersistenceSecurityTests
         {
             var key = index.ToString("x64");
             var fingerprint = (index + ExtractionStateStore.DefaultMaximumEntries).ToString("x64");
-            store.RecordSuccess(
-                key,
-                fingerprint,
-                requiresRedirectBridge: true,
-                classifiedAtUtc: now);
+            store.RecordSuccess(key, fingerprint);
             store.RecordFailure(key, fingerprint, now);
         }
 
@@ -223,7 +192,6 @@ public sealed class PersistenceSecurityTests
         var lastFingerprint = (2 * ExtractionStateStore.DefaultMaximumEntries - 1).ToString("x64");
 
         Assert.AreEqual(lastFingerprint, reloaded.GetLastSuccessfulFingerprint(lastKey));
-        Assert.AreEqual(true, reloaded.GetRedirectBridgeRequirement(lastKey, lastFingerprint));
     }
 
     [TestMethod]

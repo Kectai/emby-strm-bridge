@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using Emby.StrmBridge.Configuration;
 
@@ -25,17 +24,16 @@ public sealed class RedirectPolicy
         {
             throw new RedirectRejectedException(RedirectRejectionReason.InvalidLocation);
         }
-        if (!Uri.TryCreate(location, UriKind.Absolute, out var target) ||
+        if (!Uri.TryCreate(source, location, out var target) ||
             (!string.Equals(target.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
              !string.Equals(target.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) ||
             !string.IsNullOrEmpty(target.UserInfo) || !string.IsNullOrEmpty(target.Fragment))
         {
             throw new RedirectRejectedException(RedirectRejectionReason.UnsafeLocation);
         }
-        if (CopiesCredentialValue(source, target))
-        {
-            throw new RedirectRejectedException(RedirectRejectionReason.CredentialPropagation);
-        }
+        if (string.Equals(source.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(target.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+            throw new RedirectRejectedException(RedirectRejectionReason.InsecureDowngrade);
         if (!IsTrustedTargetHost(source, target))
         {
             untrustedHostObserver?.Invoke(PluginConfiguration.NormalizeHost(target.IdnHost));
@@ -52,47 +50,18 @@ public sealed class RedirectPolicy
         return PluginConfiguration.IsHostAllowed(targetHost, allowedHostsProvider());
     }
 
-    private static bool CopiesCredentialValue(Uri source, Uri target)
-    {
-        var sourceValues = ParseQueryValues(source.Query)
-            .Where(value => value.Length >= 12)
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-        if (sourceValues.Length == 0) return false;
-
-        string targetMaterial;
-        try { targetMaterial = Uri.UnescapeDataString(target.Host + target.AbsolutePath + target.Query); }
-        catch (UriFormatException)
-        {
-            throw new RedirectRejectedException(RedirectRejectionReason.InvalidLocation);
-        }
-        return sourceValues.Any(value => targetMaterial.IndexOf(value, StringComparison.Ordinal) >= 0);
-    }
-
-    private static IEnumerable<string> ParseQueryValues(string query)
-    {
-        if (string.IsNullOrEmpty(query)) yield break;
-        foreach (var pair in query.TrimStart('?').Split('&'))
-        {
-            var separator = pair.IndexOf('=');
-            if (separator < 0 || separator == pair.Length - 1) continue;
-            string decoded;
-            try { decoded = Uri.UnescapeDataString(pair.Substring(separator + 1)); }
-            catch (UriFormatException) { continue; }
-            yield return decoded;
-        }
-    }
 }
 
 public enum RedirectRejectionReason
 {
     InvalidLocation,
     UnsafeLocation,
-    CredentialPropagation,
+    InsecureDowngrade,
     UntrustedTargetHost,
     InvalidUserAgent,
     UnexpectedStatus,
     PermanentFailure,
+    TooManyRedirects,
 }
 
 public sealed class RedirectRejectedException : Exception

@@ -18,7 +18,6 @@ public sealed class RedirectPolicyTests
 
     [TestMethod]
     [DataRow("")]
-    [DataRow("/relative")]
     [DataRow("file:///etc/passwd")]
     [DataRow("https://user:pass@media.invalid/video")]
     [DataRow("https://media.invalid/video#fragment")]
@@ -30,12 +29,22 @@ public sealed class RedirectPolicyTests
     }
 
     [TestMethod]
-    public void Validate_RejectsCredentialValueCopiedToAnotherPartOfTarget()
+    public void Validate_ResolvesRelativeRedirectAgainstCurrentSource()
     {
-        var exception = Assert.ThrowsExactly<RedirectRejectedException>(() => policy.Validate(
-            new Uri("https://source.invalid/start?credential=long-source-secret"),
-            "https://media.invalid/path/long-source-secret/video"));
-        Assert.AreEqual(RedirectRejectionReason.CredentialPropagation, exception.Reason);
+        var target = policy.Validate(new Uri("https://source.invalid/start/path"), "/media/video");
+
+        Assert.AreEqual("https://source.invalid/media/video", target.AbsoluteUri);
+    }
+
+    [TestMethod]
+    public void Validate_RejectsHttpsToHttpDowngrade()
+    {
+        var exception = Assert.ThrowsExactly<RedirectRejectedException>(() =>
+            policy.Validate(
+                new Uri("https://media.invalid/start"),
+                "http://media.invalid/video"));
+
+        Assert.AreEqual(RedirectRejectionReason.InsecureDowngrade, exception.Reason);
     }
 
     [TestMethod]
@@ -45,22 +54,9 @@ public sealed class RedirectPolicyTests
         var exception = Assert.ThrowsExactly<RedirectRejectedException>(() =>
             new RedirectPolicy(untrustedHostObserver: host => detectedHost = host).Validate(
                 new Uri("https://source.invalid/start"),
-                "http://127.0.0.1/internal"));
+                "https://127.0.0.1/internal"));
         Assert.AreEqual(RedirectRejectionReason.UntrustedTargetHost, exception.Reason);
         Assert.AreEqual("127.0.0.1", detectedHost);
-    }
-
-    [TestMethod]
-    public void Validate_DoesNotReportAnUntrustedHostThatContainsASourceCredential()
-    {
-        string? detectedHost = null;
-        var exception = Assert.ThrowsExactly<RedirectRejectedException>(() =>
-            new RedirectPolicy(untrustedHostObserver: host => detectedHost = host).Validate(
-                new Uri("https://source.invalid/start?token=long-source-secret"),
-                "https://long-source-secret.attacker.invalid/video"));
-
-        Assert.AreEqual(RedirectRejectionReason.CredentialPropagation, exception.Reason);
-        Assert.IsNull(detectedHost);
     }
 
     [TestMethod]

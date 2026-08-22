@@ -6,7 +6,7 @@
 ./scripts/verify.sh
 ```
 
-The script uses repository-local locations for all mutable tooling state:
+All mutable test state uses repository-local paths:
 
 - `.local/dotnet-home`
 - `.local/nuget/packages`
@@ -15,31 +15,63 @@ The script uses repository-local locations for all mutable tooling state:
 - `.local/test-work`
 - `.local/test-results`
 
-Automated coverage includes strict STRM encoding, ancestor symlink rejection and URL policy; HMAC identities; exact-host and label-bounded explicit subdomain redirect policy; playback-default configuration migration; embedded English, Simplified Chinese, and Traditional Chinese administrator resources with English fallback and complete public keys; enabled/disabled playback-source generation with an opaque client route and absolute loopback server path; direct-loopback versus forwarded-request classification; privacy-safe provider lifecycle logging; counts-only administrator dashboard activity without an external notifier, optional notification targeting, new-host warning rearming, and automatic trust retry; retained exact/wildcard trusted-host presentation state and manual host entry; authorized-user ticket binding, local-server redemption, reconnect lifetime, scope and capacity; 30-second lease boundaries; direct 200/206 probe handling; User-Agent isolation; bounded single-flight behavior; abandoned-flight cancellation; global pending capacity; shared failure backoff; burst limits; cache-clear races; coalesced post-scan reruns; cancellation-time state flush; scalar and media-stream repository persistence, compensating rollback, repository-only external-stream preservation, conflict-free external subtitle reindexing, non-playback stream filtering, fresh-probe behavior when only-missing mode is disabled, and selected-library stored-information clearing; changed-STRM re-extraction; bounded whitelist serialization; main/backup recovery; and orphan cleanup. M5.0 tests cover opaque managed route generation, optional allowlisted container hints, unsafe input rejection, record capacity and expiry, Emby-authenticated server integration credentials on the still-authenticated management routes, consumer User-Agent propagation, direct 200/206 rejection, tamper handling, lifecycle invalidation, and suppression of late leases after clearing. Loopback TCP integration tests verify Range and User-Agent headers without following `Location`, delayed-response failure, `Retry-After`, permanent failures, and unsafe `Location` rejection.
+Coverage includes:
 
-`./scripts/package.sh` additionally tests ZIP integrity, an exact entry allowlist, absent ZIP extra fields, and byte equality between the archived DLL and the verified Release build.
+- strict STRM input and HMAC source identities
+- media-information extraction, replacement, recovery and clearing
+- configuration normalization, media-library selection, exact hosts, CIDR and subdomain rules
+- PlaybackInfo result processing independent of host patch attachment
+- standard static-video routing for exact STRM media-source matches
+- per-job FFmpeg input routing for exact STRM media-source matches
+- native fallback for dynamic, non-STRM, unmatched and out-of-scope video requests
+- media-source count, order, ID and metadata preservation
+- server-relative route construction with Emby path prefixes
+- random ticket scope, user binding, capability access, lifetime and capacity
+- multi-hop relative redirects
+- client User-Agent and Range forwarding
+- redirect-lease reuse across Range requests, expiry, clearing and invalid-target fallback
+- one bounded source re-resolution for a rejected fresh redirect target, with no retry for direct sources
+- adaptive transport selection and relay concurrency
+- HLS signature detection, replayable prefix handling, line and URI-attribute rewriting
+- host detection, administrator notification and automatic retry
+- privacy-safe logging and persistence
+- embedded dependency identity verification, deterministic package contents and DLL byte verification
 
-## Manual host matrix
+## Package verification
 
-Use synthetic hostnames, accounts, signatures, and titles. Never place production URLs or credentials in test logs or fixtures.
+```sh
+./scripts/package.sh
+```
 
-| Case | Expected result |
-| --- | --- |
-| 302 redirect | One first-hop Range request, then direct consumer access |
-| Delayed 302 | Bounded by item/source timeout and cancellation |
-| 401/403/404/410 | Stable unavailable response; no success cache |
-| 408/429/5xx | 503 with bounded `Retry-After`; shared source backoff |
-| Unsafe Location | Ticket revoked; no target request |
-| Same source, two User-Agents | Separate successful leases |
-| Repeated request within 30 seconds | No repeated source resolution |
-| Request at/after 30 seconds | New source resolution; no stale fallback |
-| Changed STRM after ticket issue | Ticket rejected |
-| Rebuilt library with unchanged STRM | Snapshot restored without remote probe |
-| Corrupt main snapshot | Valid backup restored |
-| Corrupt main and backup | Refuse overwrite and log fixed failure event |
-| Managed prototype 302 | One opaque static route resolves to an approved temporary target |
-| Managed prototype 200/206 | Unavailable; original source never appears in `Location` |
-| Managed prototype after one hour/clear/restart | Unavailable; no stale lease |
-| Managed prototype with external-player relay | Two bounded control redirects, media body fetched only from the final target |
+Packaging verifies:
 
-Complete the real Emby host checks in [COMPATIBILITY.md](COMPATIBILITY.md) before calling alternate playback stable.
+- complete Release build
+- one self-contained `Emby.StrmBridge.dll` with the expected embedded Harmony identity
+- exact archive entry allowlist
+- ZIP integrity
+- normalized timestamps and absent extra fields
+- byte identity between built and archived DLLs
+- release-document vendor-term scan
+
+## Emby 4.9.5.0 host matrix
+
+1. Confirm `STRM_BRIDGE_PATCH_READY` reports the installed 4.9.5.x ABI and four targets.
+2. Confirm GET and POST PlaybackInfo both retain source count, order and IDs.
+3. Confirm a matching source receives a relative `/StrmBridge/Playback/v2/` URL.
+4. Confirm Emby Web direct play reaches the gateway.
+5. Confirm an external player launched through Emby reaches the same gateway URL.
+6. Exercise a direct-body source with `200` and `206`.
+7. Exercise one-hop and multi-hop redirects.
+8. Exercise a User-Agent-bound final address in `Adaptive` mode.
+9. Exercise `HEAD`, initial playback, repeated seek, reconnect and resume.
+10. Exercise HLS master playlist, media playlist, audio, subtitle, key, map and segment resources.
+11. Repeat through HTTPS and an Emby API path prefix.
+12. Request `/Videos/{id}/stream` with the exact media-source ID and `Static=true`; confirm the matching STRM reaches the gateway.
+13. Repeat with a local file, a different media-source ID and `Static=false`; confirm each remains on Emby's native path.
+14. Force an exact STRM source through HLS transcoding; confirm `STRM_BRIDGE_TRANSCODE_INPUT_ROUTED` appears before the gateway event and FFmpeg opens the loopback gateway input.
+15. Repeat transcoding with a local file, a different media-source ID and an out-of-scope library; confirm each keeps the native FFmpeg input.
+16. Switch to `Native` and confirm the original PlaybackInfo, standard-video and FFmpeg input paths remain unchanged.
+17. Stop Emby and confirm the next start reports one clean patch installation.
+18. Audit plugin, Emby and reverse-proxy logs for source URLs, query signatures and tickets.
+
+Use synthetic names and credentials for fixtures and reports.

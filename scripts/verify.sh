@@ -15,11 +15,13 @@ export DOTNET_NOLOGO=1
 mkdir -p "$DOTNET_CLI_HOME" "$NUGET_PACKAGES" "$NUGET_HTTP_CACHE_PATH" \
   "$STRM_BRIDGE_TEST_ROOT" "$TMPDIR" "$project_root/.local/test-results"
 
-dotnet restore Emby.StrmBridge.slnx
-dotnet build Emby.StrmBridge.slnx --no-restore --configuration Release
+dotnet restore Emby.StrmBridge.slnx --disable-build-servers
+dotnet build Emby.StrmBridge.slnx --no-restore --configuration Release \
+  --disable-build-servers -m:1 -p:UseSharedCompilation=false
 dotnet format Emby.StrmBridge.slnx --no-restore --verify-no-changes --severity warn
 dotnet test tests/Emby.StrmBridge.Tests/Emby.StrmBridge.Tests.csproj \
   --no-build --no-restore --configuration Release \
+  --disable-build-servers \
   --results-directory "$project_root/.local/test-results"
 "$project_root/scripts/check-privacy.sh"
 

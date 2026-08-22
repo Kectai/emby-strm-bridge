@@ -30,6 +30,7 @@ public sealed class MaintenanceService : IDisposable
             if (Volatile.Read(ref stopping) != 0) return;
             runtime.Tickets.RemoveExpired();
             runtime.Redirects?.RemoveExpired();
+            runtime.Gateway?.RemoveExpiredRedirectLeases();
             runtime.MediaInfoStore?.RemoveTemporaryFiles();
         }
         catch (Exception)

@@ -20,14 +20,17 @@ public static class PluginStrings
     public static string EditorTitle => Get(nameof(EditorTitle));
     public static string EditorDescription => Get(nameof(EditorDescription));
     public static string Enabled => Get(nameof(Enabled));
-    public static string EnablePlaybackSource => Get(nameof(EnablePlaybackSource));
-    public static string EnablePlaybackSourceDescription => Get(nameof(EnablePlaybackSourceDescription));
+    public static string PlaybackMode => Get(nameof(PlaybackMode));
+    public static string PlaybackModeDescription => Get(nameof(PlaybackModeDescription));
     public static string ExtractAfterLibraryScan => Get(nameof(ExtractAfterLibraryScan));
     public static string OnlyMissingMediaInfo => Get(nameof(OnlyMissingMediaInfo));
     public static string OnlyMissingMediaInfoDescription => Get(nameof(OnlyMissingMediaInfoDescription));
     public static string EnablePersistence => Get(nameof(EnablePersistence));
     public static string MaximumExtractionConcurrency => Get(nameof(MaximumExtractionConcurrency));
     public static string ExtractionTimeoutSeconds => Get(nameof(ExtractionTimeoutSeconds));
+    public static string GatewayTimeoutSeconds => Get(nameof(GatewayTimeoutSeconds));
+    public static string RedirectHopLimit => Get(nameof(RedirectHopLimit));
+    public static string RelayConcurrency => Get(nameof(RelayConcurrency));
     public static string IncludedLibraryIds => Get(nameof(IncludedLibraryIds));
     public static string IncludedLibraryIdsDescription => Get(nameof(IncludedLibraryIdsDescription));
     public static string DetectedRedirectHosts => Get(nameof(DetectedRedirectHosts));
@@ -41,6 +44,7 @@ public static class PluginStrings
     public static string RetryCompletedNotificationDescription => Get(nameof(RetryCompletedNotificationDescription));
     public static string ConcurrencyValidation => Get(nameof(ConcurrencyValidation));
     public static string TimeoutValidation => Get(nameof(TimeoutValidation));
+    public static string GatewayValidation => Get(nameof(GatewayValidation));
     public static string LibraryValidation => Get(nameof(LibraryValidation));
     public static string RedirectHostValidation => Get(nameof(RedirectHostValidation));
     public static string RedirectHostCapacityValidation => Get(nameof(RedirectHostCapacityValidation));
@@ -54,12 +58,6 @@ public static class PluginStrings
     public static string InvalidLibraryIdError => Get(nameof(InvalidLibraryIdError));
     public static string AuthenticatedUserRequiredError => Get(nameof(AuthenticatedUserRequiredError));
     public static string AdministratorRequiredError => Get(nameof(AdministratorRequiredError));
-    public static string ManagedPrototypeConfirmationRequiredError =>
-        Get(nameof(ManagedPrototypeConfirmationRequiredError));
-    public static string ManagedPrototypeInvalidSourceError => Get(nameof(ManagedPrototypeInvalidSourceError));
-    public static string ManagedPrototypeInvalidContainerError => Get(nameof(ManagedPrototypeInvalidContainerError));
-    public static string ManagedPrototypeCapacityError => Get(nameof(ManagedPrototypeCapacityError));
-    public static string ManagedPrototypeUnavailableError => Get(nameof(ManagedPrototypeUnavailableError));
 
     private static string Get(string key)
     {

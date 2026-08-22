@@ -173,9 +173,6 @@ public sealed class MediaInfoStore
 
     private static bool IsSnapshotTemporaryName(string name)
     {
-        const string legacySuffix = ".json.tmp";
-        if (name.EndsWith(legacySuffix, StringComparison.Ordinal))
-            return IsStorageKey(name.Substring(0, name.Length - legacySuffix.Length));
         const string marker = ".json.";
         const string suffix = ".tmp";
         if (!name.EndsWith(suffix, StringComparison.Ordinal) ||

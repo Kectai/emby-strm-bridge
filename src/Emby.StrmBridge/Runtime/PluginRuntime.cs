@@ -6,7 +6,6 @@ using System.Threading;
 using Emby.StrmBridge.Configuration;
 using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Extraction;
-using Emby.StrmBridge.Managed;
 using Emby.StrmBridge.Persistence;
 using Emby.StrmBridge.Playback;
 using Emby.StrmBridge.Policy;
@@ -23,6 +22,9 @@ public sealed class PluginRuntime : IDisposable
     private PluginConfiguration options = new();
     private int generation;
     private int pendingHostNotificationState;
+    private PlaybackPatchStatus playbackPatchStatus;
+    private string hostAbi = "unavailable";
+    private HarmonyPatchHost? playbackPatch;
     private bool disposed;
 
     public IClock Clock { get; private set; } = new SystemClock();
@@ -37,7 +39,7 @@ public sealed class PluginRuntime : IDisposable
 
     public RedirectResolver? Redirects { get; private set; }
 
-    internal ManagedPrototypeRegistry? ManagedPrototypes { get; private set; }
+    public GatewayTransport? Gateway { get; private set; }
 
     public ExtractionCoordinator? Extraction { get; internal set; }
 
@@ -45,7 +47,46 @@ public sealed class PluginRuntime : IDisposable
 
     public string? DataDirectory { get; private set; }
 
-    public bool IsInitialized => SourcePolicy is not null && Redirects is not null && ManagedPrototypes is not null;
+    public bool IsInitialized => SourcePolicy is not null && Redirects is not null && Gateway is not null;
+
+    public int Generation
+    {
+        get { lock (sync) return generation; }
+    }
+
+    public PlaybackHealthSnapshot GetPlaybackHealth()
+    {
+        lock (sync)
+        {
+            return new PlaybackHealthSnapshot(
+                playbackPatchStatus,
+                hostAbi,
+                generation,
+                Tickets.Count,
+                Gateway?.ActiveRequests ?? 0);
+        }
+    }
+
+    internal void SetPlaybackHealth(PlaybackPatchStatus status, string abi)
+    {
+        lock (sync)
+        {
+            if (disposed) return;
+            playbackPatchStatus = status;
+            hostAbi = string.IsNullOrWhiteSpace(abi) ? "unavailable" : abi;
+        }
+    }
+
+    internal void AttachPlaybackPatch(HarmonyPatchHost patch)
+    {
+        if (patch is null) throw new ArgumentNullException(nameof(patch));
+        lock (sync)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(PluginRuntime));
+            if (playbackPatch is not null) throw new InvalidOperationException("The playback patch is already attached.");
+            playbackPatch = patch;
+        }
+    }
 
     public PluginConfiguration GetOptionsSnapshot()
     {
@@ -70,7 +111,7 @@ public sealed class PluginRuntime : IDisposable
             operationCancellation = new CancellationTokenSource();
             Tickets.Clear();
             Redirects?.Clear();
-            ManagedPrototypes?.Clear();
+            Gateway?.Clear();
             if (!options.Enabled) ClearDetectedRedirectHosts();
         }
         previous.Cancel();
@@ -91,14 +132,15 @@ public sealed class PluginRuntime : IDisposable
             MediaInfoStore = new MediaInfoStore(Path.Combine(DataDirectory, "mediainfo"), new SnapshotSerializer());
             ExtractionState = new ExtractionStateStore(Path.Combine(DataDirectory, "state", "extraction-state.json"));
             Tickets = new TicketStore(Clock);
-            ManagedPrototypes = new ManagedPrototypeRegistry(Clock);
+            var redirectPolicy = new RedirectPolicy(
+                () => GetOptionsSnapshot().AllowedRedirectHosts,
+                RecordDetectedRedirectHost);
             Redirects = new RedirectResolver(
                 sourceClient ?? new HttpRedirectSourceClient(() =>
                     TimeSpan.FromSeconds(GetOptionsSnapshot().ExtractionTimeoutSeconds)),
-                new RedirectPolicy(
-                    () => GetOptionsSnapshot().AllowedRedirectHosts,
-                    RecordDetectedRedirectHost),
+                redirectPolicy,
                 Clock);
+            Gateway = new GatewayTransport(redirectPolicy, Clock);
         }
     }
 
@@ -182,39 +224,11 @@ public sealed class PluginRuntime : IDisposable
             operationCancellation = new CancellationTokenSource();
             Tickets.Clear();
             Redirects?.Clear();
-            ManagedPrototypes?.Clear();
+            Gateway?.Clear();
             ClearDetectedRedirectHosts();
         }
         previous.Cancel();
         previous.Dispose();
-    }
-
-    internal ManagedPrototypeRegistration CreateManagedPrototype(string sourceUrl, string? containerHint)
-    {
-        lock (sync)
-        {
-            if (disposed || !options.Enabled || ManagedPrototypes is null)
-                throw new ManagedPrototypeUnavailableException();
-            return ManagedPrototypes.Create(sourceUrl, containerHint);
-        }
-    }
-
-    internal int ClearManagedPrototypes()
-    {
-        CancellationTokenSource previous;
-        int cleared;
-        lock (sync)
-        {
-            if (disposed || ManagedPrototypes is null) return 0;
-            generation++;
-            previous = operationCancellation;
-            operationCancellation = new CancellationTokenSource();
-            cleared = ManagedPrototypes.Clear();
-            Redirects?.Clear();
-        }
-        previous.Cancel();
-        previous.Dispose();
-        return cleared;
     }
 
     public void Dispose()
@@ -222,6 +236,7 @@ public sealed class PluginRuntime : IDisposable
         CancellationTokenSource previous;
         ExtractionCoordinator? extraction;
         MaintenanceService? maintenance;
+        HarmonyPatchHost? patch;
         lock (sync)
         {
             if (disposed) return;
@@ -231,16 +246,19 @@ public sealed class PluginRuntime : IDisposable
             extraction = Extraction;
             maintenance = Maintenance;
             Maintenance = null;
+            patch = playbackPatch;
+            playbackPatch = null;
         }
         previous.Cancel();
         maintenance?.Dispose();
+        patch?.Dispose();
         extraction?.CancelAndDrain();
         previous.Dispose();
         Tickets.Clear();
         Redirects?.Dispose();
-        ManagedPrototypes?.Dispose();
+        Gateway?.Dispose();
         ClearDetectedRedirectHosts();
-        ManagedPrototypes = null;
+        Gateway = null;
         Extraction = null;
     }
 }
@@ -256,4 +274,31 @@ public readonly struct OperationContext
     public int Generation { get; }
 
     public CancellationToken CancellationToken { get; }
+}
+
+public readonly struct PlaybackHealthSnapshot
+{
+    public PlaybackHealthSnapshot(
+        PlaybackPatchStatus patchStatus,
+        string hostAbi,
+        int runtimeGeneration,
+        int ticketCount,
+        int activeRelayCount)
+    {
+        PatchStatus = patchStatus;
+        HostAbi = hostAbi;
+        RuntimeGeneration = runtimeGeneration;
+        TicketCount = ticketCount;
+        ActiveRelayCount = activeRelayCount;
+    }
+
+    public PlaybackPatchStatus PatchStatus { get; }
+
+    public string HostAbi { get; }
+
+    public int RuntimeGeneration { get; }
+
+    public int TicketCount { get; }
+
+    public int ActiveRelayCount { get; }
 }

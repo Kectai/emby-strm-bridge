@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Xml.Serialization;
 using Emby.StrmBridge.Localization;
 using Emby.Web.GenericEdit;
@@ -13,9 +14,17 @@ using MediaBrowser.Model.LocalizationAttributes;
 
 namespace Emby.StrmBridge.Configuration;
 
+public enum PlaybackRoutingMode
+{
+    Native = 0,
+    RedirectOnly = 1,
+    Adaptive = 2,
+    RelayOnly = 3,
+}
+
 public sealed class PluginConfiguration : EditableOptionsBase
 {
-    internal const int CurrentConfigurationVersion = 1;
+    internal const int CurrentConfigurationVersion = 2;
     internal const int MaximumAllowedRedirectHosts = 256;
     internal const int MaximumAllowedRedirectHostTextLength = 64 * 1024;
 
@@ -26,12 +35,12 @@ public sealed class PluginConfiguration : EditableOptionsBase
     [DisplayNameL(nameof(PluginStrings.Enabled), typeof(PluginStrings))]
     public bool Enabled { get; set; } = true;
 
-    [DisplayNameL(nameof(PluginStrings.EnablePlaybackSource), typeof(PluginStrings))]
-    [DescriptionL(nameof(PluginStrings.EnablePlaybackSourceDescription), typeof(PluginStrings))]
-    public bool EnablePlaybackSource { get; set; } = true;
+    [DisplayNameL(nameof(PluginStrings.PlaybackMode), typeof(PluginStrings))]
+    [DescriptionL(nameof(PluginStrings.PlaybackModeDescription), typeof(PluginStrings))]
+    public PlaybackRoutingMode PlaybackMode { get; set; } = PlaybackRoutingMode.Adaptive;
 
     [Browsable(false)]
-    public int ConfigurationVersion { get; set; }
+    public int ConfigurationVersion { get; set; } = CurrentConfigurationVersion;
 
     [DisplayNameL(nameof(PluginStrings.ExtractAfterLibraryScan), typeof(PluginStrings))]
     public bool ExtractAfterLibraryScan { get; set; }
@@ -53,6 +62,21 @@ public sealed class PluginConfiguration : EditableOptionsBase
     [MaxValue(180)]
     public int ExtractionTimeoutSeconds { get; set; } = 120;
 
+    [DisplayNameL(nameof(PluginStrings.GatewayTimeoutSeconds), typeof(PluginStrings))]
+    [MinValue(10)]
+    [MaxValue(180)]
+    public int GatewayTimeoutSeconds { get; set; } = 120;
+
+    [DisplayNameL(nameof(PluginStrings.RedirectHopLimit), typeof(PluginStrings))]
+    [MinValue(1)]
+    [MaxValue(8)]
+    public int RedirectHopLimit { get; set; } = 5;
+
+    [DisplayNameL(nameof(PluginStrings.RelayConcurrency), typeof(PluginStrings))]
+    [MinValue(1)]
+    [MaxValue(16)]
+    public int RelayConcurrency { get; set; } = 4;
+
     [Browsable(false)]
     public string[] IncludedLibraryIds { get; set; } = Array.Empty<string>();
 
@@ -69,10 +93,6 @@ public sealed class PluginConfiguration : EditableOptionsBase
 
     [Browsable(false)]
     public string[] AllowedRedirectHosts { get; set; } = Array.Empty<string>();
-
-    [Browsable(false)]
-    [XmlIgnore]
-    public string? DetectedRedirectHostsAvailable { get; set; }
 
     [Browsable(false)]
     [XmlIgnore]
@@ -96,22 +116,47 @@ public sealed class PluginConfiguration : EditableOptionsBase
     public bool Normalize()
     {
         var changed = false;
-        if (ConfigurationVersion < CurrentConfigurationVersion)
+        if (ConfigurationVersion != CurrentConfigurationVersion)
         {
-            EnablePlaybackSource = true;
             ConfigurationVersion = CurrentConfigurationVersion;
             changed = true;
         }
-        if (MaximumExtractionConcurrency < 1 || MaximumExtractionConcurrency > 2)
+        if (!Enum.IsDefined(typeof(PlaybackRoutingMode), PlaybackMode))
         {
-            MaximumExtractionConcurrency = 1;
+            PlaybackMode = PlaybackRoutingMode.Adaptive;
             changed = true;
         }
-        if (ExtractionTimeoutSeconds < 30 || ExtractionTimeoutSeconds > 180)
+        var maximumExtractionConcurrency = NormalizeRange(MaximumExtractionConcurrency, 1, 2, 1);
+        var extractionTimeoutSeconds = NormalizeRange(ExtractionTimeoutSeconds, 30, 180, 120);
+        var gatewayTimeoutSeconds = NormalizeRange(GatewayTimeoutSeconds, 10, 180, 120);
+        var redirectHopLimit = NormalizeRange(RedirectHopLimit, 1, 8, 5);
+        var relayConcurrency = NormalizeRange(RelayConcurrency, 1, 16, 4);
+        if (MaximumExtractionConcurrency != maximumExtractionConcurrency)
         {
-            ExtractionTimeoutSeconds = 120;
+            MaximumExtractionConcurrency = maximumExtractionConcurrency;
             changed = true;
         }
+        if (ExtractionTimeoutSeconds != extractionTimeoutSeconds)
+        {
+            ExtractionTimeoutSeconds = extractionTimeoutSeconds;
+            changed = true;
+        }
+        if (GatewayTimeoutSeconds != gatewayTimeoutSeconds)
+        {
+            GatewayTimeoutSeconds = gatewayTimeoutSeconds;
+            changed = true;
+        }
+        if (RedirectHopLimit != redirectHopLimit)
+        {
+            RedirectHopLimit = redirectHopLimit;
+            changed = true;
+        }
+        if (RelayConcurrency != relayConcurrency)
+        {
+            RelayConcurrency = relayConcurrency;
+            changed = true;
+        }
+
         var configuredIds = IncludedLibraries is null
             ? IncludedLibraryIds ?? Array.Empty<string>()
             : IncludedLibraries.Split(',');
@@ -131,6 +176,7 @@ public sealed class PluginConfiguration : EditableOptionsBase
             IncludedLibraries = normalizedLibrarySelection;
             changed = true;
         }
+
         var configuredHosts = AllowedRedirectHostsText is null ||
                               AllowedRedirectHostsText.Length > MaximumAllowedRedirectHostTextLength
             ? AllowedRedirectHosts ?? Array.Empty<string>()
@@ -138,6 +184,7 @@ public sealed class PluginConfiguration : EditableOptionsBase
         var normalizedHosts = configuredHosts
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .Select(NormalizeHost)
+            .Where(value => value.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(MaximumAllowedRedirectHosts)
             .ToArray();
@@ -179,10 +226,12 @@ public sealed class PluginConfiguration : EditableOptionsBase
 
     protected override void Validate(ValidationContext context)
     {
-        if (MaximumExtractionConcurrency < 1 || MaximumExtractionConcurrency > 2)
+        if (MaximumExtractionConcurrency is < 1 or > 2)
             context.AddValidationError(nameof(MaximumExtractionConcurrency), PluginStrings.ConcurrencyValidation);
-        if (ExtractionTimeoutSeconds < 30 || ExtractionTimeoutSeconds > 180)
+        if (ExtractionTimeoutSeconds is < 30 or > 180 || GatewayTimeoutSeconds is < 10 or > 180)
             context.AddValidationError(nameof(ExtractionTimeoutSeconds), PluginStrings.TimeoutValidation);
+        if (RedirectHopLimit is < 1 or > 8 || RelayConcurrency is < 1 or > 16)
+            context.AddValidationError(nameof(RedirectHopLimit), PluginStrings.GatewayValidation);
         if ((IncludedLibraryIds ?? Array.Empty<string>()).Any(value => !Guid.TryParse(value, out _)))
             context.AddValidationError(nameof(IncludedLibraries), PluginStrings.LibraryValidation);
         var availableLibraryIds = Plugin.Instance?.GetLibraryIds();
@@ -206,13 +255,16 @@ public sealed class PluginConfiguration : EditableOptionsBase
         var snapshot = new PluginConfiguration
         {
             Enabled = Enabled,
-            EnablePlaybackSource = EnablePlaybackSource,
+            PlaybackMode = PlaybackMode,
             ConfigurationVersion = ConfigurationVersion,
             ExtractAfterLibraryScan = ExtractAfterLibraryScan,
             OnlyMissingMediaInfo = OnlyMissingMediaInfo,
             EnablePersistence = EnablePersistence,
             MaximumExtractionConcurrency = MaximumExtractionConcurrency,
             ExtractionTimeoutSeconds = ExtractionTimeoutSeconds,
+            GatewayTimeoutSeconds = GatewayTimeoutSeconds,
+            RedirectHopLimit = RedirectHopLimit,
+            RelayConcurrency = RelayConcurrency,
             IncludedLibraryIds = (IncludedLibraryIds ?? Array.Empty<string>()).ToArray(),
             IncludedLibraries = IncludedLibraries,
             AllowedRedirectHosts = (AllowedRedirectHosts ?? Array.Empty<string>()).ToArray(),
@@ -227,30 +279,28 @@ public sealed class PluginConfiguration : EditableOptionsBase
     {
         var trimmed = (value ?? string.Empty).Trim().TrimEnd('.');
         if (trimmed.Length == 0) return string.Empty;
-        var wildcard = trimmed.StartsWith("*.", StringComparison.Ordinal);
-        var host = wildcard ? trimmed.Substring(2) : trimmed;
-        if (!wildcard && host[0] == '[' && host[host.Length - 1] == ']')
+        if (TryParseCidr(trimmed, out var network, out var prefix))
+            return network + "/" + prefix.ToString(CultureInfo.InvariantCulture);
+        var wildcard = trimmed.StartsWith("*.", StringComparison.Ordinal) ||
+                       trimmed.StartsWith(".", StringComparison.Ordinal);
+        var host = trimmed.StartsWith("*.", StringComparison.Ordinal)
+            ? trimmed.Substring(2)
+            : trimmed.StartsWith(".", StringComparison.Ordinal) ? trimmed.Substring(1) : trimmed;
+        if (!wildcard && host.Length > 1 && host[0] == '[' && host[host.Length - 1] == ']')
             host = host.Substring(1, host.Length - 2);
-        try
-        {
-            host = new IdnMapping().GetAscii(host).ToLowerInvariant();
-        }
-        catch (ArgumentException)
-        {
-            host = host.ToLowerInvariant();
-        }
+        try { host = new IdnMapping().GetAscii(host).ToLowerInvariant(); }
+        catch (ArgumentException) { host = host.ToLowerInvariant(); }
         return wildcard ? "*." + host : host;
     }
 
     internal static bool IsValidHost(string value)
     {
         var normalized = NormalizeHost(value);
+        if (TryParseCidr(normalized, out _, out _)) return true;
         if (normalized.StartsWith("*.", StringComparison.Ordinal))
         {
             var suffix = normalized.Substring(2);
-            return suffix.Contains('.') &&
-                   suffix.Length <= 251 &&
-                   suffix.IndexOf('*') < 0 &&
+            return suffix.Contains('.') && suffix.Length <= 251 && suffix.IndexOf('*') < 0 &&
                    Uri.CheckHostName(suffix) == UriHostNameType.Dns;
         }
         return IsValidExactHost(normalized);
@@ -259,10 +309,10 @@ public sealed class PluginConfiguration : EditableOptionsBase
     internal static bool IsValidExactHost(string value)
     {
         var normalized = NormalizeHost(value);
-        if (normalized.Length == 0 || normalized.Length > 253 ||
+        if (normalized.Length == 0 || normalized.Length > 253 || normalized.Contains('/') ||
             normalized.IndexOf('*') >= 0 ||
-            normalized.IndexOfAny(new[] { '/', '\\', '?', '#', '@', ':', ' ', '\t', '\r', '\n' }) >= 0)
-            return System.Net.IPAddress.TryParse(normalized, out _);
+            normalized.IndexOfAny(new[] { '\\', '?', '#', '@', ':', ' ', '\t', '\r', '\n' }) >= 0)
+            return IPAddress.TryParse(normalized, out _);
         return Uri.CheckHostName(normalized) is UriHostNameType.Dns or UriHostNameType.IPv4 or UriHostNameType.IPv6;
     }
 
@@ -274,11 +324,45 @@ public sealed class PluginConfiguration : EditableOptionsBase
         {
             var rule = NormalizeHost(configured);
             if (string.Equals(rule, host, StringComparison.OrdinalIgnoreCase)) return true;
-            if (!rule.StartsWith("*.", StringComparison.Ordinal) || !IsValidHost(rule)) continue;
-            var suffix = rule.Substring(1);
-            if (host.Length > suffix.Length && host.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
-                return true;
+            if (rule.StartsWith("*.", StringComparison.Ordinal) && IsValidHost(rule))
+            {
+                var suffix = rule.Substring(1);
+                if (host.Length > suffix.Length && host.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            if (IPAddress.TryParse(host, out var address) && TryParseCidr(rule, out var network, out var prefix) &&
+                IsInNetwork(address, network, prefix)) return true;
         }
         return false;
+    }
+
+    private static int NormalizeRange(int value, int minimum, int maximum, int fallback) =>
+        value >= minimum && value <= maximum ? value : fallback;
+
+    private static bool TryParseCidr(string value, out IPAddress network, out int prefix)
+    {
+        network = IPAddress.None;
+        prefix = 0;
+        var separator = value.IndexOf('/');
+        if (separator <= 0 || separator == value.Length - 1 ||
+            !IPAddress.TryParse(value.Substring(0, separator), out network!) ||
+            !int.TryParse(value.Substring(separator + 1), NumberStyles.None, CultureInfo.InvariantCulture, out prefix))
+            return false;
+        var bits = network.GetAddressBytes().Length * 8;
+        return prefix >= 0 && prefix <= bits;
+    }
+
+    private static bool IsInNetwork(IPAddress address, IPAddress network, int prefix)
+    {
+        var addressBytes = address.GetAddressBytes();
+        var networkBytes = network.GetAddressBytes();
+        if (addressBytes.Length != networkBytes.Length) return false;
+        var wholeBytes = prefix / 8;
+        var remainingBits = prefix % 8;
+        for (var index = 0; index < wholeBytes; index++)
+            if (addressBytes[index] != networkBytes[index]) return false;
+        if (remainingBits == 0) return true;
+        var mask = (byte)(0xff << (8 - remainingBits));
+        return (addressBytes[wholeBytes] & mask) == (networkBytes[wholeBytes] & mask);
     }
 }

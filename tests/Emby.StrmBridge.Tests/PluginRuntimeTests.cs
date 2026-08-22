@@ -95,11 +95,12 @@ public sealed class PluginRuntimeTests
             new StubRedirectClient((_, _, _, _) =>
                 Task.FromResult(new Emby.StrmBridge.Playback.RedirectSourceResponse(404, null, null))));
         var operation = runtime.BeginOperation();
-        var ticket = runtime.Tickets.Issue(
-            TicketScope.PlaybackRedirect,
+        var ticket = runtime.Tickets.IssuePlayback(
             Guid.NewGuid(),
             "source",
-            TestSources.Create());
+            "user",
+            TestSources.Create(),
+            runtime.Generation);
 
         runtime.UpdateOptions(
             new PluginConfiguration { Enabled = false },
@@ -107,25 +108,7 @@ public sealed class PluginRuntimeTests
 
         Assert.IsFalse(runtime.GetOptionsSnapshot().Enabled);
         Assert.IsTrue(operation.CancellationToken.IsCancellationRequested);
-        Assert.IsFalse(runtime.Tickets.TryRedeem(ticket, TicketScope.PlaybackRedirect, 42, out _));
-    }
-
-    [TestMethod]
-    public void UpdateOptions_DropsMemoryOnlyManagedPrototypeRecords()
-    {
-        using var workspace = new TestWorkspace();
-        using var runtime = new PluginRuntime();
-        runtime.Initialize(
-            workspace.Path,
-            new ManualClock(),
-            new StubRedirectClient((_, _, _, _) =>
-                Task.FromResult(new RedirectSourceResponse(404, null, null))));
-        runtime.CreateManagedPrototype("https://source.invalid/entry", "mkv");
-        Assert.AreEqual(1, runtime.ManagedPrototypes!.Count);
-
-        runtime.UpdateOptions(new PluginConfiguration { Enabled = true }, invalidateSensitiveState: true);
-
-        Assert.AreEqual(0, runtime.ManagedPrototypes.Count);
+        Assert.IsFalse(runtime.Tickets.TryRedeem(ticket, "user", out _));
     }
 
     [TestMethod]

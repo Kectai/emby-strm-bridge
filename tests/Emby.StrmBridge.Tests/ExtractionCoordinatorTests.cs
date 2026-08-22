@@ -57,15 +57,11 @@ public sealed class ExtractionCoordinatorTests
         Assert.IsTrue(item.MediaStreams.Any(stream => stream.IsExternal && stream.Path == external.Path));
         Assert.IsTrue(fixture.LastSavedStreams().Any(stream => stream.Type == MediaStreamType.Video));
         Assert.IsTrue(fixture.LastSavedStreams().Any(stream => stream.IsExternal && stream.Path == external.Path));
-        var source = fixture.Runtime.SourcePolicy!.Read(path);
-        Assert.AreEqual(false, fixture.Runtime.ExtractionState!.GetRedirectBridgeRequirement(
-            source.StorageKey,
-            source.SourceFingerprint));
         fixture.Runtime.Dispose();
     }
 
     [TestMethod]
-    public async Task Extract_ClassifiesRedirectWithoutOverwritingCompleteTechnicalInformation()
+    public async Task Extract_DoesNotProbeCompleteUnchangedTechnicalInformation()
     {
         using var workspace = new TestWorkspace();
         var item = CreateItem(
@@ -76,8 +72,7 @@ public sealed class ExtractionCoordinatorTests
         var fixture = CreateFixture(
             workspace,
             new[] { item },
-            _ => new RedirectSourceResponse(302, "https://source.invalid/final", null),
-            enablePlayback: true);
+            _ => new RedirectSourceResponse(302, "https://source.invalid/final", null));
         var source = fixture.Runtime.SourcePolicy!.Read(item.Path);
         fixture.Runtime.MediaInfoStore!.Save(
             source,
@@ -91,17 +86,14 @@ public sealed class ExtractionCoordinatorTests
                 },
                 fixture.Runtime.Clock.UtcNow));
 
-        var classified = await fixture.Coordinator.ExtractAsync(false, null, CancellationToken.None);
+        var first = await fixture.Coordinator.ExtractAsync(false, null, CancellationToken.None);
         var skipped = await fixture.Coordinator.ExtractAsync(false, null, CancellationToken.None);
 
-        Assert.AreEqual(1, classified.Skipped);
+        Assert.AreEqual(1, first.Skipped);
         Assert.AreEqual(1, skipped.Skipped);
-        Assert.AreEqual(1, fixture.SourceClient.Calls);
+        Assert.AreEqual(0, fixture.SourceClient.Calls);
         Assert.AreEqual(0, fixture.ProbeCalls());
         Assert.AreEqual(0, fixture.UpdateCalls());
-        Assert.AreEqual(true, fixture.Runtime.ExtractionState!.GetRedirectBridgeRequirement(
-            source.StorageKey,
-            source.SourceFingerprint));
         fixture.Runtime.Dispose();
     }
 
@@ -727,8 +719,7 @@ public sealed class ExtractionCoordinatorTests
         IActivityManager? activityManager = null,
         int mediaStreamSaveFailures = 0,
         Func<BaseItem, List<MediaStream>>? storedStreamsProvider = null,
-        Func<List<MediaStream>>? probedStreamsProvider = null,
-        bool enablePlayback = false)
+        Func<List<MediaStream>>? probedStreamsProvider = null)
     {
         var libraryId = Guid.NewGuid();
         var probeCalls = 0;
@@ -809,7 +800,7 @@ public sealed class ExtractionCoordinatorTests
         {
             ConfigurationVersion = PluginConfiguration.CurrentConfigurationVersion,
             Enabled = true,
-            EnablePlaybackSource = enablePlayback,
+            PlaybackMode = PlaybackRoutingMode.Adaptive,
             EnablePersistence = true,
             OnlyMissingMediaInfo = true,
             MaximumExtractionConcurrency = maximumConcurrency,

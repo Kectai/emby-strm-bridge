@@ -6,15 +6,20 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>Emby.StrmBridge</AssemblyName>
     <RootNamespace>Emby.StrmBridge</RootNamespace>
-    <Version>0.1.0</Version>
-    <Description>Safely bridges local STRM files to Emby media information and short-lived redirects.</Description>
+    <Version>0.2.1</Version>
+    <Authors>Kectai</Authors>
+    <Copyright>Copyright (c) 2026 Kectai</Copyright>
+    <Description>Routes selected STRM playback through an in-process Emby gateway.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Lib.Harmony" GeneratePathProperty="true" />
     <PackageReference Include="MediaBrowser.Server.Core" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources/**/*" />
+    <EmbeddedResource Include="$(IntermediateOutputPath)embedded/0Harmony.dll.gz"
+                      LogicalName="Emby.StrmBridge.Dependencies.0Harmony.dll.gz" />
     <EmbeddedResource Update="Localization/PluginStrings.zh-Hans.resx">
       <WithCulture>false</WithCulture>
       <LogicalName>Emby.StrmBridge.Localization.PluginStringsZhHans.resources</LogicalName>
@@ -28,4 +33,32 @@
     <DebugType>embedded</DebugType>
     <DebugSymbols>true</DebugSymbols>
   </PropertyGroup>
+  <UsingTask TaskName="CompressHarmonyDependency"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <SourceFile ParameterType="System.String" Required="true" />
+      <DestinationFile ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.IO.Compression" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        Directory.CreateDirectory(Path.GetDirectoryName(DestinationFile));
+        using (var input = File.OpenRead(SourceFile))
+        using (var output = File.Create(DestinationFile))
+        using (var compressed = new GZipStream(output, CompressionLevel.Optimal))
+        {
+            input.CopyTo(compressed);
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+  <Target Name="PrepareEmbeddedHarmony" BeforeTargets="PrepareResources"
+          Inputs="$(PkgLib_Harmony)/lib/net6.0/0Harmony.dll"
+          Outputs="$(IntermediateOutputPath)embedded/0Harmony.dll.gz">
+    <CompressHarmonyDependency
+      SourceFile="$(PkgLib_Harmony)/lib/net6.0/0Harmony.dll"
+      DestinationFile="$(IntermediateOutputPath)embedded/0Harmony.dll.gz" />
+  </Target>
 </Project>

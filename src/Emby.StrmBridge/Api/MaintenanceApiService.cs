@@ -58,6 +58,51 @@ public sealed class MaintenanceApiService : IService, IRequiresRequest
             .ConfigureAwait(false);
     }
 
+    public object Get(GetStrmBridgeHealth request)
+    {
+        RequireAdministrator();
+        return CreateHealth();
+    }
+
+    public object Get(GetStrmBridgeDiagnostics request)
+    {
+        RequireAdministrator();
+        var runtime = Plugin.Runtime ?? throw new InvalidOperationException(PluginStrings.TaskInitializationError);
+        var options = runtime.GetOptionsSnapshot();
+        var health = runtime.GetPlaybackHealth();
+        return new
+        {
+            PluginVersion = typeof(Plugin).Assembly.GetName().Version?.ToString(3) ?? "unknown",
+            Enabled = options.Enabled,
+            PlaybackMode = options.PlaybackMode.ToString(),
+            SelectedLibraryCount = options.IncludedLibraryIds.Length,
+            TrustedHostRuleCount = options.AllowedRedirectHosts.Length,
+            DetectedHostCount = runtime.GetDetectedRedirectHosts().Length,
+            PatchStatus = health.PatchStatus.ToString(),
+            health.HostAbi,
+            health.RuntimeGeneration,
+            health.TicketCount,
+            health.ActiveRelayCount,
+        };
+    }
+
+    private static object CreateHealth()
+    {
+        var runtime = Plugin.Runtime ?? throw new InvalidOperationException(PluginStrings.TaskInitializationError);
+        var options = runtime.GetOptionsSnapshot();
+        var health = runtime.GetPlaybackHealth();
+        return new
+        {
+            Enabled = options.Enabled,
+            PlaybackMode = options.PlaybackMode.ToString(),
+            PatchStatus = health.PatchStatus.ToString(),
+            health.HostAbi,
+            health.RuntimeGeneration,
+            health.TicketCount,
+            health.ActiveRelayCount,
+        };
+    }
+
     private Extraction.ExtractionCoordinator GetCoordinator() =>
         Plugin.Runtime?.Extraction ?? throw new InvalidOperationException(PluginStrings.TaskInitializationError);
 

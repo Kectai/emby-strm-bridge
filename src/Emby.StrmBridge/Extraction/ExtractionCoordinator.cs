@@ -268,8 +268,7 @@ public sealed class ExtractionCoordinator
                                  source,
                                  snapshot!.ToMediaSource("strmbridge-restored"),
                                  operation.Generation,
-                                 saveSnapshot: null,
-                                 snapshot.RequiresRedirectBridge))
+                                 saveSnapshot: null))
                     {
                         result.Add(ExtractionOutcome.Restored);
                     }
@@ -419,26 +418,10 @@ public sealed class ExtractionCoordinator
 
         var missing = IsMissing(item);
         var lastSuccessfulFingerprint = runtime.ExtractionState!.GetLastSuccessfulFingerprint(source.StorageKey);
-        var needsPlaybackClassification = options.EnablePlaybackSource &&
-            runtime.ExtractionState.ShouldRefreshRedirectClassification(
-                source.StorageKey,
-                source.SourceFingerprint,
-                runtime.Clock.UtcNow);
         var shouldAttempt = force || !options.OnlyMissingMediaInfo || runtime.ExtractionState.ShouldAttempt(
             source.StorageKey,
             source.SourceFingerprint,
             runtime.Clock.UtcNow);
-        if (!force && options.OnlyMissingMediaInfo && !missing && needsPlaybackClassification)
-        {
-            if (!shouldAttempt) return ExtractionOutcome.Skipped;
-            return await ClassifyPlaybackSourceAsync(
-                    item,
-                    source,
-                    options.ExtractionTimeoutSeconds,
-                    operationGeneration,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
         if (!force && options.OnlyMissingMediaInfo && !missing)
         {
             if (lastSuccessfulFingerprint is null)
@@ -472,8 +455,7 @@ public sealed class ExtractionCoordinator
                         source,
                         stored!.ToMediaSource("strmbridge-restored"),
                         operationGeneration,
-                        saveSnapshot: null,
-                        stored.RequiresRedirectBridge))
+                        saveSnapshot: null))
                 {
                     logger.Debug("STRM_BRIDGE_MEDIAINFO_RESTORED item=" + ShortId(item.Id));
                     return ExtractionOutcome.Restored;
@@ -500,15 +482,13 @@ public sealed class ExtractionCoordinator
             var snapshot = MediaInfoSnapshot.FromMediaSource(
                 source,
                 probe.MediaSource,
-                runtime.Clock.UtcNow,
-                probe.RequiresRedirectBridge);
+                runtime.Clock.UtcNow);
             if (!TryApply(
                     item,
                     source,
                     probe.MediaSource,
                     operationGeneration,
-                    snapshot,
-                    probe.RequiresRedirectBridge))
+                    snapshot))
                 return ExtractionOutcome.Skipped;
             logger.Debug("STRM_BRIDGE_MEDIAINFO_EXTRACTED item=" + ShortId(item.Id));
             return ExtractionOutcome.Extracted;
@@ -543,63 +523,6 @@ public sealed class ExtractionCoordinator
         if (exception is System.Net.Http.HttpRequestException) return "probe_http";
         if (exception is TaskCanceledException) return "timeout";
         return "probe_or_save";
-    }
-
-    private async Task<ExtractionOutcome> ClassifyPlaybackSourceAsync(
-        BaseItem item,
-        SourceIdentity source,
-        int timeoutSeconds,
-        int operationGeneration,
-        CancellationToken cancellationToken)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
-        activeItems.TryAdd(timeout, 0);
-        try
-        {
-            var lease = await runtime.Redirects!.ResolveForProbeAsync(source, ProbeUserAgent, timeout.Token)
-                .ConfigureAwait(false);
-            timeout.Token.ThrowIfCancellationRequested();
-            var committed = runtime.TryCommit(
-                operationGeneration,
-                () => IsCurrentlyAllowed(item, requirePlayback: false),
-                () =>
-                {
-                    var currentSource = runtime.SourcePolicy!.Read(item.Path);
-                    if (!source.HasSameFileVersion(currentSource))
-                        throw new SourcePolicyException(SourceRejectionReason.FileChanged);
-                    runtime.ExtractionState!.RecordRedirectBridgeRequirement(
-                        source.StorageKey,
-                        source.SourceFingerprint,
-                        requiresRedirectBridge: !lease.IsDirectSource,
-                        runtime.Clock.UtcNow);
-                });
-            if (!committed) return ExtractionOutcome.Skipped;
-            logger.Debug("STRM_BRIDGE_PLAYBACK_SOURCE_CLASSIFIED item=" + ShortId(item.Id));
-            return ExtractionOutcome.Skipped;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (RedirectRejectedException exception) when (
-            exception.Reason == RedirectRejectionReason.UntrustedTargetHost)
-        {
-            RecordFailureIfCurrent(source, operationGeneration);
-            logger.Debug("STRM_BRIDGE_EXTRACTION_AWAITING_TRUST item=" + ShortId(item.Id));
-            return ExtractionOutcome.AwaitingApproval;
-        }
-        catch (Exception exception)
-        {
-            RecordFailureIfCurrent(source, operationGeneration);
-            logger.Debug("STRM_BRIDGE_EXTRACTION_FAILED item=" + ShortId(item.Id) +
-                         " reason=" + GetFailureReason(exception));
-            return ExtractionOutcome.Failed;
-        }
-        finally
-        {
-            activeItems.TryRemove(timeout, out _);
-        }
     }
 
     private async Task<ProbeResult> ProbeAsync(
@@ -639,7 +562,7 @@ public sealed class ExtractionCoordinator
                 !mediaSource.MediaStreams.Any(stream => stream.Type == MediaStreamType.Video) ||
                 !mediaSource.RunTimeTicks.HasValue)
                 throw new InvalidDataException("The media probe returned incomplete technical information.");
-            return new ProbeResult(mediaSource, requiresRedirectBridge: !lease.IsDirectSource);
+            return new ProbeResult(mediaSource);
         }
         finally
         {
@@ -675,8 +598,7 @@ public sealed class ExtractionCoordinator
         SourceIdentity source,
         MediaSourceInfo mediaSource,
         int operationGeneration,
-        MediaInfoSnapshot? saveSnapshot,
-        bool? requiresRedirectBridge)
+        MediaInfoSnapshot? saveSnapshot)
     {
         PluginConfiguration? currentOptions = null;
         return runtime.TryCommit(
@@ -706,9 +628,7 @@ public sealed class ExtractionCoordinator
                 {
                     runtime.ExtractionState!.RecordSuccess(
                         source.StorageKey,
-                        source.SourceFingerprint,
-                        requiresRedirectBridge,
-                        runtime.Clock.UtcNow);
+                        source.SourceFingerprint);
                 }
                 catch (Exception exception) when (
                     exception is IOException || exception is UnauthorizedAccessException ||
@@ -942,7 +862,7 @@ public sealed class ExtractionCoordinator
 
     private bool IsAllowed(BaseItem item, PluginConfiguration options, bool requirePlayback)
     {
-        if (!options.Enabled || requirePlayback && !options.EnablePlaybackSource) return false;
+        if (!options.Enabled || requirePlayback && options.PlaybackMode == PlaybackRoutingMode.Native) return false;
         if (options.IncludedLibraryIds.Length == 0) return false;
         var allowed = new HashSet<string>(options.IncludedLibraryIds, StringComparer.OrdinalIgnoreCase);
         return libraryManager.GetCollectionFolders(item)
@@ -1228,15 +1148,9 @@ public sealed class ExtractionCoordinator
 
     private sealed class ProbeResult
     {
-        public ProbeResult(MediaSourceInfo mediaSource, bool requiresRedirectBridge)
-        {
-            MediaSource = mediaSource;
-            RequiresRedirectBridge = requiresRedirectBridge;
-        }
+        public ProbeResult(MediaSourceInfo mediaSource) => MediaSource = mediaSource;
 
         public MediaSourceInfo MediaSource { get; }
-
-        public bool RequiresRedirectBridge { get; }
     }
 
     private sealed class RedirectDiscoveryBudget

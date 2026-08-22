@@ -13,17 +13,17 @@ public sealed class RedirectResolverTests
         var client = SuccessClient();
         using var resolver = new RedirectResolver(client, TrustedPolicy(), clock);
 
-        var first = await resolver.ResolveAsync(TestSources.Create(), "Player/1", CancellationToken.None);
+        var first = await resolver.ResolveForProbeAsync(TestSources.Create(), "Player/1", CancellationToken.None);
         clock.Advance(TimeSpan.FromSeconds(29));
-        var cached = await resolver.ResolveAsync(TestSources.Create(), "Player/1", CancellationToken.None);
+        var cached = await resolver.ResolveForProbeAsync(TestSources.Create(), "Player/1", CancellationToken.None);
         Assert.AreEqual(first.GetLocation(), cached.GetLocation());
         Assert.AreEqual(1, client.Calls);
 
-        await resolver.ResolveAsync(TestSources.Create(), "Player/2", CancellationToken.None);
+        await resolver.ResolveForProbeAsync(TestSources.Create(), "Player/2", CancellationToken.None);
         Assert.AreEqual(2, client.Calls);
 
         clock.Advance(TimeSpan.FromSeconds(1));
-        await resolver.ResolveAsync(TestSources.Create(), "Player/1", CancellationToken.None);
+        await resolver.ResolveForProbeAsync(TestSources.Create(), "Player/1", CancellationToken.None);
         Assert.AreEqual(3, client.Calls);
     }
 
@@ -40,9 +40,9 @@ public sealed class RedirectResolverTests
         });
         using var resolver = new RedirectResolver(client, TrustedPolicy(), new ManualClock());
 
-        var first = resolver.ResolveAsync(TestSources.Create(), "same-agent", CancellationToken.None);
+        var first = resolver.ResolveForProbeAsync(TestSources.Create(), "same-agent", CancellationToken.None);
         await entered.Task;
-        var second = resolver.ResolveAsync(TestSources.Create(), "same-agent", CancellationToken.None);
+        var second = resolver.ResolveForProbeAsync(TestSources.Create(), "same-agent", CancellationToken.None);
         release.SetResult(true);
         await Task.WhenAll(first, second);
 
@@ -58,15 +58,15 @@ public sealed class RedirectResolverTests
         using var resolver = new RedirectResolver(client, TrustedPolicy(), clock);
 
         var first = await Assert.ThrowsExactlyAsync<RedirectSourceUnavailableException>(() =>
-            resolver.ResolveAsync(TestSources.Create(), "Agent/A", CancellationToken.None));
+            resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/A", CancellationToken.None));
         var second = await Assert.ThrowsExactlyAsync<RedirectSourceUnavailableException>(() =>
-            resolver.ResolveAsync(TestSources.Create(), "Agent/B", CancellationToken.None));
+            resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/B", CancellationToken.None));
         Assert.AreEqual(10, first.RetryAfterSeconds);
         Assert.IsTrue(second.RetryAfterSeconds <= 10);
         Assert.AreEqual(1, client.Calls);
 
         clock.Advance(TimeSpan.FromSeconds(10));
-        await resolver.ResolveAsync(TestSources.Create(), "Agent/B", CancellationToken.None);
+        await resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/B", CancellationToken.None);
         Assert.AreEqual(2, client.Calls);
     }
 
@@ -77,10 +77,10 @@ public sealed class RedirectResolverTests
         using var resolver = new RedirectResolver(client, TrustedPolicy(), new ManualClock());
         for (var index = 0; index < 12; index++)
         {
-            await resolver.ResolveAsync(TestSources.Create(), "Agent/" + index, CancellationToken.None);
+            await resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/" + index, CancellationToken.None);
         }
         await Assert.ThrowsExactlyAsync<RedirectThrottledException>(() =>
-            resolver.ResolveAsync(TestSources.Create(), "Agent/overflow", CancellationToken.None));
+            resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/overflow", CancellationToken.None));
         Assert.AreEqual(12, client.Calls);
     }
 
@@ -96,7 +96,7 @@ public sealed class RedirectResolverTests
             return SuccessResponse();
         });
         using var resolver = new RedirectResolver(client, TrustedPolicy(), new ManualClock());
-        var resolving = resolver.ResolveAsync(TestSources.Create(), "Agent/1", CancellationToken.None);
+        var resolving = resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/1", CancellationToken.None);
         await entered.Task;
 
         resolver.Clear();
@@ -119,7 +119,7 @@ public sealed class RedirectResolverTests
         });
         using var resolver = new RedirectResolver(client, TrustedPolicy(), new ManualClock());
         using var cancellation = new CancellationTokenSource();
-        var resolving = resolver.ResolveAsync(TestSources.Create(), "Agent/1", cancellation.Token);
+        var resolving = resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/1", cancellation.Token);
         await entered.Task;
 
         cancellation.Cancel();
@@ -147,7 +147,7 @@ public sealed class RedirectResolverTests
         });
         using var resolver = new RedirectResolver(client, TrustedPolicy(), new ManualClock());
         using var cancellation = new CancellationTokenSource();
-        var abandoned = resolver.ResolveAsync(TestSources.Create(), "Agent/1", cancellation.Token);
+        var abandoned = resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/1", cancellation.Token);
         await entered.Task;
 
         cancellation.Cancel();
@@ -155,13 +155,13 @@ public sealed class RedirectResolverTests
         release.TrySetResult(true);
         await oldReturned.Task;
 
-        var replacement = await resolver.ResolveAsync(TestSources.Create(), "Agent/1", CancellationToken.None);
+        var replacement = await resolver.ResolveForProbeAsync(TestSources.Create(), "Agent/1", CancellationToken.None);
         Assert.AreEqual("https://media.invalid/video?signature=temporary", replacement.GetLocation());
         Assert.AreEqual(2, client.Calls);
     }
 
     [TestMethod]
-    public async Task Probe_AcceptsDirectMediaButGatewayRequiresRedirect()
+    public async Task Probe_AcceptsDirectMediaResponse()
     {
         var client = new StubRedirectClient((_, _, _, _) =>
             Task.FromResult(new RedirectSourceResponse(206, null, null)));
@@ -173,10 +173,7 @@ public sealed class RedirectResolverTests
             CancellationToken.None);
 
         Assert.AreEqual("https://source.invalid/entry?opaque=source-value", lease.GetLocation());
-        var rejected = await Assert.ThrowsExactlyAsync<RedirectRejectedException>(() =>
-            resolver.ResolveAsync(TestSources.Create(), "Probe/1", CancellationToken.None));
-        Assert.AreEqual(RedirectRejectionReason.UnexpectedStatus, rejected.Reason);
-        Assert.AreEqual(2, client.Calls);
+        Assert.AreEqual(1, client.Calls);
     }
 
     [TestMethod]
@@ -186,7 +183,7 @@ public sealed class RedirectResolverTests
         using var resolver = new RedirectResolver(client, TrustedPolicy(), new ManualClock());
 
         var rejected = await Assert.ThrowsExactlyAsync<RedirectRejectedException>(() =>
-            resolver.ResolveAsync(TestSources.Create(), new string('x', 257), CancellationToken.None));
+            resolver.ResolveForProbeAsync(TestSources.Create(), new string('x', 257), CancellationToken.None));
 
         Assert.AreEqual(RedirectRejectionReason.InvalidUserAgent, rejected.Reason);
         Assert.AreEqual(0, client.Calls);
@@ -203,11 +200,11 @@ public sealed class RedirectResolverTests
         });
         using var resolver = new RedirectResolver(client, TrustedPolicy(), new ManualClock());
         var tasks = Enumerable.Range(1, RedirectResolver.MaximumPendingResolutions)
-            .Select(index => resolver.ResolveAsync(CreateUniqueSource(index), "Agent", CancellationToken.None))
+            .Select(index => resolver.ResolveForProbeAsync(CreateUniqueSource(index), "Agent", CancellationToken.None))
             .ToArray();
 
         await Assert.ThrowsExactlyAsync<RedirectThrottledException>(() =>
-            resolver.ResolveAsync(CreateUniqueSource(tasks.Length + 1), "Agent", CancellationToken.None));
+            resolver.ResolveForProbeAsync(CreateUniqueSource(tasks.Length + 1), "Agent", CancellationToken.None));
 
         release.SetResult(true);
         await Task.WhenAll(tasks);

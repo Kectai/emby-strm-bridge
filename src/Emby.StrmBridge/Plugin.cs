@@ -137,10 +137,6 @@ public sealed class Plugin : BasePluginSimpleUI<PluginConfiguration>
             .ToArray();
     }
 
-    internal static string CreateDetectedRedirectHostSelection(
-        System.Collections.Generic.IEnumerable<string>? detectedHosts,
-        System.Collections.Generic.IEnumerable<string>? allowedHosts) => string.Empty;
-
     internal static string[] MergeDetectedRedirectHostCatalog(
         System.Collections.Generic.IEnumerable<string>? currentHosts,
         System.Collections.Generic.IEnumerable<EditorSelectOption>? rememberedOptions)
@@ -205,10 +201,7 @@ public sealed class Plugin : BasePluginSimpleUI<PluginConfiguration>
         prepared.AvailableDetectedRedirectHosts = CreateDetectedRedirectHostOptions(
             detectedHosts,
             prepared.AllowedRedirectHosts);
-        prepared.DetectedRedirectHostsToTrust = CreateDetectedRedirectHostSelection(
-            detectedHosts,
-            prepared.AllowedRedirectHosts);
-        prepared.DetectedRedirectHostsAvailable = detectedHosts.Length > 0 ? "true" : null;
+        prepared.DetectedRedirectHostsToTrust = string.Empty;
         return prepared;
     }
 

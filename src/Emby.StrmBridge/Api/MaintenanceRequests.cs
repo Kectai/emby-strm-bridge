@@ -20,3 +20,9 @@ public sealed class RunStrmBridgeCleanup { }
 
 [Route("/StrmBridge/Maintenance/Clear", "POST", Summary = "Clears stored STRM Bridge media information")]
 public sealed class RunStrmBridgeClear { }
+
+[Route("/StrmBridge/Admin/Health", "GET", Summary = "Returns STRM Bridge playback health")]
+public sealed class GetStrmBridgeHealth { }
+
+[Route("/StrmBridge/Admin/Diagnostics", "GET", Summary = "Returns privacy-safe STRM Bridge diagnostics")]
+public sealed class GetStrmBridgeDiagnostics { }

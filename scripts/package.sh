@@ -16,11 +16,15 @@ archive="$project_root/artifacts/Emby.StrmBridge-$version.zip"
 mkdir -p "$stage" "$project_root/artifacts"
 find "$stage" -mindepth 1 -delete
 cp "$project_root/.local/build/bin/Release/netstandard2.1/Emby.StrmBridge.dll" "$stage/"
-cp "$project_root/README.md" "$project_root/LICENSE" "$project_root/CHANGELOG.md" "$stage/"
+cp "$project_root/README.md" "$project_root/LICENSE" "$project_root/CHANGELOG.md" \
+  "$project_root/THIRD_PARTY_NOTICES.md" "$stage/"
+mkdir -p "$stage/LICENSES"
+cp "$project_root/LICENSES/Lib.Harmony-LICENSE.txt" "$stage/LICENSES/"
 mkdir -p "$stage/docs"
 cp "$project_root/docs/ARCHITECTURE.md" \
   "$project_root/docs/COMPATIBILITY.md" \
   "$project_root/docs/INSTALL.md" \
+  "$project_root/docs/PLAYBACK_GATEWAY_DESIGN.md" \
   "$project_root/docs/SECURITY.md" \
   "$project_root/docs/TESTING.md" \
   "$stage/docs/"
@@ -32,8 +36,7 @@ if rg -l '(Dropbox|OneDrive|Google Drive|Aliyun|AList|Alist|OpenList|115\.com|Pi
   echo "Package validation failed: release documentation contains vendor-specific text."
   exit 1
 fi
-cmp "$project_root/.local/build/bin/Release/netstandard2.1/Emby.StrmBridge.dll" \
-  "$stage/Emby.StrmBridge.dll"
+cmp "$project_root/.local/build/bin/Release/netstandard2.1/Emby.StrmBridge.dll" "$stage/Emby.StrmBridge.dll"
 
 if [ -f "$archive" ]; then
   rm "$archive"
@@ -44,7 +47,7 @@ fi
 unzip -tqq "$archive"
 
 unexpected=$(unzip -Z1 "$archive" | rg -v \
-  '^Emby\.StrmBridge/$|^Emby\.StrmBridge/(Emby\.StrmBridge\.dll|README\.md|LICENSE|CHANGELOG\.md)$|^Emby\.StrmBridge/docs/$|^Emby\.StrmBridge/docs/(ARCHITECTURE|COMPATIBILITY|INSTALL|SECURITY|TESTING)\.md$' \
+  '^Emby\.StrmBridge/$|^Emby\.StrmBridge/(Emby\.StrmBridge\.dll|README\.md|LICENSE|CHANGELOG\.md|THIRD_PARTY_NOTICES\.md)$|^Emby\.StrmBridge/LICENSES/$|^Emby\.StrmBridge/LICENSES/Lib\.Harmony-LICENSE\.txt$|^Emby\.StrmBridge/docs/$|^Emby\.StrmBridge/docs/(ARCHITECTURE|COMPATIBILITY|INSTALL|PLAYBACK_GATEWAY_DESIGN|SECURITY|TESTING)\.md$' \
   || true)
 if [ -n "$unexpected" ]; then
   echo "Package validation failed: the archive contains an unexpected entry."
@@ -53,7 +56,7 @@ if [ -n "$unexpected" ]; then
 fi
 
 entry_count=$(unzip -Z1 "$archive" | wc -l | tr -d ' ')
-if [ "$entry_count" -ne 11 ]; then
+if [ "$entry_count" -ne 15 ]; then
   echo "Package validation failed: the archive allowlist is incomplete."
   exit 1
 fi

@@ -46,31 +46,22 @@ public sealed class RedirectResolver : IDisposable
         globalConcurrency = new SemaphoreSlim(maximumGlobalConcurrency, maximumGlobalConcurrency);
     }
 
-    public async Task<RedirectLease> ResolveAsync(
-        SourceIdentity source,
-        string? userAgent,
-        CancellationToken cancellationToken) =>
-        await ResolveInternalAsync(source, userAgent, allowDirectMediaResponse: false, cancellationToken)
-            .ConfigureAwait(false);
-
     public async Task<RedirectLease> ResolveForProbeAsync(
         SourceIdentity source,
         string? userAgent,
         CancellationToken cancellationToken) =>
-        await ResolveInternalAsync(source, userAgent, allowDirectMediaResponse: true, cancellationToken)
+        await ResolveInternalAsync(source, userAgent, cancellationToken)
             .ConfigureAwait(false);
 
     private async Task<RedirectLease> ResolveInternalAsync(
         SourceIdentity source,
         string? userAgent,
-        bool allowDirectMediaResponse,
         CancellationToken cancellationToken)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         cancellationToken.ThrowIfCancellationRequested();
         var normalizedUserAgent = NormalizeUserAgent(userAgent);
-        var key = (allowDirectMediaResponse ? "probe:" : "redirect:") +
-                  source.SourceFingerprint + ":" + Hash(normalizedUserAgent);
+        var key = source.SourceFingerprint + ":" + Hash(normalizedUserAgent);
         PendingResolution current;
         var shouldStart = false;
 
@@ -110,7 +101,7 @@ public sealed class RedirectResolver : IDisposable
 
         if (shouldStart)
         {
-            _ = RunResolutionAsync(key, source, normalizedUserAgent, allowDirectMediaResponse, current);
+            _ = RunResolutionAsync(key, source, normalizedUserAgent, current);
         }
 
         try
@@ -175,13 +166,12 @@ public sealed class RedirectResolver : IDisposable
         string cacheKey,
         SourceIdentity source,
         string userAgent,
-        bool allowDirectMediaResponse,
         PendingResolution entry)
     {
         try
         {
             var lease = await ResolveCoreAsync(
-                    source, userAgent, allowDirectMediaResponse, entry.Generation, entry.Cancellation.Token)
+                    source, userAgent, entry.Generation, entry.Cancellation.Token)
                 .ConfigureAwait(false);
             lock (sync)
             {
@@ -223,7 +213,6 @@ public sealed class RedirectResolver : IDisposable
     private async Task<RedirectLease> ResolveCoreAsync(
         SourceIdentity source,
         string userAgent,
-        bool allowDirectMediaResponse,
         int requestGeneration,
         CancellationToken cancellationToken)
     {
@@ -275,7 +264,7 @@ public sealed class RedirectResolver : IDisposable
                     var completedAt = clock.UtcNow;
                     return new RedirectLease(target, completedAt, completedAt + LeaseLifetime);
                 }
-                if (allowDirectMediaResponse && (response.StatusCode == 200 || response.StatusCode == 206))
+                if (response.StatusCode == 200 || response.StatusCode == 206)
                 {
                     var completedAt = clock.UtcNow;
                     return new RedirectLease(

@@ -25,7 +25,7 @@ public sealed class RedirectHttpIntegrationTests
             "Content-Length: 0\r\nConnection: close\r\n\r\n");
         using var resolver = CreateResolver();
 
-        var lease = await resolver.ResolveAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None);
+        var lease = await resolver.ResolveForProbeAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None);
         var headers = await observed.Task;
         await server;
 
@@ -49,7 +49,7 @@ public sealed class RedirectHttpIntegrationTests
         using var resolver = CreateResolver();
 
         var failure = await Assert.ThrowsExactlyAsync<RedirectSourceUnavailableException>(() =>
-            resolver.ResolveAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
+            resolver.ResolveForProbeAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
         await server;
 
         Assert.AreEqual(7, failure.RetryAfterSeconds);
@@ -69,7 +69,7 @@ public sealed class RedirectHttpIntegrationTests
         using var resolver = CreateResolver();
 
         var failure = await Assert.ThrowsExactlyAsync<RedirectRejectedException>(() =>
-            resolver.ResolveAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
+            resolver.ResolveForProbeAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
         await server;
 
         Assert.AreEqual(RedirectRejectionReason.PermanentFailure, failure.Reason);
@@ -90,7 +90,7 @@ public sealed class RedirectHttpIntegrationTests
         using var resolver = CreateResolver();
 
         var failure = await Assert.ThrowsExactlyAsync<RedirectRejectedException>(() =>
-            resolver.ResolveAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
+            resolver.ResolveForProbeAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
         await server;
 
         Assert.AreEqual(RedirectRejectionReason.UnsafeLocation, failure.Reason);
@@ -112,7 +112,7 @@ public sealed class RedirectHttpIntegrationTests
         using var resolver = CreateResolver(TimeSpan.FromMilliseconds(50));
 
         var failure = await Assert.ThrowsExactlyAsync<RedirectSourceUnavailableException>(() =>
-            resolver.ResolveAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
+            resolver.ResolveForProbeAsync(CreateSource(port), "TestPlayer/1.0", CancellationToken.None));
         await server;
 
         Assert.IsTrue(failure.RetryAfterSeconds >= 1);
