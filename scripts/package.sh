@@ -36,7 +36,8 @@ cp "$project_root/docs/ARCHITECTURE.md" \
   "$stage/docs/"
 find "$stage" -name '.DS_Store' -type f -delete
 # Use one current package timestamp for every entry so source-machine mtimes are not exposed.
-package_date=$(date '+%m-%d-%Y')
+package_date_mdy=$(date '+%m-%d-%Y')
+package_date_iso=$(date '+%Y-%m-%d')
 package_timestamp=$(date '+%Y%m%d%H%M.%S')
 find "$stage" -exec touch -t "$package_timestamp" {} +
 if rg -l '(Dropbox|OneDrive|Google Drive|Aliyun|AList|Alist|OpenList|115\.com|PikPak|WebDAV vendor)' \
@@ -56,7 +57,8 @@ cp "$project_root/RELEASE_NOTES.md" "$project_root/artifacts/RELEASE_NOTES.md"
 unzip -tqq "$archive"
 
 dated_entries=$(unzip -l "$archive" | rg '[[:space:]]Emby\.StrmBridge/' || true)
-if [ -z "$dated_entries" ] || printf '%s\n' "$dated_entries" | rg -v "[[:space:]]$package_date[[:space:]]" >/dev/null; then
+if [ -z "$dated_entries" ] || printf '%s\n' "$dated_entries" | \
+  rg -v "[[:space:]]($package_date_mdy|$package_date_iso)[[:space:]]" >/dev/null; then
   echo "Package validation failed: archive entries do not use the package date."
   exit 1
 fi
