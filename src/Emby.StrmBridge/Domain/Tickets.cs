@@ -8,6 +8,12 @@ public enum TicketScope
     HlsResource = 2,
 }
 
+public enum PlaybackTicketPurpose
+{
+    DirectClient = 1,
+    ServerFfmpeg = 2,
+}
+
 public sealed class TicketPayload
 {
     internal TicketPayload(
@@ -17,6 +23,7 @@ public sealed class TicketPayload
         byte[] userBindingHash,
         SourceIdentity source,
         Uri upstreamUri,
+        PlaybackTicketPurpose purpose,
         int runtimeGeneration,
         int hlsDepth,
         DateTimeOffset issuedAtUtc,
@@ -30,6 +37,7 @@ public sealed class TicketPayload
         UserBindingHash = userBindingHash ?? throw new ArgumentNullException(nameof(userBindingHash));
         Source = source ?? throw new ArgumentNullException(nameof(source));
         UpstreamUri = upstreamUri ?? throw new ArgumentNullException(nameof(upstreamUri));
+        Purpose = purpose;
         RuntimeGeneration = runtimeGeneration;
         HlsDepth = hlsDepth;
         IssuedAtUtc = issuedAtUtc;
@@ -49,6 +57,8 @@ public sealed class TicketPayload
     public SourceIdentity Source { get; }
 
     internal Uri UpstreamUri { get; }
+
+    public PlaybackTicketPurpose Purpose { get; }
 
     public int RuntimeGeneration { get; }
 

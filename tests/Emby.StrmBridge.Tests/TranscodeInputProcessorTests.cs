@@ -1,4 +1,5 @@
 using Emby.StrmBridge.Configuration;
+using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Playback;
 using Emby.StrmBridge.Runtime;
 using MediaBrowser.Controller.Entities;
@@ -35,6 +36,10 @@ public sealed class TranscodeInputProcessorTests
         Assert.AreEqual(MediaProtocol.Http, fixture.State.MediaSource.Protocol);
         Assert.AreEqual(MediaProtocol.Http, fixture.State.MediaSource.ProbeProtocol);
         Assert.AreEqual(1, fixture.Runtime.Tickets.Count);
+        var ticket = fixture.State.MediaPath
+            .Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)[^2];
+        Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(ticket, out var payload));
+        Assert.AreEqual(PlaybackTicketPurpose.ServerFfmpeg, payload!.Purpose);
     }
 
     [TestMethod]
@@ -70,6 +75,29 @@ public sealed class TranscodeInputProcessorTests
         Assert.AreSame(originalMediaSource, fixture.State.MediaSource);
         Assert.AreEqual(originalPath, fixture.State.MediaPath);
         Assert.AreEqual(0, fixture.Runtime.Tickets.Count);
+    }
+
+    [TestMethod]
+    public void MatchingAdaptiveSeekJob_PreparesAndBindsTheIssuedLoopbackInput()
+    {
+        using var fixture = CreateFixture();
+        var logger = FastSeekCoordinatorTests.CreateLogger();
+        var probe = new SyntheticFastSeekProbeClient();
+        fixture.Runtime.InitializeFastSeek(logger, probe);
+        var target = TimeSpan.FromSeconds(50);
+        fixture.State.BaseRequest.StartTimeTicks = target.Ticks;
+        fixture.State.MediaSource.RunTimeTicks = TimeSpan.FromSeconds(100).Ticks;
+
+        Assert.IsTrue(fixture.Processor.TryRoute(fixture.Service, fixture.State));
+
+        Assert.HasCount(2, probe.Offsets);
+        Assert.IsTrue(fixture.Runtime.FastSeek!.TryGetBoundPlan(
+            fixture.State.MediaPath,
+            fixture.Runtime.Generation,
+            target.Ticks,
+            CancellationToken.None,
+            out var plan));
+        Assert.AreEqual(target.Ticks, plan!.TargetTimeTicks);
     }
 
     private static Fixture CreateFixture(
@@ -145,7 +173,7 @@ public sealed class TranscodeInputProcessorTests
             mediaSourceManager,
             logger,
             () => localApiUrl);
-        return new Fixture(workspace, runtime, processor, new TestService(request), state);
+        return new Fixture(workspace, runtime, processor, new TestService(request), state, item);
     }
 
     private sealed class Fixture : IDisposable
@@ -155,13 +183,15 @@ public sealed class TranscodeInputProcessorTests
             PluginRuntime runtime,
             TranscodeInputProcessor processor,
             TestService service,
-            TestStreamState state)
+            TestStreamState state,
+            Movie item)
         {
             Workspace = workspace;
             Runtime = runtime;
             Processor = processor;
             Service = service;
             State = state;
+            Item = item;
         }
 
         private TestWorkspace Workspace { get; }
@@ -169,6 +199,7 @@ public sealed class TranscodeInputProcessorTests
         public TranscodeInputProcessor Processor { get; }
         public TestService Service { get; }
         public TestStreamState State { get; }
+        public Movie Item { get; }
 
         public void Dispose()
         {
@@ -187,6 +218,7 @@ public sealed class TranscodeInputProcessorTests
     {
         public string Id { get; set; } = string.Empty;
         public string MediaSourceId { get; set; } = string.Empty;
+        public long? StartTimeTicks { get; set; }
     }
 
     private sealed class TestStreamState

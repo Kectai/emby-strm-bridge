@@ -100,6 +100,7 @@ public sealed class PluginRuntimeTests
             "source",
             "user",
             TestSources.Create(),
+            Emby.StrmBridge.Domain.PlaybackTicketPurpose.DirectClient,
             runtime.Generation);
 
         runtime.UpdateOptions(
@@ -128,6 +129,34 @@ public sealed class PluginRuntimeTests
             invalidateSensitiveState: true);
 
         Assert.IsEmpty(runtime.GetDetectedRedirectHosts());
+    }
+
+    [TestMethod]
+    public async Task SensitiveStateInvalidation_ClearsPreparedFastSeekPlans()
+    {
+        using var workspace = new TestWorkspace();
+        using var runtime = new PluginRuntime();
+        runtime.Initialize(
+            workspace.Path,
+            new ManualClock(),
+            new StubRedirectClient((_, _, _, _) =>
+                Task.FromResult(new RedirectSourceResponse(404, null, null))));
+        runtime.InitializeFastSeek(
+            FastSeekCoordinatorTests.CreateLogger(),
+            new SyntheticFastSeekProbeClient());
+        Assert.IsTrue(await runtime.FastSeek!.PrepareAsync(
+            TestSources.Create(),
+            "source",
+            TimeSpan.FromSeconds(50).Ticks,
+            TimeSpan.FromSeconds(100).Ticks,
+            runtime.Generation,
+            new PluginConfiguration(),
+            CancellationToken.None));
+        Assert.AreEqual(1, runtime.FastSeek.Count);
+
+        runtime.UpdateOptions(new PluginConfiguration(), invalidateSensitiveState: true);
+
+        Assert.AreEqual(0, runtime.FastSeek.Count);
     }
 
     [TestMethod]

@@ -92,7 +92,8 @@ static void PrintType(Type type)
         Console.WriteLine($"  CTOR {Format(constructor)}");
     foreach (var property in type.GetProperties(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
                  .OrderBy(value => value.Name))
-        Console.WriteLine($"  PROP {FormatType(property.PropertyType)} {property.Name}");
+        Console.WriteLine($"  PROP {FormatType(property.PropertyType)} {property.Name} " +
+                          $"read={property.CanRead} write={property.CanWrite}");
     foreach (var method in type.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
                  .Where(value => !value.IsSpecialName && value.DeclaringType == type)
                  .OrderBy(value => value.Name)

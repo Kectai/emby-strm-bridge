@@ -69,6 +69,7 @@ public sealed class GatewayService : IService, IRequiresRequest
         if (parentTicketValue is not null &&
             (!runtime.Tickets.TryInspect(parentTicketValue, out var parent) ||
              parent!.Scope != TicketScope.Playback || inspected!.Scope != TicketScope.HlsResource ||
+             !runtime.Tickets.IsHlsResourceOfRoot(parentTicketValue, ticketValue) ||
              parent.ItemId != inspected.ItemId ||
              !string.Equals(parent.MediaSourceId, inspected.MediaSourceId, StringComparison.Ordinal)))
             throw Unavailable();
@@ -106,9 +107,12 @@ public sealed class GatewayService : IService, IRequiresRequest
 
         try
         {
-            var lease = await runtime.Gateway.OpenAsync(
+            using var lease = await runtime.Gateway.OpenAsync(
                     ticket.UpstreamUri,
                     ticketValue,
+                    ticket.Purpose == PlaybackTicketPurpose.ServerFfmpeg
+                        ? GatewayTransport.CreateRedirectCandidateScope(ticket.Source)
+                        : null,
                     Request.HttpMethod,
                     Request.UserAgent,
                     GetForwardedRequestHeaders(),
@@ -119,7 +123,7 @@ public sealed class GatewayService : IService, IRequiresRequest
                 logger.Debug("STRM_BRIDGE_GATEWAY_REDIRECT_LEASE_HIT item=" + ShortId(ticket.ItemId));
             if (lease.RetriedRejectedRedirect)
                 logger.Debug("STRM_BRIDGE_GATEWAY_REDIRECT_RETRIED item=" + ShortId(ticket.ItemId));
-            var behavior = SourceBehaviorClassifier.Classify(lease.Response, lease.EffectiveUri, lease.RedirectCount);
+            var behavior = SourceBehaviorClassifier.Classify(lease.Response, lease.EffectiveUri);
             if (behavior != SourceTransportBehavior.HlsManifest &&
                 HasResponseBody(lease.Response, Request.HttpMethod) &&
                 (int)lease.Response.StatusCode is 200 or 206)
@@ -128,70 +132,69 @@ public sealed class GatewayService : IService, IRequiresRequest
                 behavior = SourceBehaviorClassifier.Classify(
                     lease.Response,
                     lease.EffectiveUri,
-                    lease.RedirectCount,
                     prefix);
             }
-            var plan = TransportPlanner.Create(options.PlaybackMode, behavior);
+            var plan = TransportPlanner.Create(options.PlaybackMode, behavior, ticket.Purpose);
             if (plan == GatewayTransportPlan.Redirect)
             {
-                using (lease)
-                {
-                    Request.Response.StatusCode = 302;
-                    AddSafeHeaders();
-                    Request.Response.AddHeader("Location", lease.EffectiveUri.AbsoluteUri);
-                }
+                Request.Response.StatusCode = 302;
+                AddSafeHeaders();
+                Request.Response.AddHeader("Location", lease.EffectiveUri.AbsoluteUri);
                 logger.Debug("STRM_BRIDGE_GATEWAY_REDIRECT item=" + ShortId(ticket.ItemId));
                 return string.Empty;
             }
             if (plan == GatewayTransportPlan.RelayHls && HasResponseBody(lease.Response, Request.HttpMethod))
             {
-                using (lease)
+                var statusCode = (int)lease.Response.StatusCode;
+                var headers = CreateResponseHeaders(lease, includeLength: false);
+                var manifest = await ReadManifestAsync(lease, Request.CancellationToken).ConfigureAwait(false);
+                var apiPathBase = GatewayRouteBuilder.GetApiPathBase(Request);
+                var rootTicket = parentTicketValue ?? ticketValue;
+                using var mutation = await runtime.Tickets.AcquireHlsMutationAsync(
+                        rootTicket,
+                        Request.CancellationToken)
+                    .ConfigureAwait(false);
+                var childTickets = new List<string>();
+                var childRoutes = new Dictionary<string, string>(StringComparer.Ordinal);
+                try
                 {
-                    var statusCode = (int)lease.Response.StatusCode;
-                    var headers = CreateResponseHeaders(lease, includeLength: false);
-                    var manifest = await ReadManifestAsync(lease, Request.CancellationToken).ConfigureAwait(false);
-                    var apiPathBase = GatewayRouteBuilder.GetApiPathBase(Request);
-                    var childTickets = new List<string>();
-                    var childRoutes = new Dictionary<string, string>(StringComparer.Ordinal);
-                    try
-                    {
-                        var rewritten = HlsPlaylistRewriter.Rewrite(
-                            manifest,
-                            lease.EffectiveUri,
-                            target =>
-                            {
-                                var validated = runtime.Gateway.ValidateResource(lease.EffectiveUri, target);
-                                if (childRoutes.TryGetValue(validated.AbsoluteUri, out var existingRoute))
-                                    return existingRoute;
-                                var childTicket = runtime.Tickets.IssueHlsResource(
-                                    parentTicketValue ?? ticketValue,
-                                    ticket,
-                                    validated,
-                                    out var created);
-                                if (created) childTickets.Add(childTicket);
-                                var route = GatewayRouteBuilder.CreateHlsRoute(
-                                    apiPathBase,
-                                    parentTicketValue ?? ticketValue,
-                                    childTicket,
-                                    validated);
-                                childRoutes.Add(validated.AbsoluteUri, route);
-                                return route;
-                            });
-                        Request.Response.StatusCode = statusCode;
-                        headers["Cache-Control"] = "private, no-store";
-                        var result = resultFactory.GetResult(
-                            Request,
-                            new ReadOnlyMemory<byte>(Encoding.UTF8.GetBytes(rewritten)),
-                            "application/vnd.apple.mpegurl",
-                            headers);
-                        logger.Debug("STRM_BRIDGE_GATEWAY_HLS item=" + ShortId(ticket.ItemId));
-                        return result;
-                    }
-                    catch
-                    {
-                        foreach (var childTicket in childTickets) runtime.Tickets.Revoke(childTicket);
-                        throw;
-                    }
+                    var rewritten = HlsPlaylistRewriter.Rewrite(
+                        manifest,
+                        lease.EffectiveUri,
+                        target =>
+                        {
+                            var validated = runtime.Gateway.ValidateResource(lease.EffectiveUri, target);
+                            if (childRoutes.TryGetValue(validated.AbsoluteUri, out var existingRoute))
+                                return existingRoute;
+                            var childTicket = runtime.Tickets.IssueHlsResource(
+                                rootTicket,
+                                ticketValue,
+                                ticket,
+                                validated,
+                                out var created);
+                            if (created) childTickets.Add(childTicket);
+                            var route = GatewayRouteBuilder.CreateHlsRoute(
+                                apiPathBase,
+                                rootTicket,
+                                childTicket,
+                                validated);
+                            childRoutes.Add(validated.AbsoluteUri, route);
+                            return route;
+                        });
+                    Request.Response.StatusCode = statusCode;
+                    headers["Cache-Control"] = "private, no-store";
+                    var result = resultFactory.GetResult(
+                        Request,
+                        new ReadOnlyMemory<byte>(Encoding.UTF8.GetBytes(rewritten)),
+                        "application/vnd.apple.mpegurl",
+                        headers);
+                    logger.Debug("STRM_BRIDGE_GATEWAY_HLS item=" + ShortId(ticket.ItemId));
+                    return result;
+                }
+                catch
+                {
+                    foreach (var childTicket in childTickets) runtime.Tickets.Revoke(childTicket);
+                    throw;
                 }
             }
             return await CreateRelayResultAsync(lease, ticket).ConfigureAwait(false);

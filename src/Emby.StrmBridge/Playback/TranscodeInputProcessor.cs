@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Reflection;
+using System.Threading;
 using Emby.StrmBridge.Configuration;
 using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Policy;
@@ -108,6 +109,16 @@ internal sealed class TranscodeInputProcessor
 
             var operation = runtime.BeginOperation();
             var userId = GetUserId(GetProperty(state, "AuthorizationInfo"));
+            var startTimeTicks = GetLongProperty(request, "StartTimeTicks");
+            var fastSeekDurationTicks = TryPrepareFastSeek(
+                source,
+                sourceItem,
+                currentMediaSource,
+                mediaSourceId,
+                startTimeTicks,
+                options,
+                operation,
+                GetProperty(service, "Request") as IRequest);
             var container = string.IsNullOrWhiteSpace(currentMediaSource.Container)
                 ? Path.GetExtension(source.SourceUri.AbsolutePath).TrimStart('.')
                 : currentMediaSource.Container;
@@ -121,6 +132,7 @@ internal sealed class TranscodeInputProcessor
                             currentMediaSource.Id ?? mediaSourceId,
                             userId,
                             source,
+                            PlaybackTicketPurpose.ServerFfmpeg,
                             operation.Generation,
                             TicketStore.ComputePlaybackLifetime(
                                 currentMediaSource.RunTimeTicks ?? sourceItem.RunTimeTicks));
@@ -151,6 +163,15 @@ internal sealed class TranscodeInputProcessor
                         SetProperty(state, "DirectMediaPath", route);
                         SetProperty(state, "MediaProtocol", MediaProtocol.Http);
                         SetProperty(state, "DirectMediaProtocol", MediaProtocol.Http);
+                        if (startTimeTicks.HasValue && fastSeekDurationTicks.HasValue)
+                            runtime.FastSeek?.TryBindInput(
+                                source,
+                                currentMediaSource.Id ?? mediaSourceId,
+                                startTimeTicks.Value,
+                                fastSeekDurationTicks.Value,
+                                operation.Generation,
+                                route,
+                                options);
                     }))
                 return false;
 
@@ -238,6 +259,66 @@ internal sealed class TranscodeInputProcessor
 
     private static string? GetStringProperty(object? value, string name) =>
         GetProperty(value, name)?.ToString();
+
+    private static long? GetLongProperty(object? value, string name)
+    {
+        var property = GetProperty(value, name);
+        if (property is long number) return number;
+        return long.TryParse(property?.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private long? TryPrepareFastSeek(
+        SourceIdentity source,
+        BaseItem sourceItem,
+        MediaSourceInfo mediaSource,
+        string mediaSourceId,
+        long? startTimeTicks,
+        PluginConfiguration options,
+        OperationContext operation,
+        IRequest? serviceRequest)
+    {
+        var fastSeek = runtime.FastSeek;
+        var durationTicks = mediaSource.RunTimeTicks ?? sourceItem.RunTimeTicks;
+        if (fastSeek is null || options.PlaybackMode != PlaybackRoutingMode.Adaptive ||
+            !startTimeTicks.HasValue || startTimeTicks.Value < FastSeekCoordinator.MinimumTarget.Ticks ||
+            !durationTicks.HasValue || durationTicks.Value <= startTimeTicks.Value ||
+            !IsTransportStreamCandidate(mediaSource, source))
+            return null;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            operation.CancellationToken,
+            serviceRequest?.CancellationToken ?? CancellationToken.None);
+        var prepared = fastSeek.PrepareAsync(
+                source,
+                mediaSource.Id ?? mediaSourceId,
+                startTimeTicks.Value,
+                durationTicks.Value,
+                operation.Generation,
+                options,
+                cancellation.Token)
+            .GetAwaiter()
+            .GetResult();
+        return prepared ? durationTicks.Value : null;
+    }
+
+    private static bool IsTransportStreamCandidate(MediaSourceInfo mediaSource, SourceIdentity source)
+    {
+        var containers = (mediaSource.Container ?? string.Empty)
+            .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => value.Trim());
+        if (containers.Any(value =>
+                string.Equals(value, "mpegts", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "mpegtsraw", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "ts", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "m2ts", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "mts", StringComparison.OrdinalIgnoreCase)))
+            return true;
+        var extension = Path.GetExtension(source.SourceUri.AbsolutePath);
+        return string.Equals(extension, ".ts", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(extension, ".m2ts", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(extension, ".mts", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static void SetProperty(object value, string name, object? propertyValue)
     {

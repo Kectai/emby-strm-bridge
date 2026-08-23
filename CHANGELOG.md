@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2
+
+- Adds Adaptive routing for direct playback and server-side media processing.
+- Adds fast positioning for remote TS and M2TS media.
+- Improves repeated seeking and playback recovery.
+- Improves simultaneous playback across users and sessions.
+- Improves HLS playback continuity and gateway compatibility.
+- Makes configuration labels and descriptions follow the active Emby Web language without changing setting values.
+
 ## 0.2.1
 
 - Processes version-gated GET and POST PlaybackInfo responses on Emby Server 4.9.5.x while preserving media-source count, order, IDs and metadata.

@@ -21,14 +21,14 @@ The archive is created at `artifacts/Emby.StrmBridge-<version>.zip`. Build cache
 7. Configure trusted cross-host redirect rules or review detected hosts after extraction.
 8. Run **Extract missing STRM media information**.
 
-The Emby service account needs read access to STRM files and write access to its plugin configuration directory. Media-library write access is optional for this plugin.
+The Emby service account needs read access to STRM files and write access to its plugin configuration directory. Media-library write access is optional for this plugin. Configuration localization uses Emby's native Generic UI request and does not modify dashboard files.
 
 ## Verify the installation
 
 Check Emby's plugin log for:
 
 ```text
-STRM_BRIDGE_PATCH_READY abi=4.9.5.0 targets=4
+STRM_BRIDGE_PATCH_READY abi=4.9.5.0 targets=5
 ```
 
 Request PlaybackInfo for a selected STRM Item and confirm its existing media source contains a relative URL beginning with:
@@ -43,9 +43,13 @@ During playback, privacy-safe log events identify the selected transport without
 
 - `STRM_BRIDGE_PLAYBACK_REWRITTEN`
 - `STRM_BRIDGE_TRANSCODE_INPUT_ROUTED`
+- `STRM_BRIDGE_FAST_SEEK_READY`
+- `STRM_BRIDGE_FAST_SEEK_APPLIED`
 - `STRM_BRIDGE_GATEWAY_REDIRECT`
 - `STRM_BRIDGE_GATEWAY_RELAY`
 - `STRM_BRIDGE_GATEWAY_HLS`
+
+In the settings page, switch the Emby Web language and confirm the title, labels and descriptions update while `Adaptive`, `RedirectOnly`, `RelayOnly` and `Native` remain unchanged.
 
 ## Update
 

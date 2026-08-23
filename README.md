@@ -10,11 +10,12 @@
 
 ### 播放模型
 
-Emby 先生成原生 PlaybackInfo 响应。对于 Emby Server 4.9.5.x，插件通过经过版本校验的 Harmony 补丁衔接静态播放生命周期中的三个位置：
+Emby 先生成原生 PlaybackInfo 响应。对于 Emby Server 4.9.5.x，插件通过经过版本校验的 Harmony 补丁衔接静态播放生命周期中的四个位置：
 
 - PlaybackInfo 中匹配媒体源的 `DirectStreamUrl` 使用服务器相对网关路由，并保留原生 `Path` 与 `ProbePath`；
 - 客户端采用 Emby 标准静态视频路由时，插件按项目和媒体源 ID 验证目标 STRM，并在原生代取开始前交给同一个网关处理。
-- Emby 启动 FFmpeg 转码前，插件再次验证转码作业中的项目、媒体源 ID 和当前 STRM 来源，仅把该作业的输入改为 Emby 运行时提供的回环网关地址。
+- Emby 创建 FFmpeg 转码状态时，插件再次验证转码作业中的项目、媒体源 ID 和当前 STRM 来源；只有实际进入转码的远程 TS/M2TS 非零起播才使用两个有界 Range 样本生成定位校准，估算预滚不在 0.25–6 秒窗口时增加一个校正样本，然后把该作业输入改为 Emby 运行时回环网关地址并精确绑定；每个新拖动目标先执行一次有界 PCR 校正，超出安全预滚窗口时最多追加一次校正；同一来源和目标跨播放会话共享已验证计划；
+- FFmpeg 命令生成完成后，插件只为精确绑定且时间线可证明的 HTTP 分段作业设置校准后的字节偏移、顺序读取、相对预滚和绝对输出时间轴。处理器接受 Emby 原生 `segment_time_delta=-ss` 契约，也接受 `copyts + start_at_zero` 且 `segment_start_number × segment_time ≈ ss` 的完整转码契约；分片编号保持不变，首段时间容差按实际分片时长的一半调整且最多调整 3 秒，后续分片保持原生节奏，其余命令保持原样。
 
 ```text
 {当前-api-路径前缀}/StrmBridge/Playback/v2/{随机票据}/stream{扩展名}
@@ -28,14 +29,14 @@ Emby 先生成原生 PlaybackInfo 响应。对于 Emby Server 4.9.5.x，插件�
 
 播放模式：
 
-- `Adaptive`：跟随已获信任的重定向链，通过 Emby 中继最终文件或 HLS 流。
+- `Adaptive`：普通客户端直放在验证重定向链后以 HTTP 302 访问最终来源；服务端 FFmpeg 文件和 HLS 通过 Emby 中继。
 - `RedirectOnly`：解析已获信任的重定向链，以 HTTP 302 返回最终地址。
 - `RelayOnly`：通过 Emby 中继所选来源。
 - `Native`：保持 Emby PlaybackInfo、标准静态视频和 FFmpeg 输入行为不变。
 
-默认模式为 `Adaptive`。上游请求会保留客户端 User-Agent 和 Range 请求头，从而支持与实际播放请求绑定的临时地址。
+默认模式为 `Adaptive`。客户端直放仍先访问一次票据路由以完成授权和重定向验证，媒体正文随后由客户端从最终来源读取；服务端处理保留实际请求的 User-Agent 和 Range 上下文。
 
-文件中继会为每个播放票据和标准化请求上下文保存一个有界、仅内存、有效期 30 秒的重定向租约。首次 Range 请求完成可信重定向解析后，临近的 Range 请求从已验证的有效地址开始。首次重定向链或租约目标返回 401、403、404、410 时，会释放该响应并从 STRM 原始地址重新解析一次；第二次结果直接返回。
+文件中继会为每个播放票据和标准化请求上下文保存一个有界、仅内存、有效期 30 秒的重定向租约。每次 Range 复用都要求返回范围和长度一致的 `206 Content-Range`。快速定位探测还会按来源保存一个短期候选地址；仅服务端 FFmpeg 正式媒体请求会使用自己的 User-Agent 和 Range 复验该候选，客户端直放不会读取该候选。范围不匹配时立即从 STRM 原始地址解析。首次重定向链或租约目标返回 401、403、404、410 时，会释放该响应并从 STRM 原始地址重新解析一次；第二次结果直接返回。
 
 ### 媒体信息
 
@@ -49,6 +50,8 @@ Emby 先生成原生 PlaybackInfo 响应。对于 Emby Server 4.9.5.x，插件�
 ### 配置
 
 至少选择一个参与处理的媒体库。留空表示提取和播放的处理范围均为空。
+
+配置页标题、字段名称和说明文字跟随当前 Emby Web 界面语言，并在切换语言后刷新；`Adaptive`、`RedirectOnly`、`RelayOnly` 和 `Native` 保持为稳定的模式标识。语言刷新只更新显示文字，不会修改已选择的媒体库、播放模式或其他配置值。说明文字统一支持选择和复制。
 
 跨主机重定向由管理员信任规则控制，支持：
 
@@ -80,6 +83,7 @@ Emby 先生成原生 PlaybackInfo 响应。对于 Emby Server 4.9.5.x，插件�
 ### 文档
 
 - [播放网关设计](docs/PLAYBACK_GATEWAY_DESIGN.md)
+- [远程传输流快速定位设计](docs/FAST_SEEK_DESIGN.md)
 - [架构](docs/ARCHITECTURE.md)
 - [安装](docs/INSTALL.md)
 - [安全](docs/SECURITY.md)
@@ -100,11 +104,12 @@ STRM Bridge 使用 MIT 许可证。内嵌 Harmony 运行库的许可证声明请
 
 ### Playback model
 
-Emby builds the native PlaybackInfo response first. On Emby Server 4.9.5.x, version-gated Harmony patches integrate at three points in the static-playback lifecycle:
+Emby builds the native PlaybackInfo response first. On Emby Server 4.9.5.x, version-gated Harmony patches integrate at four points in the static-playback lifecycle:
 
 - an exact matching source in PlaybackInfo receives a server-relative `DirectStreamUrl`, while its native `Path` and `ProbePath` remain unchanged;
 - when a client uses Emby's standard static-video route, the plugin validates the item and media-source ID before handing the request to the same gateway ahead of native upstream retrieval.
-- immediately before Emby starts FFmpeg, the plugin revalidates the job's item, media-source ID, and current STRM source, then changes only that job's input to the loopback gateway address reported by the running Emby instance.
+- when Emby creates FFmpeg transcode state, the plugin revalidates the job's item, media-source ID, and current STRM source; an actual non-zero remote TS/M2TS transcode normally uses two bounded Range samples and adds a correction sample when the estimated pre-roll falls outside the preferred 0.25-to-6-second window, after which the plugin changes that job's input to the runtime loopback gateway and binds the calibration; each previously unseen later seek uses one bounded PCR correction and at most one bounded retry when the result falls outside the safe pre-roll window; validated source-and-target plans are shared across playback sessions;
+- after command construction, the plugin applies the calibrated byte offset, sequential input, relative pre-roll, and absolute output timeline only to a bound HTTP segment job with a provable timeline. It accepts either Emby's native `segment_time_delta=-ss` contract or an indexed transcode contract with `copyts`, `start_at_zero`, and `segment_start_number × segment_time ≈ ss`. Segment numbering stays unchanged; first-segment tolerance advances by half the actual segment duration, capped at three seconds, while later segments retain the native cadence. Every other command stays native.
 
 ```text
 {current-api-path-base}/StrmBridge/Playback/v2/{random-ticket}/stream{extension}
@@ -118,14 +123,14 @@ The standard static-video adapter accepts only GET/HEAD requests with `Static=tr
 
 Playback modes:
 
-- `Adaptive`: follows approved redirect chains and relays the resulting file or HLS stream through Emby.
+- `Adaptive`: redirects ordinary client direct play to the validated final source, while relaying server-side FFmpeg files and HLS through Emby.
 - `RedirectOnly`: resolves an approved redirect chain and returns the final URL as HTTP 302.
 - `RelayOnly`: streams selected sources through Emby.
 - `Native`: keeps Emby's PlaybackInfo, standard static-video, and FFmpeg input behavior unchanged.
 
-`Adaptive` is the default. It preserves the client User-Agent and Range headers during upstream requests, which supports temporary URLs bound to the actual playback request.
+`Adaptive` is the default. Client direct play first visits the ticket route for authorization and redirect validation, then reads the media body from the final source; server-side processing retains the actual User-Agent and Range context.
 
-File relay keeps a bounded 30-second, memory-only redirect lease for each playback ticket and normalized request context. After the first Range request resolves the approved chain, nearby Range requests start at the validated effective address. A fresh redirect chain or leased target ending in 401, 403, 404, or 410 releases that response and resolves once from the STRM source; the second result is returned directly.
+File relay keeps a bounded 30-second, memory-only redirect lease for each playback ticket and normalized request context. After the first Range request resolves the approved chain, nearby Range requests start at the validated effective address only when the returned `206 Content-Range` and length match the request. Fast-seek probes also keep a short source-scoped candidate; only the server-FFmpeg media request revalidates it with that request's own User-Agent and Range, while direct-client requests never consume it. A fresh redirect chain or leased target ending in 401, 403, 404, or 410 releases that response and resolves once from the STRM source; the second result is returned directly.
 
 ### Media information
 
@@ -139,6 +144,8 @@ Extraction uses Emby's media probe APIs and saves a URL-free snapshot. Existing 
 ### Configuration
 
 Select at least one participating media library. An empty selection defines an empty processing scope for extraction and playback.
+
+Configuration titles, field labels, and descriptions follow the current Emby Web language and refresh after a language change. `Adaptive`, `RedirectOnly`, `RelayOnly`, and `Native` remain stable mode identifiers. Localization updates display text only; it does not change the selected libraries, playback mode, or any other setting value. Description text is consistently selectable and copyable.
 
 Cross-host redirects use administrator trust rules. Supported entries are:
 
@@ -170,6 +177,7 @@ Maintenance routes require an Emby administrator. Playback routes use high-entro
 ### Documentation
 
 - [Playback gateway design](docs/PLAYBACK_GATEWAY_DESIGN.md)
+- [Remote transport-stream fast seek design](docs/FAST_SEEK_DESIGN.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Installation](docs/INSTALL.md)
 - [Security](docs/SECURITY.md)

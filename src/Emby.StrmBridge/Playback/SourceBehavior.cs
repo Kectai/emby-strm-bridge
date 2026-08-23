@@ -1,14 +1,14 @@
 using System;
 using System.Net.Http;
 using Emby.StrmBridge.Configuration;
+using Emby.StrmBridge.Domain;
 
 namespace Emby.StrmBridge.Playback;
 
 public enum SourceTransportBehavior
 {
-    DirectBody = 0,
-    RequestBoundRedirect = 1,
-    HlsManifest = 2,
+    FileBody = 0,
+    HlsManifest = 1,
 }
 
 public enum GatewayTransportPlan
@@ -23,13 +23,12 @@ public static class SourceBehaviorClassifier
     private static readonly byte[] HlsSignature =
         { (byte)'#', (byte)'E', (byte)'X', (byte)'T', (byte)'M', (byte)'3', (byte)'U' };
 
-    public static SourceTransportBehavior Classify(HttpResponseMessage response, Uri effectiveUri, int redirectCount)
-        => Classify(response, effectiveUri, redirectCount, ReadOnlyMemory<byte>.Empty);
+    public static SourceTransportBehavior Classify(HttpResponseMessage response, Uri effectiveUri)
+        => Classify(response, effectiveUri, ReadOnlyMemory<byte>.Empty);
 
     public static SourceTransportBehavior Classify(
         HttpResponseMessage response,
         Uri effectiveUri,
-        int redirectCount,
         ReadOnlyMemory<byte> contentPrefix)
     {
         if (response is null) throw new ArgumentNullException(nameof(response));
@@ -39,9 +38,7 @@ public static class SourceBehaviorClassifier
             effectiveUri.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase) ||
             HasHlsSignature(contentPrefix))
             return SourceTransportBehavior.HlsManifest;
-        return redirectCount > 0
-            ? SourceTransportBehavior.RequestBoundRedirect
-            : SourceTransportBehavior.DirectBody;
+        return SourceTransportBehavior.FileBody;
     }
 
     private static bool HasHlsSignature(ReadOnlyMemory<byte> prefix)
@@ -57,10 +54,15 @@ public static class SourceBehaviorClassifier
 
 public static class TransportPlanner
 {
-    public static GatewayTransportPlan Create(PlaybackRoutingMode mode, SourceTransportBehavior behavior)
+    public static GatewayTransportPlan Create(
+        PlaybackRoutingMode mode,
+        SourceTransportBehavior behavior,
+        PlaybackTicketPurpose purpose)
     {
         if (mode == PlaybackRoutingMode.RedirectOnly) return GatewayTransportPlan.Redirect;
         if (behavior == SourceTransportBehavior.HlsManifest) return GatewayTransportPlan.RelayHls;
+        if (mode == PlaybackRoutingMode.Adaptive && purpose == PlaybackTicketPurpose.DirectClient)
+            return GatewayTransportPlan.Redirect;
         return GatewayTransportPlan.RelayFile;
     }
 }

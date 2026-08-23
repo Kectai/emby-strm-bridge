@@ -4,12 +4,14 @@ using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
 using System.Net;
+using System.Reflection;
 using System.Xml.Serialization;
 using Emby.StrmBridge.Localization;
 using Emby.Web.GenericEdit;
 using Emby.Web.GenericEdit.Common;
 using Emby.Web.GenericEdit.Validation;
 using MediaBrowser.Model.Attributes;
+using MediaBrowser.Model.GenericEdit;
 using MediaBrowser.Model.LocalizationAttributes;
 
 namespace Emby.StrmBridge.Configuration;
@@ -31,6 +33,30 @@ public sealed class PluginConfiguration : EditableOptionsBase
     public override string EditorTitle => PluginStrings.EditorTitle;
 
     public override string EditorDescription => PluginStrings.EditorDescription;
+
+    public override IEditObjectContainer CreateEditContainer()
+    {
+        var result = base.CreateEditContainer();
+        if (result is not EditObjectContainer container) return result;
+
+        var root = container.EditorRoot;
+        root.DisplayName = EditorTitle;
+        root.Description = EditorDescription;
+        foreach (var editor in root.EditorItems)
+        {
+            var property = typeof(PluginConfiguration).GetProperty(
+                editor.Name,
+                BindingFlags.Instance | BindingFlags.Public);
+            if (property is null) continue;
+
+            if (property.GetCustomAttribute<DisplayNameLAttribute>() is { } displayName)
+                editor.DisplayName = displayName.DisplayName;
+            if (property.GetCustomAttribute<DescriptionLAttribute>() is { } description)
+                editor.Description = description.Description;
+        }
+
+        return container;
+    }
 
     [DisplayNameL(nameof(PluginStrings.Enabled), typeof(PluginStrings))]
     public bool Enabled { get; set; } = true;

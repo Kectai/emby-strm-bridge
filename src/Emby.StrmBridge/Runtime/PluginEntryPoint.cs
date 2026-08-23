@@ -57,6 +57,7 @@ public sealed class PluginEntryPoint : IServerEntryPoint, IDisposable
         var runtime = Plugin.Runtime ?? throw new InvalidOperationException("STRM Bridge runtime is unavailable.");
         Plugin.Instance?.AttachLibraryManager(libraryManager);
         runtime.Initialize(applicationPaths.ConfigurationDirectoryPath);
+        runtime.InitializeFastSeek(logManager.GetLogger(Plugin.Instance?.Name ?? "STRM Bridge"));
         var coordinator = new ExtractionCoordinator(
             runtime,
             libraryManager,
@@ -87,10 +88,12 @@ public sealed class PluginEntryPoint : IServerEntryPoint, IDisposable
                 mediaSourceManager,
                 applicationHost,
                 logManager);
+            var ffmpegCommandProcessor = new FfmpegCommandProcessor(runtime, logManager);
             var playbackPatch = new HarmonyPatchHost(
                 playbackProcessor,
                 nativeStreamProcessor,
                 transcodeInputProcessor,
+                ffmpegCommandProcessor,
                 logManager);
             runtime.SetPlaybackHealth(playbackPatch.Install(), playbackPatch.HostAbi);
             runtime.AttachPlaybackPatch(playbackPatch);

@@ -121,6 +121,7 @@ internal sealed class NativeVideoStreamProcessor
                         matchedMediaSource.Id ?? mediaSourceId,
                         userId,
                         matchedSource,
+                        PlaybackTicketPurpose.DirectClient,
                         operation.Generation,
                         TicketStore.ComputePlaybackLifetime(
                             matchedMediaSource.RunTimeTicks ?? matchedItem.RunTimeTicks))))

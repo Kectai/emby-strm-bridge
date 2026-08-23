@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Emby.StrmBridge.Domain;
 
 namespace Emby.StrmBridge.Playback;
@@ -18,6 +21,7 @@ public sealed class TicketStore
     private readonly Dictionary<string, TicketPayload> entries = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Dictionary<string, string>> hlsTicketsByParent = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HlsTicketIndex> hlsTicketIndexes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SemaphoreSlim> hlsMutationGates = new(StringComparer.Ordinal);
     private readonly IClock clock;
     private readonly int playbackCapacity;
     private readonly int hlsCapacity;
@@ -49,6 +53,7 @@ public sealed class TicketStore
         string mediaSourceId,
         string? userId,
         SourceIdentity source,
+        PlaybackTicketPurpose purpose,
         int runtimeGeneration,
         TimeSpan? playbackLifetime = null)
     {
@@ -62,6 +67,7 @@ public sealed class TicketStore
             HashUserId(userId),
             source,
             source.SourceUri,
+            purpose,
             runtimeGeneration,
             hlsDepth: 0,
             now,
@@ -72,13 +78,16 @@ public sealed class TicketStore
     }
 
     public string IssueHlsResource(
-        string parentTicket,
+        string rootTicket,
+        string currentTicket,
         TicketPayload parent,
         Uri upstreamUri,
         out bool created)
     {
         created = false;
-        if (!IsWellFormed(parentTicket)) throw new ArgumentException("The parent ticket is invalid.", nameof(parentTicket));
+        if (!IsWellFormed(rootTicket)) throw new ArgumentException("The root ticket is invalid.", nameof(rootTicket));
+        if (!IsWellFormed(currentTicket))
+            throw new ArgumentException("The current ticket is invalid.", nameof(currentTicket));
         if (parent is null) throw new ArgumentNullException(nameof(parent));
         if (upstreamUri is null) throw new ArgumentNullException(nameof(upstreamUri));
         if (parent.HlsDepth >= 8) throw new TicketCapacityException();
@@ -87,12 +96,17 @@ public sealed class TicketStore
         lock (sync)
         {
             RemoveExpiredUnsafe();
-            if (!entries.TryGetValue(parentTicket, out var root) || root.Scope != TicketScope.Playback ||
+            if (!entries.TryGetValue(rootTicket, out var root) || root.Scope != TicketScope.Playback ||
+                !entries.TryGetValue(currentTicket, out var current) || !ReferenceEquals(current, parent) ||
+                parent.Scope == TicketScope.Playback && !string.Equals(rootTicket, currentTicket, StringComparison.Ordinal) ||
+                parent.Scope == TicketScope.HlsResource &&
+                (!hlsTicketIndexes.TryGetValue(currentTicket, out var currentIndex) ||
+                 !string.Equals(currentIndex.ParentTicket, rootTicket, StringComparison.Ordinal)) ||
                 root.ItemId != parent.ItemId ||
                 !string.Equals(root.MediaSourceId, parent.MediaSourceId, StringComparison.Ordinal))
-                throw new ArgumentException("The parent ticket is unavailable.", nameof(parentTicket));
-            var resourceKey = HashHlsResource(upstreamUri);
-            if (hlsTicketsByParent.TryGetValue(parentTicket, out var indexed) &&
+                throw new InvalidOperationException("The HLS ticket relationship is unavailable.");
+            var resourceKey = HashHlsResource(upstreamUri, parent.HlsDepth + 1);
+            if (hlsTicketsByParent.TryGetValue(rootTicket, out var indexed) &&
                 indexed.TryGetValue(resourceKey, out var existingTicket) &&
                 entries.TryGetValue(existingTicket, out var existing) &&
                 Uri.Compare(existing.UpstreamUri, upstreamUri, UriComponents.AbsoluteUri,
@@ -109,6 +123,7 @@ public sealed class TicketStore
                 parent.UserBindingHash.ToArray(),
                 parent.Source,
                 upstreamUri,
+                parent.Purpose,
                 parent.RuntimeGeneration,
                 parent.HlsDepth + 1,
                 now,
@@ -118,8 +133,8 @@ public sealed class TicketStore
             var ticket = AddUnsafe(payload, hlsCapacity);
             indexed ??= new Dictionary<string, string>(StringComparer.Ordinal);
             indexed[resourceKey] = ticket;
-            hlsTicketsByParent[parentTicket] = indexed;
-            hlsTicketIndexes[ticket] = new HlsTicketIndex(parentTicket, resourceKey);
+            hlsTicketsByParent[rootTicket] = indexed;
+            hlsTicketIndexes[ticket] = new HlsTicketIndex(rootTicket, resourceKey);
             created = true;
             return ticket;
         }
@@ -168,6 +183,47 @@ public sealed class TicketStore
         }
     }
 
+    public bool IsHlsResourceOfRoot(string rootTicket, string childTicket)
+    {
+        if (!IsWellFormed(rootTicket) || !IsWellFormed(childTicket)) return false;
+        lock (sync)
+        {
+            return entries.TryGetValue(rootTicket, out var root) && root.Scope == TicketScope.Playback &&
+                   entries.TryGetValue(childTicket, out var child) && child.Scope == TicketScope.HlsResource &&
+                   clock.UtcNow < root.ExpiresAtUtc && clock.UtcNow < child.ExpiresAtUtc &&
+                   hlsTicketIndexes.TryGetValue(childTicket, out var index) &&
+                   string.Equals(index.ParentTicket, rootTicket, StringComparison.Ordinal);
+        }
+    }
+
+    public async Task<IDisposable> AcquireHlsMutationAsync(
+        string rootTicket,
+        CancellationToken cancellationToken)
+    {
+        if (!IsWellFormed(rootTicket)) throw new ArgumentException("The root ticket is invalid.", nameof(rootTicket));
+        SemaphoreSlim gate;
+        lock (sync)
+        {
+            if (!entries.TryGetValue(rootTicket, out var root) || root.Scope != TicketScope.Playback ||
+                clock.UtcNow >= root.ExpiresAtUtc)
+                throw new InvalidOperationException("The root ticket is unavailable.");
+            if (!hlsMutationGates.TryGetValue(rootTicket, out gate!))
+            {
+                gate = new SemaphoreSlim(1, 1);
+                hlsMutationGates.Add(rootTicket, gate);
+            }
+        }
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        lock (sync)
+        {
+            if (entries.TryGetValue(rootTicket, out var root) && root.Scope == TicketScope.Playback &&
+                clock.UtcNow < root.ExpiresAtUtc)
+                return new HlsMutationLease(gate);
+        }
+        gate.Release();
+        throw new InvalidOperationException("The root ticket is unavailable.");
+    }
+
     public void Revoke(string ticket)
     {
         if (string.IsNullOrEmpty(ticket)) return;
@@ -193,6 +249,7 @@ public sealed class TicketStore
             entries.Clear();
             hlsTicketsByParent.Clear();
             hlsTicketIndexes.Clear();
+            hlsMutationGates.Clear();
             playbackCount = 0;
             hlsCount = 0;
         }
@@ -241,6 +298,7 @@ public sealed class TicketStore
         if (payload.Scope == TicketScope.Playback)
         {
             playbackCount--;
+            hlsMutationGates.Remove(ticket);
             if (hlsTicketsByParent.TryGetValue(ticket, out var children))
             {
                 foreach (var childTicket in children.Values.ToArray()) RemoveUnsafe(childTicket);
@@ -275,10 +333,11 @@ public sealed class TicketStore
         return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
     }
 
-    private static string HashHlsResource(Uri resource)
+    private static string HashHlsResource(Uri resource, int depth)
     {
         using var hash = SHA256.Create();
-        return Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(resource.AbsoluteUri)));
+        return Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(
+            depth.ToString(CultureInfo.InvariantCulture) + "\n" + resource.AbsoluteUri)));
     }
 
     private byte[] HashUserId(string? value)
@@ -327,6 +386,15 @@ public sealed class TicketStore
         public string ParentTicket { get; }
 
         public string ResourceKey { get; }
+    }
+
+    private sealed class HlsMutationLease : IDisposable
+    {
+        private SemaphoreSlim? gate;
+
+        public HlsMutationLease(SemaphoreSlim gate) => this.gate = gate;
+
+        public void Dispose() => Interlocked.Exchange(ref gate, null)?.Release();
     }
 }
 

@@ -1,4 +1,5 @@
 using Emby.StrmBridge.Configuration;
+using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Playback;
 using Emby.StrmBridge.Runtime;
 using System.Globalization;
@@ -8,6 +9,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Logging;
 using MediaBrowser.Model.MediaInfo;
+using MediaBrowser.Model.Services;
 
 namespace Emby.StrmBridge.Tests;
 
@@ -47,6 +49,10 @@ public sealed class PlaybackInfoProcessorTests
         Assert.IsTrue(response.MediaSources[0].DirectStreamUrl.EndsWith("/stream.mkv", StringComparison.Ordinal));
         Assert.IsFalse(response.MediaSources[0].AddApiKeyToDirectStreamUrl);
         Assert.AreEqual(1, fixture.Runtime.Tickets.Count);
+        var ticket = response.MediaSources[0].DirectStreamUrl
+            .Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)[^2];
+        Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(ticket, out var payload));
+        Assert.AreEqual(PlaybackTicketPurpose.DirectClient, payload!.Purpose);
     }
 
     [TestMethod]
@@ -99,10 +105,12 @@ public sealed class PlaybackInfoProcessorTests
         StringAssert.StartsWith(response.MediaSources[0].DirectStreamUrl, "/StrmBridge/Playback/v2/");
     }
 
-    private static Fixture CreateFixture(PlaybackRoutingMode mode)
+    private static Fixture CreateFixture(
+        PlaybackRoutingMode mode,
+        string sourceUrl = "https://source.invalid/media",
+        string container = "mkv")
     {
         var workspace = new TestWorkspace();
-        var sourceUrl = "https://source.invalid/media";
         var path = workspace.Write("playback.strm", sourceUrl);
         var library = new Folder { Id = Guid.NewGuid(), Name = "Library" };
         var item = new Movie
@@ -110,7 +118,7 @@ public sealed class PlaybackInfoProcessorTests
             Id = Guid.NewGuid(),
             InternalId = Random.Shared.NextInt64(1, long.MaxValue),
             Path = path,
-            Container = "mkv",
+            Container = container,
             Parent = library,
             MediaStreams = new List<MediaBrowser.Model.Entities.MediaStream>(),
         };

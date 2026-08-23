@@ -141,6 +141,7 @@ public sealed class PlaybackInfoProcessor
                             original.Id ?? string.Empty,
                             userId,
                             source,
+                            PlaybackTicketPurpose.DirectClient,
                             operation.Generation,
                             TicketStore.ComputePlaybackLifetime(original.RunTimeTicks ?? sourceItem.RunTimeTicks))))
                 {

@@ -2,6 +2,8 @@
 
 [中文](#中文) | [English](#english)
 
+远程 MPEG-TS/M2TS 非零起播的字节定位、命令变换和验收约束由 [STRM 远程传输流快速定位设计](FAST_SEEK_DESIGN.md) 定义。
+
 ## 中文
 
 ### 1. 目标
@@ -15,7 +17,7 @@ STRM Bridge 是一个面向本地 `.strm` 文件的 Emby Server 插件，每个�
 
 ### 2. 支持的宿主
 
-插件面向 `netstandard2.1` 和 Emby Server 4.9.5.x。运行时 ABI 校验确认两个 PlaybackInfo 服务方法、渐进式请求执行方法、FFmpeg 启动方法及其请求和响应结构后，播放路由才会启用。播放 ABI 校验失败时，媒体信息提取和维护功能仍可独立使用。
+插件面向 `netstandard2.1` 和 Emby Server 4.9.5.x。运行时 ABI 校验确认两个 PlaybackInfo 服务方法、渐进式请求执行方法、转码状态创建方法、最终 FFmpeg 命令启动方法及其请求和响应结构后，播放路由才会启用。播放 ABI 校验失败时，媒体信息提取和维护功能仍可独立使用。
 
 Harmony 以经过身份校验的程序集资源嵌入 `Emby.StrmBridge.dll`，因此发布包只需安装一个插件 DLL。
 
@@ -58,7 +60,7 @@ Emby 首先生成原生 `PlaybackInfoResponse`，随后由经过版本校验的�
 2. 确认项目属于参与处理的媒体库；
 3. 读取当前 STRM 身份；
 4. 验证响应中的媒体源仍映射到同一静态来源；
-5. 签发一个 256 位、仅内存的播放票据；
+5. 签发一个带有客户端直放用途的 256 位、仅内存播放票据；
 6. 克隆媒体源，将 `DirectStreamUrl` 设为相对网关路由，并保留原生 `Path` 与 `ProbePath`；
 7. 仅在运行时代际仍有效时提交完整媒体源数组。
 
@@ -87,10 +89,14 @@ Emby 创建服务端转码状态后，`TranscodeInputProcessor` 在 `StartFfMpeg
 1. 从作业请求中解析项目与精确媒体源 ID，并要求该 ID 等于作业当前媒体源 ID；
 2. 确认请求项目和来源项目均属于参与处理的媒体库，来源项目为本地 `.strm` 文件；
 3. 重新读取当前 STRM，验证宿主静态媒体源与作业媒体源均对应同一来源；
-4. 签发单次作业使用的内存票据；
-5. 通过 Emby 的 `GetLocalApiUrl(IPAddress.Loopback)` 获取运行时本地 API Origin，并结合当前请求的 API 路径前缀生成绝对回环网关地址；
-6. 仅修改当前 `StreamState` 的媒体源副本、媒体路径和协议，使 FFmpeg 从网关读取；
-7. 任一生成或写入步骤失败时恢复原始作业状态并撤销票据。
+4. 对 `Adaptive` 模式中大于 10 秒的 TS/M2TS 作业，在 5 秒总时限内读取两个最大 512 KiB 的稀疏 Range 样本；估算预滚不在 0.25–6 秒窗口时增加一个校正样本并生成字节定位计划；
+5. 签发带有服务端 FFmpeg 用途的单次作业内存票据；
+6. 通过 Emby 的 `GetLocalApiUrl(IPAddress.Loopback)` 获取运行时本地 API Origin，并结合当前请求的 API 路径前缀生成绝对回环网关地址；
+7. 仅修改当前 `StreamState` 的媒体源副本、媒体路径和协议，使 FFmpeg 从网关读取；
+8. 将匹配的字节定位计划绑定到该作业的精确回环输入 URL；
+9. 任一生成或写入步骤失败时恢复原始作业状态并撤销票据。
+
+`FfmpegCommandProcessor` 在进程启动前只接受该精确回环 URL、HTTP 输入和 `segment` 输出组合。首次起播使用自适应两/三样本计划；HLS 分片请求改变起播时间时，每个新目标先读取一次有界 PCR 样本，结果超出安全预滚窗口时最多追加一次校正。同一来源、媒体源、目标和运行时代际的已验证计划可跨播放会话共享；命令仍严格绑定到各自的回环输入 URL。处理器接受 Emby 原生 `segment_time_delta=-ss` 时间线，或由 `copyts`、`start_at_zero`、禁用负时间戳改写、无其他时间偏移以及 `segment_start_number × segment_time ≈ ss` 共同证明的完整转码时间线。处理器原子设置校准后的字节偏移、禁止再次搜索，清空输入级绝对起播时间，用输出级短预滚相对时间顺序裁剪，将输出时间戳偏移恢复到原目标时间，并把首段时间容差增加半个实际分片时长且最多增加 3 秒。Emby 生成的分片起始编号与后续分片节奏保持不变。任一验证或修改失败时恢复全部原生命令字段。
 
 该入口不修改媒体库项目、STRM 文件、持久化媒体源或 PlaybackInfo 的原生路径。非 STRM、本地媒体文件、未参与媒体库、不匹配媒体源及 `Native` 模式继续使用 Emby 原生转码输入。
 
@@ -99,6 +105,7 @@ Emby 创建服务端转码状态后，`TranscodeInputProcessor` 在 `StartFfMpeg
 票据是由 256 位随机数支持的 Base64URL 承载能力，其仅内存载荷包含：
 
 - 票据作用域；
+- 客户端直放或服务端 FFmpeg 用途；
 - 媒体项目和媒体源身份；
 - 当前 STRM 来源身份；
 - 上游 URI；
@@ -107,7 +114,7 @@ Emby 创建服务端转码状态后，`TranscodeInputProcessor` 在 `StartFfMpeg
 - 签发、预览、活动和绝对过期时间；
 - HLS 嵌套深度。
 
-播放票据具有 10 分钟预览窗口。完成授权兑换后，其活动期按媒体时长加重连宽限期延长，绝对上限为 24 小时。HLS 子票据继承根播放票据的边界。同一播放票据下对相同绝对 HLS 资源的重复引用会复用同一个子票据；撤销根票据时会一并撤销其子票据。
+播放票据具有 10 分钟预览窗口。完成授权兑换后，其活动期按媒体时长加重连宽限期延长，绝对上限为 24 小时。HLS 子票据继承根播放票据的边界，并在每次访问和后代发行时精确校验其登记的根票据。同一播放票据、相同资源深度下对相同绝对 HLS 资源的重复引用会复用同一个子票据；不同深度使用独立子票据，使合法有向引用可继续处理，并让循环引用按深度递增后在第 8 层终止。同一根下的清单改写、票据发行和失败回滚按根串行提交，避免失败请求撤销并发成功响应已复用的票据。撤销根票据时会一并撤销其子票据。
 
 ### 7. 网关授权
 
@@ -149,10 +156,10 @@ Emby 创建服务端转码状态后，`TranscodeInputProcessor` 在 `StartFfMpeg
 | --- | --- |
 | `Native` | 保持原生 PlaybackInfo 和标准视频服务行为。 |
 | `RedirectOnly` | 网关以 HTTP 302 返回经过验证的有效地址。 |
-| `Adaptive` | 重写并中继 HLS；其他响应通过网关流式中继。 |
+| `Adaptive` | 普通客户端直放返回经过验证的 HTTP 302；服务端 FFmpeg 文件通过网关中继；HLS 重写并中继。 |
 | `RelayOnly` | 通过网关流式中继经过验证的响应。 |
 
-普通中继保留状态码、内容类型、有效内容长度、字节范围元数据、验证器和安全的内容处置字段。响应携带 `private, no-store`、`Pragma: no-cache`、`nosniff` 和 `no-referrer`。请求取消和读取空闲超时在整个响应体传输期间持续生效。
+客户端直放仍先通过票据、权限、媒体库、来源身份和逐跳重定向验证；网关随后只返回最终地址，媒体正文由客户端读取。普通中继保留状态码、内容类型、有效内容长度、字节范围元数据、验证器和安全的内容处置字段。响应携带 `private, no-store`、`Pragma: no-cache`、`nosniff` 和 `no-referrer`。请求取消和读取空闲超时在整个响应体传输期间持续生效。需要服务器 IP 或服务器侧上下文的来源使用 `RelayOnly`。
 
 ### 10. 重定向租约
 
@@ -163,7 +170,9 @@ Emby 创建服务端转码状态后，`TranscodeInputProcessor` 在 `StartFfMpeg
 - 标准化 User-Agent；
 - `Accept` 和 `Accept-Language`。
 
-Range 值不进入租约键，因此临近字节请求可共享同一个已验证目标。按键单飞门会合并同时发生的首次解析。缓存目标每次使用前都会重新通过策略校验，有效期为 30 秒；到期、超时、传输拒绝或返回 401、403、404、410 时会被清除。首次重定向链的最终目标返回上述状态时也会释放响应。两种情况均允许从 STRM 原始地址重试一次，并直接采用第二次结果。运行时失效使用代际校验，阻止较晚完成的在途解析重新写入已清空的租约。
+Range 值不进入租约键，因此临近字节请求可共享同一个已验证目标。每次 Range 复用都要求候选响应返回与请求起止范围、文件总长度和响应正文长度一致的单段 `206 Content-Range` 与 identity 编码。按来源或票据建立的单飞门会合并同时发生的首次解析。缓存目标每次使用前都会重新通过策略校验，有效期为 30 秒；到期、传输拒绝、范围不匹配或返回 401、403、404、410 时会被清除并在当前总超时预算内从 STRM 原始地址解析；耗尽总超时预算时当前请求返回超时，下一请求从原始地址解析。首次重定向链的最终目标返回上述状态时也会释放响应并从 STRM 原始地址重试一次。运行时失效使用代际校验，阻止较晚完成的在途解析重新写入已清空的租约。
+
+快速定位探测还会创建来源指纹范围内的 30 秒候选租约。候选键包含方法、`Accept` 和 `Accept-Language`，仅服务端 FFmpeg 正式媒体请求会使用自己的 User-Agent 复验候选；客户端直放不会读取该候选。候选响应必须返回与请求起止范围、文件总长度和正文长度一致的单段 `206 Content-Range` 与 identity 编码。状态、范围或编码不匹配时清除候选并从 STRM 原始地址解析。候选地址始终重新执行重定向策略校验。
 
 ### 11. HLS 中继
 
@@ -205,9 +214,10 @@ Range 值不进入租约键，因此临近字节请求可共享同一个已验�
 - 播放票据：4,096；
 - HLS 票据：20,000；
 - 重定向租约：4,096；
-- 中继并发：1–16；
+- 中继并发：1–16；大于 1 时快速定位探测至少为播放正文保留 1 个配置槽位；
 - 重定向跳数：1–8；
 - 网关超时：10–180 秒；
+- 快速定位：初始 2 个样本，估算预滚不在 0.25–6 秒窗口时增加第 3 个样本；每个新目标先使用 1 个校正样本，超出安全窗口时最多增加第 2 个样本；每个样本最大 512 KiB，每次准备时限 5 秒，两级内存索引各 512 条，每个绑定最多 16 个目标计划，绝对有效期 2 分钟；
 - 提取并发：1–2；
 - 提取超时：30–180 秒。
 
@@ -243,6 +253,7 @@ Emby.StrmBridge/
 - 在 Emby 4.9.5.x 上，GET 和 POST PlaybackInfo 保持媒体源身份并生成相对网关路由；
 - 在 Emby 4.9.5.x 上，标准静态视频 GET 和 HEAD 对精确 STRM 媒体源进入同一网关，其他请求保持原生执行；
 - 在 Emby 4.9.5.x 上，精确 STRM 转码作业在 FFmpeg 启动前使用运行时回环网关输入，其他作业保持原生输入；
+- 符合条件的远程 TS/M2TS 非零起播作业产生快速定位就绪和已应用事件；每个新 HLS 目标最多一次有界校正探测，相同目标不重复探测，每个 FFmpeg 媒体正文只使用一个连续 Range；
 - 直出响应、重定向文件、Range/HEAD、拖动、重连和 HLS 播放通过宿主矩阵；
 - 本地、远程、HTTPS 代理和 API 路径前缀访问均沿用客户端的 Emby Origin；
 - 发布产物不包含测试凭据、个人路径或针对特定播放器厂商的路由逻辑。
@@ -250,6 +261,8 @@ Emby.StrmBridge/
 ---
 
 ## English
+
+Byte calibration, command transformation, and acceptance rules for non-zero remote MPEG-TS/M2TS playback are defined by the [remote transport-stream fast seek design](FAST_SEEK_DESIGN.md).
 
 ### 1. Purpose
 
@@ -262,7 +275,7 @@ The plugin keeps media-library files read-only. Emby remains responsible for lib
 
 ### 2. Supported host
 
-The plugin targets `netstandard2.1` and Emby Server 4.9.5.x. Playback routing activates after a runtime ABI check confirms two PlaybackInfo service methods, the progressive request executor, the FFmpeg startup method, and their request and response shapes. Media-information extraction and maintenance remain independently available when the playback ABI check fails.
+The plugin targets `netstandard2.1` and Emby Server 4.9.5.x. Playback routing activates after a runtime ABI check confirms two PlaybackInfo service methods, the progressive request executor, transcode-state creation, final FFmpeg command startup, and their request and response shapes. Media-information extraction and maintenance remain independently available when the playback ABI check fails.
 
 Harmony is embedded as an identity-checked assembly resource in `Emby.StrmBridge.dll`. The release package therefore installs as one plugin DLL.
 
@@ -305,7 +318,7 @@ For every matching STRM media source, `PlaybackInfoProcessor`:
 2. confirms that the item belongs to a participating library;
 3. reads the current STRM identity;
 4. verifies that the response source still maps to the same static media source;
-5. issues a 256-bit, memory-only playback ticket;
+5. issues a 256-bit, memory-only ticket with direct-client purpose;
 6. clones the source, sets `DirectStreamUrl` to a relative gateway route, and preserves the native `Path` and `ProbePath`;
 7. commits the complete source array only while the runtime generation remains current.
 
@@ -334,10 +347,14 @@ After Emby creates server-side transcode state, `TranscodeInputProcessor` handle
 1. it resolves the item and exact media-source ID from the job request and requires that ID to equal the job's current media-source ID;
 2. it confirms that both the requested item and source owner belong to participating libraries and that the source owner is a local `.strm` file;
 3. it rereads the current STRM and verifies that both the host static source and job media source represent that same source;
-4. it issues a memory-only ticket for the job;
-5. it obtains the runtime local API Origin through Emby's `GetLocalApiUrl(IPAddress.Loopback)` and combines it with the active API path prefix to create an absolute loopback gateway URL;
-6. it changes only the current `StreamState` media-source clone, media paths, and protocols so FFmpeg reads from the gateway;
-7. any route-generation or state-write failure restores the original job state and revokes the ticket.
+4. for an `Adaptive` TS/M2TS job beyond ten seconds, it reads two sparse Range samples of at most 512 KiB within one five-second deadline, adds a third corrected sample when estimated pre-roll falls outside the preferred 0.25-to-6-second window, and prepares the byte plan;
+5. it issues a memory-only ticket with server-FFmpeg purpose for the job;
+6. it obtains the runtime local API Origin through Emby's `GetLocalApiUrl(IPAddress.Loopback)` and combines it with the active API path prefix to create an absolute loopback gateway URL;
+7. it changes only the current `StreamState` media-source clone, media paths, and protocols so FFmpeg reads from the gateway;
+8. it binds a matching byte plan to that job's exact loopback input URL;
+9. any route-generation or state-write failure restores the original job state and revokes the ticket.
+
+Immediately before process startup, `FfmpegCommandProcessor` accepts only that exact loopback URL with an HTTP input and `segment` output. It uses the adaptive initial plan; each previously unseen later HLS target receives one bounded PCR correction and at most one bounded retry when the result falls outside the safe pre-roll window. A validated plan is shared across playback sessions only when source fingerprint, media-source ID, target, timeline identity and runtime generation all match; each command remains bound to its own exact loopback input. It accepts Emby's native `segment_time_delta=-ss` timeline or a full-transcode timeline proven jointly by `copyts`, `start_at_zero`, disabled negative-timestamp rewriting, absent competing offsets, and `segment_start_number * segment_time ~= ss`. It atomically sets the calibrated byte offset, disables further seeking, clears the input-side absolute seek, applies the short relative pre-roll as an output-side sequential trim, restores the output timestamp offset to the original target, and advances the first-segment tolerance by half the actual segment duration with a three-second cap. Emby's segment start number and later cadence remain unchanged. Any failed validation or mutation restores every native command field.
 
 This entry point does not modify library items, STRM files, persisted media sources, or native PlaybackInfo paths. Non-STRM and local media, out-of-scope libraries, unmatched media sources, and `Native` mode retain Emby's native transcode input.
 
@@ -346,6 +363,7 @@ This entry point does not modify library items, STRM files, persisted media sour
 Tickets are Base64URL bearer capabilities backed by 256 random bits. Their memory-only payload includes:
 
 - ticket scope;
+- direct-client or server-FFmpeg purpose;
 - item and media-source identity;
 - current source identity;
 - upstream URI;
@@ -354,7 +372,7 @@ Tickets are Base64URL bearer capabilities backed by 256 random bits. Their memor
 - issue, preview, active and absolute-expiry timestamps;
 - HLS nesting depth.
 
-Playback tickets use a ten-minute preview window and extend during authorized redemption according to media runtime plus reconnect grace, capped at 24 hours. HLS child tickets inherit the root playback bounds. Repeated references to the same absolute HLS resource under one playback ticket reuse one child ticket. Revoking the root revokes its children.
+Playback tickets use a ten-minute preview window and extend during authorized redemption according to media runtime plus reconnect grace, capped at 24 hours. HLS child tickets inherit the root playback bounds, and every access and descendant issuance verifies their registered root exactly. Repeated references to the same absolute HLS resource at the same resource depth under one playback ticket reuse one child ticket. A different depth receives a distinct child, allowing valid directed references while making cycles advance to the depth-eight limit. Manifest rewriting, ticket issuance and failure rollback are committed serially per root so a failed request cannot revoke a shared child already returned by a concurrent successful response. Revoking the root revokes its children.
 
 ### 7. Gateway authorization
 
@@ -396,10 +414,10 @@ Mode behavior:
 | --- | --- |
 | `Native` | Native PlaybackInfo and standard-video behavior remain unchanged. |
 | `RedirectOnly` | The gateway returns the validated effective address as HTTP 302. |
-| `Adaptive` | HLS is rewritten and relayed; other responses are streamed through the gateway. |
+| `Adaptive` | Ordinary client direct play receives a validated HTTP 302; server FFmpeg files are relayed; HLS is rewritten and relayed. |
 | `RelayOnly` | Validated responses are streamed through the gateway. |
 
-Ordinary relay preserves status, content type, content length when valid, byte-range metadata, validators and safe content disposition. Responses carry `private, no-store`, `Pragma: no-cache`, `nosniff` and `no-referrer` headers. Request cancellation and an idle read timeout remain active for the full response body.
+Client direct play still passes ticket, permission, library, source-identity and per-hop redirect validation; the gateway then returns only the final address and the client reads the media body. Ordinary relay preserves status, content type, content length when valid, byte-range metadata, validators and safe content disposition. Responses carry `private, no-store`, `Pragma: no-cache`, `nosniff` and `no-referrer` headers. Request cancellation and an idle read timeout remain active for the full response body. Sources that require the server IP or server-side context use `RelayOnly`.
 
 ### 10. Redirect leases
 
@@ -410,7 +428,9 @@ A successful redirected file request creates a memory-only lease keyed by a dige
 - normalized User-Agent;
 - `Accept` and `Accept-Language`.
 
-Range values stay outside the key so nearby byte requests can share one validated target. A keyed single-flight gate merges simultaneous first resolutions. Each cached target is policy-validated again before use, expires after 30 seconds and is evicted on expiry, timeout, transport rejection, or status 401, 403, 404 or 410. The same statuses on the final target of a fresh redirect chain release that response. Both cases allow one resolution from the STRM source and return the second result directly. Runtime invalidation uses a generation check so late in-flight resolutions cannot repopulate cleared leases.
+Range values stay outside the key so nearby byte requests can share one validated target. Every Range reuse requires a single identity-encoded `206 Content-Range` whose requested start and end, total file length and response body length are consistent. A source- or ticket-keyed single-flight gate merges simultaneous first resolutions. Each cached target is policy-validated again before use, expires after 30 seconds and is evicted on expiry, transport rejection, range mismatch, or status 401, 403, 404 or 410, then resolves from the STRM source within the current total timeout budget. Exhausting that budget times out the current request and makes the next request resolve from the source. The same statuses on the final target of a fresh redirect chain release that response and permit one retry from the source. Runtime invalidation uses a generation check so late in-flight resolutions cannot repopulate cleared leases.
+
+Fast-seek probes also create a 30-second candidate lease scoped to the source fingerprint. The candidate key includes the method, `Accept`, and `Accept-Language`. Only server-FFmpeg media retrieval consumes the candidate and preserves its own User-Agent; direct-client delivery never reads it. Reuse requires a single identity-encoded `206 Content-Range` whose start, end, total length and body length match the request. A status, range, or encoding mismatch clears the candidate and resolves from the original STRM source. Redirect policy validation runs again before every candidate use.
 
 ### 11. HLS relay
 
@@ -452,9 +472,10 @@ Capacity limits:
 - playback tickets: 4,096;
 - HLS tickets: 20,000;
 - redirect leases: 4,096;
-- relay concurrency: 1–16;
+- relay concurrency: 1–16; above one, fast-seek probes leave at least one configured slot available for playback delivery;
 - redirect hops: 1–8;
 - gateway timeout: 10–180 seconds;
+- fast seek: 2 initial samples plus a third when estimated pre-roll falls outside 0.25–6 seconds; each new target uses 1 correction sample and at most a second when the result falls outside the safe window; samples are at most 512 KiB, each preparation has a 5-second deadline, each top-level memory index has 512 entries, each binding has up to 16 target plans, and plans have a 2-minute absolute lifetime;
 - extraction concurrency: 1–2;
 - extraction timeout: 30–180 seconds.
 
@@ -490,6 +511,7 @@ A release candidate satisfies all of these checks:
 - GET and POST PlaybackInfo preserve source identity and emit relative gateway routes on Emby 4.9.5.x;
 - standard static-video GET and HEAD route exact STRM media-source matches through the same gateway while other requests retain native execution on Emby 4.9.5.x;
 - exact STRM transcode jobs use Emby's runtime-derived loopback gateway input before FFmpeg starts, while other jobs retain native input;
+- an eligible non-zero remote TS/M2TS job reports fast-seek ready and applied events, reuses its bound calibration after HLS segment seeks, and uses one continuous Range per FFmpeg media body;
 - direct-body, redirected file, Range/HEAD, seek, reconnect and HLS playback pass the host matrix;
 - local, remote, HTTPS proxy and API path-prefix access reuse the client's Emby Origin;
 - release artifacts contain no fixture secrets, personal paths or vendor-specific player routing.

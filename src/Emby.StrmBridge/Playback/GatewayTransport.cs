@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -57,6 +58,13 @@ public sealed class GatewayTransport : IDisposable
     public Uri ValidateResource(Uri source, Uri target) =>
         redirectPolicy.Validate(source, target.AbsoluteUri);
 
+    internal static string CreateRedirectCandidateScope(SourceIdentity source)
+    {
+        if (source is null || source.SourceFingerprint.Length < 32)
+            throw new ArgumentException("The source identity is unavailable.", nameof(source));
+        return "source-" + source.SourceFingerprint.Substring(0, 32);
+    }
+
     public async Task<GatewayTransportLease> OpenAsync(
         Uri source,
         string method,
@@ -74,11 +82,74 @@ public sealed class GatewayTransport : IDisposable
         string? userAgent,
         IReadOnlyDictionary<string, string> requestHeaders,
         PluginConfiguration options,
+        CancellationToken cancellationToken) =>
+        await OpenAsync(
+                source,
+                redirectLeaseScope,
+                null,
+                method,
+                userAgent,
+                requestHeaders,
+                options,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<GatewayTransportLease> OpenAsync(
+        Uri source,
+        string? redirectLeaseScope,
+        string? redirectCandidateScope,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        PluginConfiguration options,
+        CancellationToken cancellationToken)
+        => await OpenCoreAsync(
+                source,
+                redirectLeaseScope,
+                redirectCandidateScope,
+                method,
+                userAgent,
+                requestHeaders,
+                options,
+                isProbe: false,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal async Task<GatewayTransportLease> OpenProbeAsync(
+        Uri source,
+        string? redirectLeaseScope,
+        string? redirectCandidateScope,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        PluginConfiguration options,
+        CancellationToken cancellationToken)
+        => await OpenCoreAsync(
+                source,
+                redirectLeaseScope,
+                redirectCandidateScope,
+                method,
+                userAgent,
+                requestHeaders,
+                options,
+                isProbe: true,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    private async Task<GatewayTransportLease> OpenCoreAsync(
+        Uri source,
+        string? redirectLeaseScope,
+        string? redirectCandidateScope,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        PluginConfiguration options,
+        bool isProbe,
         CancellationToken cancellationToken)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (options is null) throw new ArgumentNullException(nameof(options));
-        var leaseGeneration = Enter(options.RelayConcurrency);
+        var leaseGeneration = Enter(options.RelayConcurrency, isProbe);
         SemaphoreSlim? resolutionGate = null;
         var resolutionGateHeld = false;
         try
@@ -92,26 +163,85 @@ public sealed class GatewayTransport : IDisposable
                 normalizedMethod,
                 normalizedUserAgent,
                 requestHeaders);
+            var candidateKey = CreateRedirectCandidateKey(
+                redirectCandidateScope,
+                normalizedMethod,
+                requestHeaders);
+            var hasRequestedRange = TryGetSingleRange(
+                requestHeaders,
+                out var requestedRangeStart,
+                out var requestedRangeEnd);
+            Func<HttpResponseMessage, bool>? rangeResponseValidator = hasRequestedRange
+                ? response => IsRedirectRangeResponseCompatible(
+                    response,
+                    requestedRangeStart,
+                    requestedRangeEnd)
+                : null;
+            var resolutionGateKey = candidateKey.Length > 0 ? candidateKey : leaseKey;
+            GatewayTransportLease? cachedLease;
             try
             {
                 if (leaseKey.Length > 0)
                 {
-                    var cachedLease = await TryOpenRedirectLeaseAsync(
+                    cachedLease = await TryOpenRedirectLeaseAsync(
                             source, leaseKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
-                            requestHeaders, options, cancellationToken, timeout.Token)
+                            requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator)
                         .ConfigureAwait(false);
                     if (cachedLease is not null) return cachedLease;
+                }
 
-                    resolutionGate = GetRedirectLeaseGate(leaseKey);
+                if (candidateKey.Length > 0 && !string.Equals(candidateKey, leaseKey, StringComparison.Ordinal))
+                {
+                    var candidateLease = await TryOpenRedirectLeaseAsync(
+                            source, candidateKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
+                            requestHeaders, options, cancellationToken, timeout.Token,
+                            rangeResponseValidator)
+                        .ConfigureAwait(false);
+                    if (candidateLease is not null)
+                    {
+                        if (leaseKey.Length > 0)
+                            StoreRedirectLease(
+                                leaseKey,
+                                candidateLease.EffectiveUri,
+                                candidateLease.RedirectCount,
+                                leaseGeneration);
+                        return candidateLease;
+                    }
+                }
+
+                if (resolutionGateKey.Length > 0)
+                {
+                    resolutionGate = GetRedirectLeaseGate(resolutionGateKey);
                     if (resolutionGate is not null)
                     {
                         await resolutionGate.WaitAsync(timeout.Token).ConfigureAwait(false);
                         resolutionGateHeld = true;
-                        cachedLease = await TryOpenRedirectLeaseAsync(
-                                source, leaseKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
-                                requestHeaders, options, cancellationToken, timeout.Token)
-                            .ConfigureAwait(false);
-                        if (cachedLease is not null) return cachedLease;
+                        if (leaseKey.Length > 0)
+                        {
+                            cachedLease = await TryOpenRedirectLeaseAsync(
+                                    source, leaseKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
+                                    requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator)
+                                .ConfigureAwait(false);
+                            if (cachedLease is not null) return cachedLease;
+                        }
+                        if (candidateKey.Length > 0 &&
+                            !string.Equals(candidateKey, leaseKey, StringComparison.Ordinal))
+                        {
+                            var candidateLease = await TryOpenRedirectLeaseAsync(
+                                    source, candidateKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
+                                    requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator)
+                                .ConfigureAwait(false);
+                            if (candidateLease is not null)
+                            {
+                                if (leaseKey.Length > 0)
+                                    StoreRedirectLease(
+                                        leaseKey,
+                                        candidateLease.EffectiveUri,
+                                        candidateLease.RedirectCount,
+                                        leaseGeneration);
+                                return candidateLease;
+                            }
+                        }
                     }
                 }
 
@@ -145,6 +275,16 @@ public sealed class GatewayTransport : IDisposable
                         resolved.EffectiveUri,
                         resolved.RedirectCount,
                         leaseGeneration);
+                if (candidateKey.Length > 0 && resolved.RedirectCount > 0 &&
+                    IsRedirectRangeResponseCompatible(
+                        resolved.Response,
+                        requestedRangeStart,
+                        requestedRangeEnd))
+                    StoreRedirectLease(
+                        candidateKey,
+                        resolved.EffectiveUri,
+                        resolved.RedirectCount,
+                        leaseGeneration);
                 return new GatewayTransportLease(
                     resolved.Response,
                     resolved.EffectiveUri,
@@ -157,7 +297,7 @@ public sealed class GatewayTransport : IDisposable
             }
             finally
             {
-                if (resolutionGateHeld) ReleaseRedirectLeaseGate(leaseKey, resolutionGate!);
+                if (resolutionGateHeld) ReleaseRedirectLeaseGate(resolutionGateKey, resolutionGate!);
             }
         }
         catch
@@ -195,12 +335,13 @@ public sealed class GatewayTransport : IDisposable
         client.Dispose();
     }
 
-    private int Enter(int limit)
+    private int Enter(int limit, bool isProbe)
     {
         lock (sync)
         {
             if (disposed) throw new ObjectDisposedException(nameof(GatewayTransport));
-            if (activeRequests >= limit) throw new GatewayCapacityException();
+            var effectiveLimit = isProbe && limit > 1 ? limit - 1 : limit;
+            if (activeRequests >= effectiveLimit) throw new GatewayCapacityException();
             activeRequests++;
             return redirectLeaseGeneration;
         }
@@ -370,7 +511,8 @@ public sealed class GatewayTransport : IDisposable
         IReadOnlyDictionary<string, string> requestHeaders,
         PluginConfiguration options,
         CancellationToken requestCancellation,
-        CancellationToken timeoutCancellation)
+        CancellationToken timeoutCancellation,
+        Func<HttpResponseMessage, bool>? responseValidator = null)
     {
         if (!TryGetRedirectLease(leaseKey, out var cached)) return null;
         try
@@ -385,7 +527,8 @@ public sealed class GatewayTransport : IDisposable
                     options,
                     timeoutCancellation)
                 .ConfigureAwait(false);
-            if (!InvalidatesRedirectLease(cachedResponse.Response))
+            if (!InvalidatesRedirectLease(cachedResponse.Response) &&
+                (responseValidator is null || responseValidator(cachedResponse.Response)))
             {
                 var effectiveRedirectCount = Math.Max(cached.RedirectCount, cachedResponse.RedirectCount);
                 StoreRedirectLease(
@@ -426,6 +569,49 @@ public sealed class GatewayTransport : IDisposable
         return status is 401 or 403 or 404 or 410;
     }
 
+    private static bool IsRedirectRangeResponseCompatible(
+        HttpResponseMessage response,
+        long requestedRangeStart,
+        long? requestedRangeEnd)
+    {
+        if (response.StatusCode != System.Net.HttpStatusCode.PartialContent ||
+            requestedRangeStart < 0)
+            return false;
+        var actual = response.Content.Headers.ContentRange;
+        if (actual is null ||
+            !string.Equals(actual.Unit, "bytes", StringComparison.OrdinalIgnoreCase) ||
+            actual.From != requestedRangeStart || !actual.To.HasValue || actual.To < actual.From ||
+            !actual.Length.HasValue || actual.Length <= actual.To ||
+            response.Content.Headers.ContentEncoding.Any(value =>
+                !string.Equals(value, "identity", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        var expectedEnd = requestedRangeEnd.HasValue
+            ? Math.Min(requestedRangeEnd.Value, actual.Length.Value - 1)
+            : actual.Length.Value - 1;
+        var responseLength = actual.To.Value - actual.From.Value + 1;
+        return actual.To.Value == expectedEnd &&
+               response.Content.Headers.ContentLength == responseLength;
+    }
+
+    private static bool TryGetSingleRange(
+        IReadOnlyDictionary<string, string> headers,
+        out long rangeStart,
+        out long? rangeEnd)
+    {
+        rangeStart = -1;
+        rangeEnd = null;
+        var value = GetHeader(headers, "Range");
+        if (!RangeHeaderValue.TryParse(value, out var parsed) || parsed.Ranges.Count != 1)
+            return false;
+        var requested = parsed.Ranges.Single();
+        if (!requested.From.HasValue || requested.From.Value < 0 ||
+            requested.To.HasValue && requested.To.Value < requested.From.Value)
+            return false;
+        rangeStart = requested.From.Value;
+        rangeEnd = requested.To;
+        return true;
+    }
+
     private static string CreateRedirectLeaseKey(
         string? scope,
         string method,
@@ -442,6 +628,25 @@ public sealed class GatewayTransport : IDisposable
         using var hash = SHA256.Create();
         var input = Encoding.UTF8.GetBytes(
             scope + "\n" + method + "\n" + normalizedUserAgent + "\n" + accept + "\n" + language);
+        return Convert.ToBase64String(hash.ComputeHash(input));
+    }
+
+    private static string CreateRedirectCandidateKey(
+        string? scope,
+        string method,
+        IReadOnlyDictionary<string, string> headers)
+    {
+        if (string.IsNullOrWhiteSpace(scope) || scope.Length > 128 ||
+            scope.Any(character =>
+                !(character is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '-' or '_')))
+            return string.Empty;
+        if (!TryGetSingleRange(headers, out _, out _)) return string.Empty;
+        var accept = GetHeader(headers, "Accept");
+        var language = GetHeader(headers, "Accept-Language");
+        if (accept.Length > 4096 || language.Length > 4096) return string.Empty;
+        using var hash = SHA256.Create();
+        var input = Encoding.UTF8.GetBytes(
+            "candidate\n" + scope + "\n" + method + "\n" + accept + "\n" + language);
         return Convert.ToBase64String(hash.ComputeHash(input));
     }
 
@@ -526,25 +731,34 @@ public sealed class GatewayTransportLease : IDisposable
 
     public async Task<ReadOnlyMemory<byte>> PeekPrefixAsync(int maximumBytes, CancellationToken cancellationToken)
     {
-        if (maximumBytes < 1 || maximumBytes > 4096) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+        if (maximumBytes < 1 || maximumBytes > FastSeekCoordinator.MaximumProbeBytes)
+            throw new ArgumentOutOfRangeException(nameof(maximumBytes));
         var ownedResponse = response ?? throw new ObjectDisposedException(nameof(GatewayTransportLease));
         if (bufferedPrefix is not null) return bufferedPrefix;
-        preparedStream ??= await ownedResponse.Content.ReadAsStreamAsync().ConfigureAwait(false);
-        var buffer = new byte[maximumBytes];
-        var offset = 0;
-        while (offset < buffer.Length)
+        try
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
-                requestCancellation,
-                cancellationToken);
-            timeout.CancelAfter(idleTimeout);
-            var read = await preparedStream.ReadAsync(buffer, offset, buffer.Length - offset, timeout.Token)
-                .ConfigureAwait(false);
-            if (read == 0) break;
-            offset += read;
+            preparedStream ??= await ownedResponse.Content.ReadAsStreamAsync().ConfigureAwait(false);
+            var buffer = new byte[maximumBytes];
+            var offset = 0;
+            while (offset < buffer.Length)
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+                    requestCancellation,
+                    cancellationToken);
+                timeout.CancelAfter(idleTimeout);
+                var read = await preparedStream.ReadAsync(buffer, offset, buffer.Length - offset, timeout.Token)
+                    .ConfigureAwait(false);
+                if (read == 0) break;
+                offset += read;
+            }
+            bufferedPrefix = offset == buffer.Length ? buffer : buffer.Take(offset).ToArray();
+            return bufferedPrefix;
         }
-        bufferedPrefix = offset == buffer.Length ? buffer : buffer.Take(offset).ToArray();
-        return bufferedPrefix;
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     public async Task<Stream> OpenOwnedStreamAsync()

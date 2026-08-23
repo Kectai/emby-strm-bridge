@@ -9,6 +9,7 @@ using Emby.StrmBridge.Extraction;
 using Emby.StrmBridge.Persistence;
 using Emby.StrmBridge.Playback;
 using Emby.StrmBridge.Policy;
+using MediaBrowser.Model.Logging;
 
 namespace Emby.StrmBridge.Runtime;
 
@@ -40,6 +41,8 @@ public sealed class PluginRuntime : IDisposable
     public RedirectResolver? Redirects { get; private set; }
 
     public GatewayTransport? Gateway { get; private set; }
+
+    internal FastSeekCoordinator? FastSeek { get; private set; }
 
     public ExtractionCoordinator? Extraction { get; internal set; }
 
@@ -112,6 +115,7 @@ public sealed class PluginRuntime : IDisposable
             Tickets.Clear();
             Redirects?.Clear();
             Gateway?.Clear();
+            FastSeek?.Clear();
             if (!options.Enabled) ClearDetectedRedirectHosts();
         }
         previous.Cancel();
@@ -141,6 +145,22 @@ public sealed class PluginRuntime : IDisposable
                 redirectPolicy,
                 Clock);
             Gateway = new GatewayTransport(redirectPolicy, Clock);
+        }
+    }
+
+    internal void InitializeFastSeek(ILogger logger, IFastSeekProbeClient? probeClient = null)
+    {
+        if (logger is null) throw new ArgumentNullException(nameof(logger));
+        lock (sync)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(PluginRuntime));
+            if (FastSeek is not null) return;
+            var gateway = Gateway ?? throw new InvalidOperationException("The gateway is unavailable.");
+            FastSeek = new FastSeekCoordinator(
+                probeClient ?? new GatewayFastSeekProbeClient(gateway),
+                Clock,
+                logger,
+                () => Generation);
         }
     }
 
@@ -225,6 +245,7 @@ public sealed class PluginRuntime : IDisposable
             Tickets.Clear();
             Redirects?.Clear();
             Gateway?.Clear();
+            FastSeek?.Clear();
             ClearDetectedRedirectHosts();
         }
         previous.Cancel();
@@ -255,10 +276,12 @@ public sealed class PluginRuntime : IDisposable
         extraction?.CancelAndDrain();
         previous.Dispose();
         Tickets.Clear();
+        FastSeek?.Clear();
         Redirects?.Dispose();
         Gateway?.Dispose();
         ClearDetectedRedirectHosts();
         Gateway = null;
+        FastSeek = null;
         Extraction = null;
     }
 }

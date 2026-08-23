@@ -31,6 +31,7 @@ public sealed class MaintenanceService : IDisposable
             runtime.Tickets.RemoveExpired();
             runtime.Redirects?.RemoveExpired();
             runtime.Gateway?.RemoveExpiredRedirectLeases();
+            runtime.FastSeek?.RemoveExpired();
             runtime.MediaInfoStore?.RemoveTemporaryFiles();
         }
         catch (Exception)

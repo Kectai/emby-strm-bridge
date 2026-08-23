@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Net;
 using System.Resources;
 
 namespace Emby.StrmBridge.Localization;
@@ -18,13 +19,13 @@ public static class PluginStrings
 
     public static string PluginDescription => Get(nameof(PluginDescription));
     public static string EditorTitle => Get(nameof(EditorTitle));
-    public static string EditorDescription => Get(nameof(EditorDescription));
+    public static string EditorDescription => GetSelectableDescription(nameof(EditorDescription));
     public static string Enabled => Get(nameof(Enabled));
     public static string PlaybackMode => Get(nameof(PlaybackMode));
-    public static string PlaybackModeDescription => Get(nameof(PlaybackModeDescription));
+    public static string PlaybackModeDescription => GetSelectableDescription(nameof(PlaybackModeDescription));
     public static string ExtractAfterLibraryScan => Get(nameof(ExtractAfterLibraryScan));
     public static string OnlyMissingMediaInfo => Get(nameof(OnlyMissingMediaInfo));
-    public static string OnlyMissingMediaInfoDescription => Get(nameof(OnlyMissingMediaInfoDescription));
+    public static string OnlyMissingMediaInfoDescription => GetSelectableDescription(nameof(OnlyMissingMediaInfoDescription));
     public static string EnablePersistence => Get(nameof(EnablePersistence));
     public static string MaximumExtractionConcurrency => Get(nameof(MaximumExtractionConcurrency));
     public static string ExtractionTimeoutSeconds => Get(nameof(ExtractionTimeoutSeconds));
@@ -32,12 +33,12 @@ public static class PluginStrings
     public static string RedirectHopLimit => Get(nameof(RedirectHopLimit));
     public static string RelayConcurrency => Get(nameof(RelayConcurrency));
     public static string IncludedLibraryIds => Get(nameof(IncludedLibraryIds));
-    public static string IncludedLibraryIdsDescription => Get(nameof(IncludedLibraryIdsDescription));
+    public static string IncludedLibraryIdsDescription => GetSelectableDescription(nameof(IncludedLibraryIdsDescription));
     public static string DetectedRedirectHosts => Get(nameof(DetectedRedirectHosts));
-    public static string DetectedRedirectHostsDescription => Get(nameof(DetectedRedirectHostsDescription));
+    public static string DetectedRedirectHostsDescription => GetSelectableDescription(nameof(DetectedRedirectHostsDescription));
     public static string TrustedHostSuffix => Get(nameof(TrustedHostSuffix));
     public static string AllowedRedirectHosts => Get(nameof(AllowedRedirectHosts));
-    public static string AllowedRedirectHostsDescription => Get(nameof(AllowedRedirectHostsDescription));
+    public static string AllowedRedirectHostsDescription => GetSelectableDescription(nameof(AllowedRedirectHostsDescription));
     public static string AwaitingApprovalNotificationTitle => Get(nameof(AwaitingApprovalNotificationTitle));
     public static string AwaitingApprovalNotificationDescription => Get(nameof(AwaitingApprovalNotificationDescription));
     public static string RetryCompletedNotificationTitle => Get(nameof(RetryCompletedNotificationTitle));
@@ -61,11 +62,24 @@ public static class PluginStrings
 
     private static string Get(string key)
     {
-        var resources = SelectResources(CultureInfo.CurrentUICulture);
-        return resources.GetString(key, CultureInfo.InvariantCulture) ??
-               EnglishResources.GetString(key, CultureInfo.InvariantCulture) ??
-               throw new InvalidOperationException("A required plugin localization resource is missing.");
+        return Get(SelectResources(CultureInfo.CurrentUICulture), key);
     }
+
+    internal static string GetText(string key, CultureInfo culture) =>
+        Get(SelectResources(culture), key);
+
+    private static string Get(ResourceManager resources, string key) =>
+        resources.GetString(key, CultureInfo.InvariantCulture) ??
+        EnglishResources.GetString(key, CultureInfo.InvariantCulture) ??
+        throw new InvalidOperationException("A required plugin localization resource is missing.");
+
+    private static string GetSelectableDescription(string key) =>
+        WrapSelectableDescription(Get(key));
+
+    private static string WrapSelectableDescription(string text) =>
+        "<span style=\"-webkit-user-select:text;user-select:text\">" +
+        WebUtility.HtmlEncode(text) +
+        "</span>";
 
     private static ResourceManager SelectResources(CultureInfo culture)
     {
@@ -79,4 +93,5 @@ public static class PluginStrings
             return TraditionalChineseResources;
         return SimplifiedChineseResources;
     }
+
 }

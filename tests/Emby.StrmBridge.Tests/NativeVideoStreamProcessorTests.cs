@@ -1,4 +1,5 @@
 using Emby.StrmBridge.Configuration;
+using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Playback;
 using Emby.StrmBridge.Runtime;
 using MediaBrowser.Controller.Entities;
@@ -25,6 +26,8 @@ public sealed class NativeVideoStreamProcessorTests
             Assert.IsFalse(isHead);
             Assert.IsFalse(string.IsNullOrWhiteSpace(ticket));
             Assert.AreEqual("stream.mp4", fileName);
+            Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(ticket, out var payload));
+            Assert.AreEqual(PlaybackTicketPurpose.DirectClient, payload!.Purpose);
             return Task.FromResult(sentinel);
         };
 

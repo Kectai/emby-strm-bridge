@@ -29,7 +29,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-package
-          path: artifacts/Emby.StrmBridge-*.zip
+          path: |
+            artifacts/Emby.StrmBridge-*.zip
+            artifacts/RELEASE_NOTES.md
           if-no-files-found: error
 
   publish:
@@ -46,4 +48,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/Emby.StrmBridge-*.zip --verify-tag --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" artifacts/Emby.StrmBridge-*.zip --verify-tag --notes-file artifacts/RELEASE_NOTES.md

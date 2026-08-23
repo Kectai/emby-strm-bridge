@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using HarmonyLib;
 using MediaBrowser.Model.Logging;
@@ -16,16 +17,19 @@ public enum PlaybackPatchStatus
 
 public sealed class HarmonyPatchHost : IDisposable
 {
-    private const string PatchId = "Emby.StrmBridge.Playback.v3";
+    private const string PatchId = "Emby.StrmBridge.Playback.v4";
     private const string PlaybackInfoServiceTypeName = "Emby.Server.MediaEncoding.Api.MediaInfoService";
     private const string VideoServiceTypeName = "Emby.Server.MediaEncoding.Api.Progressive.VideoService";
     private const string ProgressiveServiceTypeName =
         "Emby.Server.MediaEncoding.Api.Progressive.BaseProgressiveStreamingService";
     private const string BaseStreamingServiceTypeName =
         "Emby.Server.MediaEncoding.Api.BaseStreamingService";
+    private const string FfmpegRunnerTypeName =
+        "Emby.Server.MediaEncoding.Unified.Ffmpeg.FfmpegRunner";
     private readonly PlaybackInfoProcessor processor;
     private readonly NativeVideoStreamProcessor nativeStreamProcessor;
     private readonly TranscodeInputProcessor transcodeInputProcessor;
+    private readonly FfmpegCommandProcessor ffmpegCommandProcessor;
     private readonly ILogger logger;
     private Harmony? harmony;
     private bool disposed;
@@ -34,6 +38,7 @@ public sealed class HarmonyPatchHost : IDisposable
         PlaybackInfoProcessor processor,
         NativeVideoStreamProcessor nativeStreamProcessor,
         TranscodeInputProcessor transcodeInputProcessor,
+        FfmpegCommandProcessor ffmpegCommandProcessor,
         ILogManager logManager)
     {
         this.processor = processor ?? throw new ArgumentNullException(nameof(processor));
@@ -41,6 +46,8 @@ public sealed class HarmonyPatchHost : IDisposable
             throw new ArgumentNullException(nameof(nativeStreamProcessor));
         this.transcodeInputProcessor = transcodeInputProcessor ??
             throw new ArgumentNullException(nameof(transcodeInputProcessor));
+        this.ffmpegCommandProcessor = ffmpegCommandProcessor ??
+            throw new ArgumentNullException(nameof(ffmpegCommandProcessor));
         logger = (logManager ?? throw new ArgumentNullException(nameof(logManager)))
             .GetLogger(Plugin.Instance?.Name ?? "STRM Bridge");
     }
@@ -59,12 +66,14 @@ public sealed class HarmonyPatchHost : IDisposable
             var videoServiceType = ResolveServiceType(VideoServiceTypeName);
             var progressiveServiceType = ResolveServiceType(ProgressiveServiceTypeName);
             var baseStreamingServiceType = ResolveServiceType(BaseStreamingServiceTypeName);
+            var ffmpegRunnerType = ResolveServiceType(FfmpegRunnerTypeName);
             var version = playbackInfoServiceType.Assembly.GetName().Version ?? new Version(0, 0);
             HostAbi = version.ToString();
             if (version.Major != 4 || version.Minor != 9 || version.Build != 5 ||
                 videoServiceType.Assembly.GetName().Version != version ||
                 progressiveServiceType.Assembly.GetName().Version != version ||
-                baseStreamingServiceType.Assembly.GetName().Version != version)
+                baseStreamingServiceType.Assembly.GetName().Version != version ||
+                ffmpegRunnerType.Assembly.GetName().Version != version)
             {
                 logger.Warn("STRM_BRIDGE_PATCH_ABI_UNSUPPORTED abi=" + HostAbi);
                 Status = PlaybackPatchStatus.NativeOnly;
@@ -89,9 +98,16 @@ public sealed class HarmonyPatchHost : IDisposable
                 typeof(string).FullName!,
                 "System.Threading.CancellationToken",
                 typeof(bool).FullName!);
+            var ffmpegCommandTarget = FindTaskTarget(
+                ffmpegRunnerType,
+                "Start",
+                typeof(bool).FullName!,
+                "Emby.Ffmpeg.Model.FfmpegCommand",
+                "System.Threading.CancellationToken");
             PlaybackPatchBridge.Attach(processor);
             NativeStreamPatchBridge.Attach(nativeStreamProcessor);
             TranscodeInputPatchBridge.Attach(transcodeInputProcessor);
+            FfmpegCommandPatchBridge.Attach(ffmpegCommandProcessor);
             harmony = new Harmony(PatchId);
             var postfix = new HarmonyMethod(typeof(PlaybackPatchBridge).GetMethod(
                 nameof(PlaybackPatchBridge.Postfix), BindingFlags.Static | BindingFlags.Public));
@@ -99,10 +115,17 @@ public sealed class HarmonyPatchHost : IDisposable
                 nameof(NativeStreamPatchBridge.Prefix), BindingFlags.Static | BindingFlags.Public));
             var transcodeInputPrefix = new HarmonyMethod(typeof(TranscodeInputPatchBridge).GetMethod(
                 nameof(TranscodeInputPatchBridge.Prefix), BindingFlags.Static | BindingFlags.Public));
+            var ffmpegCommandPrefix = new HarmonyMethod(typeof(FfmpegCommandPatchBridge).GetMethod(
+                nameof(FfmpegCommandPatchBridge.Prefix), BindingFlags.Static | BindingFlags.Public));
             foreach (var target in playbackInfoTargets) harmony.Patch(target, postfix: postfix);
             harmony.Patch(nativeStreamTarget, prefix: prefix);
             harmony.Patch(transcodeInputTarget, prefix: transcodeInputPrefix);
-            var targets = playbackInfoTargets.Append(nativeStreamTarget).Append(transcodeInputTarget).ToArray();
+            harmony.Patch(ffmpegCommandTarget, prefix: ffmpegCommandPrefix);
+            var targets = playbackInfoTargets
+                .Append(nativeStreamTarget)
+                .Append(transcodeInputTarget)
+                .Append(ffmpegCommandTarget)
+                .ToArray();
             if (targets.Any(target => Harmony.GetPatchInfo(target)?.Owners.Contains(PatchId) != true))
                 throw new InvalidOperationException("Playback patch ownership validation failed.");
             Status = PlaybackPatchStatus.Ready;
@@ -115,6 +138,7 @@ public sealed class HarmonyPatchHost : IDisposable
             PlaybackPatchBridge.Detach(processor);
             NativeStreamPatchBridge.Detach(nativeStreamProcessor);
             TranscodeInputPatchBridge.Detach(transcodeInputProcessor);
+            FfmpegCommandPatchBridge.Detach(ffmpegCommandProcessor);
             Status = PlaybackPatchStatus.Failed;
             logger.Warn("STRM_BRIDGE_PATCH_FAILED error=" + exception.GetType().Name);
         }
@@ -130,6 +154,7 @@ public sealed class HarmonyPatchHost : IDisposable
         PlaybackPatchBridge.Detach(processor);
         NativeStreamPatchBridge.Detach(nativeStreamProcessor);
         TranscodeInputPatchBridge.Detach(transcodeInputProcessor);
+        FfmpegCommandPatchBridge.Detach(ffmpegCommandProcessor);
         Status = PlaybackPatchStatus.NativeOnly;
     }
 
@@ -174,6 +199,32 @@ public sealed class HarmonyPatchHost : IDisposable
         return target ?? throw new MissingMethodException(
             serviceType.FullName,
             name + "(" + string.Join(",", parameterTypeNames) + ")");
+    }
+}
+
+public static class FfmpegCommandPatchBridge
+{
+    private static readonly object Sync = new();
+    private static FfmpegCommandProcessor? processor;
+
+    internal static void Attach(FfmpegCommandProcessor value)
+    {
+        lock (Sync) processor = value;
+    }
+
+    internal static void Detach(FfmpegCommandProcessor value)
+    {
+        lock (Sync)
+        {
+            if (ReferenceEquals(processor, value)) processor = null;
+        }
+    }
+
+    public static void Prefix(object __0, CancellationToken __1)
+    {
+        FfmpegCommandProcessor? current;
+        lock (Sync) current = processor;
+        current?.TryApply(__0, __1);
     }
 }
 
