@@ -30,6 +30,67 @@ public sealed class TicketStoreTests
     }
 
     [TestMethod]
+    public void DirectRouteScope_IsStableAcrossTicketsAndSeparatedByUserAndDevice()
+    {
+        var store = new TicketStore(new ManualClock(), 6, 2);
+        var itemId = Guid.NewGuid();
+        var source = TestSources.Create();
+        var firstTicket = store.IssuePlayback(
+            itemId, "source-id", "first-user", source,
+            PlaybackTicketPurpose.DirectClient, runtimeGeneration: 1,
+            deviceId: "device-a");
+        var reconnectTicket = store.IssuePlayback(
+            itemId, "source-id", "first-user", source,
+            PlaybackTicketPurpose.DirectClient, runtimeGeneration: 1,
+            deviceId: "device-a");
+        var anotherUserTicket = store.IssuePlayback(
+            itemId, "source-id", "second-user", source,
+            PlaybackTicketPurpose.DirectClient, runtimeGeneration: 1,
+            deviceId: "device-a");
+        var anotherDeviceTicket = store.IssuePlayback(
+            itemId, "source-id", "first-user", source,
+            PlaybackTicketPurpose.DirectClient, runtimeGeneration: 1,
+            deviceId: "device-b");
+        var unboundTicket = store.IssuePlayback(
+            itemId, "source-id", "first-user", source,
+            PlaybackTicketPurpose.DirectClient, runtimeGeneration: 1);
+        var anotherUnboundTicket = store.IssuePlayback(
+            itemId, "source-id", "first-user", source,
+            PlaybackTicketPurpose.DirectClient, runtimeGeneration: 1);
+        Assert.IsTrue(store.TryInspect(firstTicket, out var first));
+        Assert.IsTrue(store.TryInspect(reconnectTicket, out var reconnect));
+        Assert.IsTrue(store.TryInspect(anotherUserTicket, out var anotherUser));
+        Assert.IsTrue(store.TryInspect(anotherDeviceTicket, out var anotherDevice));
+        Assert.IsTrue(store.TryInspect(unboundTicket, out var unbound));
+        Assert.IsTrue(store.TryInspect(anotherUnboundTicket, out var anotherUnbound));
+
+        var firstScope = GatewayTransport.CreateDirectRouteScope(first!, firstTicket);
+        Assert.AreEqual(firstScope, GatewayTransport.CreateDirectRouteScope(reconnect!, reconnectTicket));
+        Assert.AreNotEqual(
+            firstScope,
+            GatewayTransport.CreateDirectRouteScope(anotherUser!, anotherUserTicket));
+        Assert.AreNotEqual(
+            firstScope,
+            GatewayTransport.CreateDirectRouteScope(anotherDevice!, anotherDeviceTicket));
+        Assert.AreNotEqual(
+            GatewayTransport.CreateDirectRouteScope(unbound!, unboundTicket),
+            GatewayTransport.CreateDirectRouteScope(anotherUnbound!, anotherUnboundTicket));
+        Assert.AreEqual(32, first!.DeviceBindingHash.Length);
+        Assert.IsTrue(firstScope.All(character =>
+            char.IsAsciiLetterOrDigit(character) || character is '-' or '_'));
+
+        var firstResourceTicket = store.IssueHlsResource(
+            firstTicket, firstTicket, first!, new Uri("https://source.invalid/segment-one.ts"), out _);
+        var secondResourceTicket = store.IssueHlsResource(
+            firstTicket, firstTicket, first!, new Uri("https://source.invalid/segment-two.ts"), out _);
+        Assert.IsTrue(store.TryInspect(firstResourceTicket, out var firstResource));
+        Assert.IsTrue(store.TryInspect(secondResourceTicket, out var secondResource));
+        Assert.AreNotEqual(
+            GatewayTransport.CreateDirectRouteScope(firstResource!, firstResourceTicket),
+            GatewayTransport.CreateDirectRouteScope(secondResource!, secondResourceTicket));
+    }
+
+    [TestMethod]
     public void PreviewAndPlaybackLifetimes_AreBounded()
     {
         var clock = new ManualClock();

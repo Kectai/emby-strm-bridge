@@ -33,6 +33,8 @@ Coverage includes:
 - multi-hop relative redirects
 - client User-Agent and Range forwarding
 - redirect-lease reuse across Range requests, expiry, clearing and invalid-target fallback
+- user/device direct-play isolation with per-ticket fallback, generation-safe first-resolution serialization, two-step Range confirmation, 4,096-entry bounds, fast handoff expiry and Adaptive relay fallback
+- final-response lease eligibility, transient-error fallback and request-specific 416 handling
 - one bounded source re-resolution for a rejected fresh redirect target, with no retry for direct sources
 - Adaptive client redirect, server-FFmpeg/HLS relay, RelayOnly transport and relay concurrency
 - HLS signature detection, replayable prefix handling, line and URI-attribute rewriting
@@ -69,8 +71,8 @@ Packaging verifies:
 5. Confirm an external player launched through Emby reaches the same gateway URL.
 6. Exercise a direct-body source with `200` and `206`.
 7. Exercise one-hop and multi-hop redirects.
-8. Confirm `Adaptive` returns a validated 302 for an ordinary client-direct file, relays a server-FFmpeg file, and rewrites and relays HLS. Confirm `RelayOnly` retains server relay for a source that cannot be consumed from the client network context.
-9. Exercise `HEAD`, initial playback, repeated seek, reconnect and resume.
+8. Confirm `Adaptive` returns a validated 302 for an ordinary client-direct file, relays a server-FFmpeg file, and rewrites and relays HLS. Confirm a rejected redirect reuse selects a short-lived relay decision for that direct-play context. Confirm `RelayOnly` retains server relay for a source that cannot be consumed from the client network context.
+9. Exercise `HEAD`, initial playback, repeated seek, reconnect and resume. For one M2TS direct-play context, confirm the first redirect resolves from the STRM source, the next Range validates reuse, later Range requests report `STRM_BRIDGE_GATEWAY_DIRECT_ROUTE_HIT` without a matching plugin-side CDN pre-read until the 30-second decision expires, and concurrent first requests do not produce gateway-capacity errors.
 10. Exercise HLS master playlist, media playlist, audio, subtitle, key, map and segment resources.
 11. Repeat through HTTPS and an Emby API path prefix.
 12. Request `/Videos/{id}/stream` with the exact media-source ID and `Static=true`; confirm the matching STRM reaches the gateway.

@@ -74,6 +74,7 @@ public sealed class PluginEntryPoint : IServerEntryPoint, IDisposable
                 runtime,
                 libraryManager,
                 mediaSourceManager,
+                authorizationContext,
                 logManager);
             var nativeStreamProcessor = new NativeVideoStreamProcessor(
                 runtime,

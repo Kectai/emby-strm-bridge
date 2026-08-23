@@ -54,14 +54,30 @@ public static class SourceBehaviorClassifier
 
 public static class TransportPlanner
 {
+    public static bool CanHandoffRedirect(int statusCode) => statusCode is 200 or 206;
+
+    public static bool RequiresAdaptiveRelay(int statusCode, bool retriedRejectedRedirect)
+    {
+        if (retriedRejectedRedirect) return true;
+        return statusCode is 401 or 403 or 404 or 410 or 429 || statusCode >= 500;
+    }
+
+    public static bool ShouldUseAdaptiveRelay(
+        bool rememberedRelay,
+        int statusCode,
+        bool retriedRejectedRedirect) =>
+        rememberedRelay || RequiresAdaptiveRelay(statusCode, retriedRejectedRedirect);
+
     public static GatewayTransportPlan Create(
         PlaybackRoutingMode mode,
         SourceTransportBehavior behavior,
-        PlaybackTicketPurpose purpose)
+        PlaybackTicketPurpose purpose,
+        bool unstableRedirect = false)
     {
         if (mode == PlaybackRoutingMode.RedirectOnly) return GatewayTransportPlan.Redirect;
         if (behavior == SourceTransportBehavior.HlsManifest) return GatewayTransportPlan.RelayHls;
-        if (mode == PlaybackRoutingMode.Adaptive && purpose == PlaybackTicketPurpose.DirectClient)
+        if (mode == PlaybackRoutingMode.Adaptive && purpose == PlaybackTicketPurpose.DirectClient &&
+            !unstableRedirect)
             return GatewayTransportPlan.Redirect;
         return GatewayTransportPlan.RelayFile;
     }

@@ -31,7 +31,7 @@ The standard-route adapter activates only for `Static=true` requests whose exact
 
 ## Upstream behavior
 
-Adaptive mode returns a validated final redirect for ordinary client direct play and relays server-side FFmpeg inputs and HLS. RelayOnly retains full server relay for sources whose final address cannot be consumed by a client. RedirectOnly exposes the validated final URL for every eligible request.
+Adaptive mode returns a validated final redirect for ordinary client direct play, reuses it only after an actual request confirms status and Range behavior, and temporarily selects relay for a direct-play context whose redirect is rejected. Server-side FFmpeg inputs and HLS remain relayed. RelayOnly retains full server relay for sources whose final address cannot be consumed by a client. RedirectOnly exposes a usable validated final URL for every eligible request.
 
 Adaptive routing uses ticket purpose and observed HLS behavior rather than client, vendor, host or filename rules. Release validation uses the live 4.9.5.x matrix in [TESTING.md](TESTING.md).
 

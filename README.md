@@ -29,14 +29,14 @@ Emby 先生成原生 PlaybackInfo 响应。对于 Emby Server 4.9.5.x，插件�
 
 播放模式：
 
-- `Adaptive`：普通客户端直放在验证重定向链后以 HTTP 302 访问最终来源；服务端 FFmpeg 文件和 HLS 通过 Emby 中继。
+- `Adaptive`：普通客户端文件直放使用经过验证的 HTTP 302；不稳定来源在当前直放上下文中短期自动改用中继；服务端 FFmpeg 文件和 HLS 通过 Emby 中继。
 - `RedirectOnly`：解析已获信任的重定向链，以 HTTP 302 返回最终地址。
 - `RelayOnly`：通过 Emby 中继所选来源。
 - `Native`：保持 Emby PlaybackInfo、标准静态视频和 FFmpeg 输入行为不变。
 
-默认模式为 `Adaptive`。客户端直放仍先访问一次票据路由以完成授权和重定向验证，媒体正文随后由客户端从最终来源读取；服务端处理保留实际请求的 User-Agent 和 Range 上下文。
+默认模式为 `Adaptive`。客户端直放仍先访问票据路由完成授权和重定向验证。重定向地址完成一次实际 Range 复验后，同一用户和设备上下文中的后续 Range 会在 30 秒内直接取得地址，不再由插件逐次预读 CDN；媒体正文由客户端从最终来源读取。地址复验出现拒绝时，该上下文短期使用 Emby 中继。无法取得 Emby 设备标识时，优化自动收窄到单张播放票据。服务端处理保留实际请求的 User-Agent 和 Range 上下文。
 
-文件中继会为每个播放票据和标准化请求上下文保存一个有界、仅内存、有效期 30 秒的重定向租约。每次 Range 复用都要求返回范围和长度一致的 `206 Content-Range`。快速定位探测还会按来源保存一个短期候选地址；仅服务端 FFmpeg 正式媒体请求会使用自己的 User-Agent 和 Range 复验该候选，客户端直放不会读取该候选。范围不匹配时立即从 STRM 原始地址解析。首次重定向链或租约目标返回 401、403、404、410 时，会释放该响应并从 STRM 原始地址重新解析一次；第二次结果直接返回。
+传输层会为标准化请求上下文保存有界、仅内存、有效期 30 秒的重定向租约。每次 Range 复用都要求返回范围和长度一致的 `206 Content-Range`。客户端直放另以项目、媒体源、来源指纹、授权绑定、方法和请求上下文建立隔离的短期决策；不同用户或客户端不会共享。快速定位探测还会按来源保存一个短期候选地址，仅服务端 FFmpeg 正式媒体请求使用自己的 User-Agent 和 Range 复验该候选。范围不匹配时立即从 STRM 原始地址解析。首次重定向链或租约目标返回 401、403、404、410 时，会释放该响应并从 STRM 原始地址重新解析一次。
 
 ### 媒体信息
 
@@ -123,14 +123,14 @@ The standard static-video adapter accepts only GET/HEAD requests with `Static=tr
 
 Playback modes:
 
-- `Adaptive`: redirects ordinary client direct play to the validated final source, while relaying server-side FFmpeg files and HLS through Emby.
+- `Adaptive`: uses a validated HTTP 302 for ordinary client files, temporarily relays an unstable source for the matching direct-play context, and relays server-side FFmpeg files and HLS through Emby.
 - `RedirectOnly`: resolves an approved redirect chain and returns the final URL as HTTP 302.
 - `RelayOnly`: streams selected sources through Emby.
 - `Native`: keeps Emby's PlaybackInfo, standard static-video, and FFmpeg input behavior unchanged.
 
-`Adaptive` is the default. Client direct play first visits the ticket route for authorization and redirect validation, then reads the media body from the final source; server-side processing retains the actual User-Agent and Range context.
+`Adaptive` is the default. Client direct play first visits the ticket route for authorization and redirect validation. After one actual Range reuse confirms a redirected address, later Range requests in the same user and device context receive that address directly for 30 seconds without a plugin-side CDN pre-read. The client reads the media body from the final source. A rejected reuse temporarily selects Emby relay for that context. When Emby provides no device identifier, the optimization narrows automatically to one playback ticket. Server-side processing retains the actual User-Agent and Range context.
 
-File relay keeps a bounded 30-second, memory-only redirect lease for each playback ticket and normalized request context. After the first Range request resolves the approved chain, nearby Range requests start at the validated effective address only when the returned `206 Content-Range` and length match the request. Fast-seek probes also keep a short source-scoped candidate; only the server-FFmpeg media request revalidates it with that request's own User-Agent and Range, while direct-client requests never consume it. A fresh redirect chain or leased target ending in 401, 403, 404, or 410 releases that response and resolves once from the STRM source; the second result is returned directly.
+The transport keeps a bounded 30-second, memory-only redirect lease for each normalized request context. Range reuse requires a matching `206 Content-Range` and length. Direct play also derives an isolated short-lived decision from the item, media source, source fingerprint, authorization binding, method and request context; users and clients do not share it. Fast-seek probes keep a separate short source-scoped candidate that only the server-FFmpeg media request revalidates with its own User-Agent and Range. A fresh redirect chain or leased target ending in 401, 403, 404, or 410 releases that response and resolves once from the STRM source.
 
 ### Media information
 

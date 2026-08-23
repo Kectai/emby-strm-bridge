@@ -26,6 +26,7 @@ internal sealed class NativeVideoStreamProcessor
     private readonly IMediaSourceManager mediaSourceManager;
     private readonly ILogger logger;
     private readonly Func<IRequest, string?> resolveUserId;
+    private readonly Func<IRequest, string?> resolveDeviceId;
     private readonly Func<IRequest, string, string, bool, Task<object>> invokeGateway;
 
     public NativeVideoStreamProcessor(
@@ -42,6 +43,7 @@ internal sealed class NativeVideoStreamProcessor
             (logManager ?? throw new ArgumentNullException(nameof(logManager)))
                 .GetLogger(Plugin.Instance?.Name ?? "STRM Bridge"),
             request => ResolveUserId(authorizationContext, request),
+            request => ResolveDeviceId(authorizationContext, request),
             (request, ticket, fileName, isHead) => InvokeGateway(
                 libraryManager,
                 authorizationContext,
@@ -60,6 +62,7 @@ internal sealed class NativeVideoStreamProcessor
         IMediaSourceManager mediaSourceManager,
         ILogger logger,
         Func<IRequest, string?> resolveUserId,
+        Func<IRequest, string?> resolveDeviceId,
         Func<IRequest, string, string, bool, Task<object>> invokeGateway)
     {
         this.runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
@@ -67,6 +70,7 @@ internal sealed class NativeVideoStreamProcessor
         this.mediaSourceManager = mediaSourceManager ?? throw new ArgumentNullException(nameof(mediaSourceManager));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.resolveUserId = resolveUserId ?? throw new ArgumentNullException(nameof(resolveUserId));
+        this.resolveDeviceId = resolveDeviceId ?? throw new ArgumentNullException(nameof(resolveDeviceId));
         this.invokeGateway = invokeGateway ?? throw new ArgumentNullException(nameof(invokeGateway));
     }
 
@@ -113,6 +117,7 @@ internal sealed class NativeVideoStreamProcessor
 
             var operation = runtime.BeginOperation();
             var userId = resolveUserId(httpRequest);
+            var deviceId = resolveDeviceId(httpRequest);
             if (!runtime.TryCommit(
                     operation.Generation,
                     () => true,
@@ -124,7 +129,8 @@ internal sealed class NativeVideoStreamProcessor
                         PlaybackTicketPurpose.DirectClient,
                         operation.Generation,
                         TicketStore.ComputePlaybackLifetime(
-                            matchedMediaSource.RunTimeTicks ?? matchedItem.RunTimeTicks))))
+                            matchedMediaSource.RunTimeTicks ?? matchedItem.RunTimeTicks),
+                        deviceId)))
                 return false;
 
             var container = string.IsNullOrWhiteSpace(matchedMediaSource.Container)
@@ -231,6 +237,12 @@ internal sealed class NativeVideoStreamProcessor
         var user = authorizationContext.GetAuthorizationInfo(request)?.User;
         if (user is not null && !user.Policy.EnableMediaPlayback) throw new UnauthorizedAccessException();
         return user?.Id.ToString("N");
+    }
+
+    private static string? ResolveDeviceId(IAuthorizationContext authorizationContext, IRequest request)
+    {
+        if (authorizationContext is null) throw new ArgumentNullException(nameof(authorizationContext));
+        return authorizationContext.GetAuthorizationInfo(request)?.ReportedDeviceId;
     }
 
     private static Task<object> InvokeGateway(

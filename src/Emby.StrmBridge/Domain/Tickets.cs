@@ -21,6 +21,7 @@ public sealed class TicketPayload
         Guid itemId,
         string mediaSourceId,
         byte[] userBindingHash,
+        byte[] deviceBindingHash,
         SourceIdentity source,
         Uri upstreamUri,
         PlaybackTicketPurpose purpose,
@@ -35,6 +36,7 @@ public sealed class TicketPayload
         ItemId = itemId;
         MediaSourceId = mediaSourceId ?? throw new ArgumentNullException(nameof(mediaSourceId));
         UserBindingHash = userBindingHash ?? throw new ArgumentNullException(nameof(userBindingHash));
+        DeviceBindingHash = deviceBindingHash ?? throw new ArgumentNullException(nameof(deviceBindingHash));
         Source = source ?? throw new ArgumentNullException(nameof(source));
         UpstreamUri = upstreamUri ?? throw new ArgumentNullException(nameof(upstreamUri));
         Purpose = purpose;
@@ -53,6 +55,8 @@ public sealed class TicketPayload
     public string MediaSourceId { get; }
 
     internal byte[] UserBindingHash { get; }
+
+    internal byte[] DeviceBindingHash { get; }
 
     public SourceIdentity Source { get; }
 

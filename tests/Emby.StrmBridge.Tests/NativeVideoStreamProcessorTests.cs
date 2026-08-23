@@ -28,6 +28,7 @@ public sealed class NativeVideoStreamProcessorTests
             Assert.AreEqual("stream.mp4", fileName);
             Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(ticket, out var payload));
             Assert.AreEqual(PlaybackTicketPurpose.DirectClient, payload!.Purpose);
+            Assert.AreEqual(32, payload.DeviceBindingHash.Length);
             return Task.FromResult(sentinel);
         };
 
@@ -184,6 +185,7 @@ public sealed class NativeVideoStreamProcessorTests
                 mediaSourceManager,
                 logger,
                 _ => null,
+                _ => "device-id",
                 (request, ticket, fileName, isHead) => InvokeGateway(request, ticket, fileName, isHead));
         }
 

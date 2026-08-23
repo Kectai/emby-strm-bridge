@@ -26,6 +26,7 @@ public sealed class TicketStore
     private readonly int playbackCapacity;
     private readonly int hlsCapacity;
     private readonly byte[] userBindingSalt = CreateRandomBytes(32);
+    private readonly byte[] deviceBindingSalt = CreateRandomBytes(32);
     private int playbackCount;
     private int hlsCount;
 
@@ -55,7 +56,8 @@ public sealed class TicketStore
         SourceIdentity source,
         PlaybackTicketPurpose purpose,
         int runtimeGeneration,
-        TimeSpan? playbackLifetime = null)
+        TimeSpan? playbackLifetime = null,
+        string? deviceId = null)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         var lifetime = ValidatePlaybackLifetime(playbackLifetime ?? MaximumLifetime);
@@ -65,6 +67,7 @@ public sealed class TicketStore
             itemId,
             mediaSourceId,
             HashUserId(userId),
+            HashDeviceId(deviceId),
             source,
             source.SourceUri,
             purpose,
@@ -121,6 +124,7 @@ public sealed class TicketStore
                 parent.ItemId,
                 parent.MediaSourceId,
                 parent.UserBindingHash.ToArray(),
+                parent.DeviceBindingHash.ToArray(),
                 parent.Source,
                 upstreamUri,
                 parent.Purpose,
@@ -343,9 +347,17 @@ public sealed class TicketStore
     private byte[] HashUserId(string? value)
     {
         var normalized = (value ?? string.Empty).Trim().Replace("-", string.Empty).ToLowerInvariant();
-        if (normalized.Length == 0) return Array.Empty<byte>();
-        using var hmac = new HMACSHA256(userBindingSalt);
-        return hmac.ComputeHash(Encoding.UTF8.GetBytes(normalized));
+        return HashBinding(normalized, userBindingSalt);
+    }
+
+    private byte[] HashDeviceId(string? value) =>
+        HashBinding((value ?? string.Empty).Trim(), deviceBindingSalt);
+
+    private static byte[] HashBinding(string value, byte[] salt)
+    {
+        if (value.Length == 0) return Array.Empty<byte>();
+        using var hmac = new HMACSHA256(salt);
+        return hmac.ComputeHash(Encoding.UTF8.GetBytes(value));
     }
 
     private static bool FixedTimeEquals(byte[] left, byte[] right)

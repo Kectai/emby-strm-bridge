@@ -60,9 +60,11 @@ public sealed class GatewayService : IService, IRequiresRequest
     {
         if (!IsValidFileName(fileName)) throw Unavailable();
         var runtime = Plugin.Runtime;
-        var options = runtime?.GetOptionsSnapshot();
-        if (runtime?.SourcePolicy is null || runtime.Gateway is null || options is null ||
-            !options.Enabled || options.PlaybackMode == PlaybackRoutingMode.Native ||
+        if (runtime?.SourcePolicy is null || runtime.Gateway is null)
+            throw Unavailable();
+        var operation = runtime.BeginOperation();
+        var options = runtime.GetOptionsSnapshot();
+        if (!options.Enabled || options.PlaybackMode == PlaybackRoutingMode.Native ||
             !runtime.Tickets.TryInspect(ticketValue, out var inspected))
             throw Unavailable();
 
@@ -87,7 +89,8 @@ public sealed class GatewayService : IService, IRequiresRequest
         if (user is not null && !user.Policy.EnableMediaPlayback) throw Unavailable();
         var authenticatedUserId = user?.Id.ToString("N");
         if (!runtime.Tickets.TryRedeem(ticketValue, authenticatedUserId, out var ticket)) throw Unavailable();
-        if (ticket!.RuntimeGeneration != runtime.Generation)
+        if (ticket!.RuntimeGeneration != operation.Generation ||
+            !runtime.IsOperationCurrent(operation.Generation))
         {
             runtime.Tickets.Revoke(ticketValue);
             throw Unavailable();
@@ -105,20 +108,88 @@ public sealed class GatewayService : IService, IRequiresRequest
             throw Unavailable();
         }
 
+        var forwardedHeaders = GetForwardedRequestHeaders();
+        var directRouteScope = ticket.Purpose == PlaybackTicketPurpose.DirectClient &&
+                               options.PlaybackMode is PlaybackRoutingMode.Adaptive or PlaybackRoutingMode.RedirectOnly
+            ? GatewayTransport.CreateDirectRouteScope(ticket, ticketValue)
+            : null;
+        GatewayTransport.DirectRouteGateLease? directRouteGate = null;
         try
         {
-            using var lease = await runtime.Gateway.OpenAsync(
-                    ticket.UpstreamUri,
-                    ticketValue,
-                    ticket.Purpose == PlaybackTicketPurpose.ServerFfmpeg
-                        ? GatewayTransport.CreateRedirectCandidateScope(ticket.Source)
-                        : null,
-                    Request.HttpMethod,
-                    Request.UserAgent,
-                    GetForwardedRequestHeaders(),
-                    options,
-                    Request.CancellationToken)
-                .ConfigureAwait(false);
+            var forceAdaptiveRelay = false;
+            if (directRouteScope is not null)
+            {
+                using var gateTimeout = CancellationTokenSource.CreateLinkedTokenSource(
+                    Request.CancellationToken,
+                    operation.CancellationToken);
+                gateTimeout.CancelAfter(TimeSpan.FromSeconds(options.GatewayTimeoutSeconds));
+                directRouteGate = await runtime.Gateway.AcquireDirectRouteGateAsync(
+                        directRouteScope,
+                        Request.HttpMethod,
+                        Request.UserAgent,
+                        forwardedHeaders,
+                        gateTimeout.Token)
+                    .ConfigureAwait(false);
+                if (!runtime.IsOperationCurrent(operation.Generation)) throw Unavailable();
+                if (runtime.Gateway.TryGetDirectRoute(
+                        ticket.UpstreamUri,
+                        directRouteScope,
+                        Request.HttpMethod,
+                        Request.UserAgent,
+                        forwardedHeaders,
+                        out var rememberedRoute))
+                {
+                    if (rememberedRoute.RelayRequired && options.PlaybackMode == PlaybackRoutingMode.Adaptive)
+                    {
+                        forceAdaptiveRelay = true;
+                        directRouteGate?.Dispose();
+                    }
+                    else if (!rememberedRoute.RelayRequired &&
+                             (options.PlaybackMode == PlaybackRoutingMode.RedirectOnly ||
+                              rememberedRoute.Behavior == SourceTransportBehavior.FileBody))
+                    {
+                        if (!runtime.TryCommit(
+                                operation.Generation,
+                                () => true,
+                                () =>
+                                {
+                                    Request.Response.StatusCode = 302;
+                                    AddSafeHeaders();
+                                    Request.Response.AddHeader(
+                                        "Location",
+                                        rememberedRoute.EffectiveUri!.AbsoluteUri);
+                                }))
+                            throw Unavailable();
+                        logger.Debug("STRM_BRIDGE_GATEWAY_DIRECT_ROUTE_HIT item=" + ShortId(ticket.ItemId));
+                        return string.Empty;
+                    }
+                }
+            }
+
+            using var lease = directRouteScope is not null && directRouteGate is not null
+                ? await runtime.Gateway.OpenDirectAsync(
+                        ticket.UpstreamUri,
+                        forceAdaptiveRelay ? ticketValue : directRouteScope,
+                        directRouteGate.Generation,
+                        Request.HttpMethod,
+                        Request.UserAgent,
+                        forwardedHeaders,
+                        options,
+                        Request.CancellationToken)
+                    .ConfigureAwait(false)
+                : await runtime.Gateway.OpenAsync(
+                        ticket.UpstreamUri,
+                        ticketValue,
+                        ticket.Purpose == PlaybackTicketPurpose.ServerFfmpeg
+                            ? GatewayTransport.CreateRedirectCandidateScope(ticket.Source)
+                            : null,
+                        Request.HttpMethod,
+                        Request.UserAgent,
+                        forwardedHeaders,
+                        options,
+                        Request.CancellationToken)
+                    .ConfigureAwait(false);
+            if (!runtime.IsOperationCurrent(operation.Generation)) throw Unavailable();
             if (lease.UsedCachedRedirect)
                 logger.Debug("STRM_BRIDGE_GATEWAY_REDIRECT_LEASE_HIT item=" + ShortId(ticket.ItemId));
             if (lease.RetriedRejectedRedirect)
@@ -134,12 +205,49 @@ public sealed class GatewayService : IService, IRequiresRequest
                     lease.EffectiveUri,
                     prefix);
             }
-            var plan = TransportPlanner.Create(options.PlaybackMode, behavior, ticket.Purpose);
-            if (plan == GatewayTransportPlan.Redirect)
+            var responseStatusCode = (int)lease.Response.StatusCode;
+            var observedInstability = TransportPlanner.RequiresAdaptiveRelay(
+                responseStatusCode,
+                lease.RetriedRejectedRedirect);
+            var unstableRedirect = TransportPlanner.ShouldUseAdaptiveRelay(
+                forceAdaptiveRelay,
+                responseStatusCode,
+                lease.RetriedRejectedRedirect);
+            var plan = TransportPlanner.Create(options.PlaybackMode, behavior, ticket.Purpose, unstableRedirect);
+            var canHandoff = TransportPlanner.CanHandoffRedirect(responseStatusCode);
+            if (directRouteScope is not null && options.PlaybackMode == PlaybackRoutingMode.Adaptive &&
+                behavior == SourceTransportBehavior.FileBody && observedInstability)
             {
-                Request.Response.StatusCode = 302;
-                AddSafeHeaders();
-                Request.Response.AddHeader("Location", lease.EffectiveUri.AbsoluteUri);
+                runtime.Gateway.RememberDirectRelay(
+                    directRouteScope,
+                    Request.HttpMethod,
+                    Request.UserAgent,
+                    forwardedHeaders,
+                    lease);
+                logger.Debug("STRM_BRIDGE_GATEWAY_ADAPTIVE_RELAY item=" + ShortId(ticket.ItemId));
+            }
+            if (plan == GatewayTransportPlan.Redirect && canHandoff)
+            {
+                if (!runtime.TryCommit(
+                        operation.Generation,
+                        () => true,
+                        () =>
+                        {
+                            if (directRouteScope is not null &&
+                                (lease.RedirectCount == 0 || lease.UsedCachedRedirect))
+                                runtime.Gateway.RememberDirectRedirect(
+                                    ticket.UpstreamUri,
+                                    directRouteScope,
+                                    Request.HttpMethod,
+                                    Request.UserAgent,
+                                    forwardedHeaders,
+                                    lease,
+                                    behavior);
+                            Request.Response.StatusCode = 302;
+                            AddSafeHeaders();
+                            Request.Response.AddHeader("Location", lease.EffectiveUri.AbsoluteUri);
+                        }))
+                    throw Unavailable();
                 logger.Debug("STRM_BRIDGE_GATEWAY_REDIRECT item=" + ShortId(ticket.ItemId));
                 return string.Empty;
             }
@@ -207,6 +315,10 @@ public sealed class GatewayService : IService, IRequiresRequest
             logger.Debug("STRM_BRIDGE_GATEWAY_CAPACITY item=" + ShortId(ticket.ItemId));
             return string.Empty;
         }
+        catch (OperationCanceledException) when (operation.CancellationToken.IsCancellationRequested)
+        {
+            throw Unavailable();
+        }
         catch (OperationCanceledException) when (!Request.CancellationToken.IsCancellationRequested)
         {
             Request.Response.StatusCode = 504;
@@ -224,6 +336,10 @@ public sealed class GatewayService : IService, IRequiresRequest
             logger.Debug("STRM_BRIDGE_GATEWAY_REJECTED item=" + ShortId(ticket.ItemId) +
                          " error=" + exception.GetType().Name);
             throw Unavailable();
+        }
+        finally
+        {
+            directRouteGate?.Dispose();
         }
     }
 

@@ -111,6 +111,7 @@ Emby 创建服务端转码状态后，`TranscodeInputProcessor` 在 `StartFfMpeg
 - 上游 URI；
 - 运行时代际；
 - 可选的 HMAC 用户绑定；
+- 可选的运行期 HMAC 设备绑定；
 - 签发、预览、活动和绝对过期时间；
 - HLS 嵌套深度。
 
@@ -156,21 +157,25 @@ Emby 创建服务端转码状态后，`TranscodeInputProcessor` 在 `StartFfMpeg
 | --- | --- |
 | `Native` | 保持原生 PlaybackInfo 和标准视频服务行为。 |
 | `RedirectOnly` | 网关以 HTTP 302 返回经过验证的有效地址。 |
-| `Adaptive` | 普通客户端直放返回经过验证的 HTTP 302；服务端 FFmpeg 文件通过网关中继；HLS 重写并中继。 |
+| `Adaptive` | 普通客户端文件直放使用经过验证并可复用的 HTTP 302；地址表现不稳定时在当前直放上下文中短期改用中继；服务端 FFmpeg 文件通过网关中继；HLS 重写并中继。 |
 | `RelayOnly` | 通过网关流式中继经过验证的响应。 |
 
-客户端直放仍先通过票据、权限、媒体库、来源身份和逐跳重定向验证；网关随后只返回最终地址，媒体正文由客户端读取。普通中继保留状态码、内容类型、有效内容长度、字节范围元数据、验证器和安全的内容处置字段。响应携带 `private, no-store`、`Pragma: no-cache`、`nosniff` 和 `no-referrer`。请求取消和读取空闲超时在整个响应体传输期间持续生效。需要服务器 IP 或服务器侧上下文的来源使用 `RelayOnly`。
+客户端直放仍先通过票据、权限、媒体库、来源身份和逐跳重定向验证。一个新直放上下文先按实际请求验证地址；同一地址再正确响应一次复用请求后，后续请求在短期有效期内直接取得 302，媒体正文只由客户端读取。普通中继保留状态码、内容类型、有效内容长度、字节范围元数据、验证器和安全的内容处置字段。响应携带 `private, no-store`、`Pragma: no-cache`、`nosniff` 和 `no-referrer`。请求取消和读取空闲超时在整个响应体传输期间持续生效。需要服务器 IP 或服务器侧上下文的来源使用 `RelayOnly`。
 
 ### 10. 重定向租约
 
-成功完成重定向的文件请求会创建一个仅内存租约，其键由以下内容的摘要组成：
+传输层为每次重定向保留一个仅内存验证租约，其键由以下内容的摘要组成：
 
 - 播放票据；
 - 标准化的 GET 或 HEAD 方法；
 - 标准化 User-Agent；
 - `Accept` 和 `Accept-Language`。
 
-Range 值不进入租约键，因此临近字节请求可共享同一个已验证目标。每次 Range 复用都要求候选响应返回与请求起止范围、文件总长度和响应正文长度一致的单段 `206 Content-Range` 与 identity 编码。按来源或票据建立的单飞门会合并同时发生的首次解析。缓存目标每次使用前都会重新通过策略校验，有效期为 30 秒；到期、传输拒绝、范围不匹配或返回 401、403、404、410 时会被清除并在当前总超时预算内从 STRM 原始地址解析；耗尽总超时预算时当前请求返回超时，下一请求从原始地址解析。首次重定向链的最终目标返回上述状态时也会释放响应并从 STRM 原始地址重试一次。运行时失效使用代际校验，阻止较晚完成的在途解析重新写入已清空的租约。
+Range 值不进入租约键，因此临近字节请求可共享同一个已验证目标。每次 Range 复用都要求候选响应返回与请求起止范围、文件总长度和响应正文长度一致的单段 `206 Content-Range` 与 identity 编码。按来源或票据建立的单飞门会合并同时发生的首次解析。只有最终状态为 200 或 206 的地址会写入租约。缓存目标每次使用前都会重新通过策略校验，有效期为 30 秒；到期、传输拒绝、范围不匹配或返回 401、403、404、410 时会被清除并在当前总超时预算内从 STRM 原始地址解析；耗尽总超时预算时当前请求返回超时，下一请求从原始地址解析。首次重定向链的最终目标返回上述状态时也会释放响应并从 STRM 原始地址重试一次。运行时失效使用代际校验；单飞门和上游打开操作携带同一代际，阻止清理前开始的等待者或在途解析重新写入已清空的租约。
+
+客户端直放另有一个仅内存直放上下文，其摘要包含票据层级、实际上游资源、项目、媒体源、STRM 来源指纹、授权用户绑定和 Emby 报告设备标识的运行期 HMAC；方法、User-Agent、`Accept` 与 `Accept-Language` 继续参与最终键，Range 不参与。原始设备标识不进入键、持久化或日志。没有设备标识时，上下文自动收窄到单张播放票据。不同 HLS 资源、用户或设备彼此隔离，同一用户和设备中新生成的播放票据可共享结果。首次并发解析通过引用计数、代际绑定的单飞门合并，等待者不占用中继并发槽。新重定向地址至少经过两步确认：首次从 STRM 原始地址解析并验证，下一次复用时再以实际请求验证状态与 Range；只有直接来源或完成复验的重定向地址才进入 30 秒快速交接。快速交接仍执行重定向策略校验，但不再由插件预读 CDN，客户端因此不会为每个 M2TS Range 同时触发一次插件校验请求和一次播放器正文请求。
+
+`Adaptive` 在地址复验发生拒绝重试，或最终响应为 401、403、404、410、429、5xx 时，为同一直放上下文记录 30 秒中继决策。该窗口内的新 Range 直接按中继路径打开原始 STRM 来源，避免继续把不稳定地址交给播放器；成功的中继响应不会续期该决策，窗口到期后重新尝试直达。范围错误 416 不会污染该上下文。`RedirectOnly` 保持显式重定向语义，但不会交接状态非 200/206 的最终响应。直放上下文、快速交接地址、降级决策和单飞状态均不持久化，不包含原始用户或设备标识，也不写入日志。
 
 快速定位探测还会创建来源指纹范围内的 30 秒候选租约。候选键包含方法、`Accept` 和 `Accept-Language`，仅服务端 FFmpeg 正式媒体请求会使用自己的 User-Agent 复验候选；客户端直放不会读取该候选。候选响应必须返回与请求起止范围、文件总长度和正文长度一致的单段 `206 Content-Range` 与 identity 编码。状态、范围或编码不匹配时清除候选并从 STRM 原始地址解析。候选地址始终重新执行重定向策略校验。
 
@@ -214,6 +219,7 @@ Range 值不进入租约键，因此临近字节请求可共享同一个已验�
 - 播放票据：4,096；
 - HLS 票据：20,000；
 - 重定向租约：4,096；
+- 直放上下文决策：4,096，30 秒，仅内存；
 - 中继并发：1–16；大于 1 时快速定位探测至少为播放正文保留 1 个配置槽位；
 - 重定向跳数：1–8；
 - 网关超时：10–180 秒；
@@ -369,6 +375,7 @@ Tickets are Base64URL bearer capabilities backed by 256 random bits. Their memor
 - upstream URI;
 - runtime generation;
 - optional HMAC user binding;
+- optional runtime-HMAC device binding;
 - issue, preview, active and absolute-expiry timestamps;
 - HLS nesting depth.
 
@@ -414,21 +421,25 @@ Mode behavior:
 | --- | --- |
 | `Native` | Native PlaybackInfo and standard-video behavior remain unchanged. |
 | `RedirectOnly` | The gateway returns the validated effective address as HTTP 302. |
-| `Adaptive` | Ordinary client direct play receives a validated HTTP 302; server FFmpeg files are relayed; HLS is rewritten and relayed. |
+| `Adaptive` | Ordinary client files use a validated reusable HTTP 302; an unstable address temporarily selects relay for that direct-play context; server FFmpeg files are relayed; HLS is rewritten and relayed. |
 | `RelayOnly` | Validated responses are streamed through the gateway. |
 
-Client direct play still passes ticket, permission, library, source-identity and per-hop redirect validation; the gateway then returns only the final address and the client reads the media body. Ordinary relay preserves status, content type, content length when valid, byte-range metadata, validators and safe content disposition. Responses carry `private, no-store`, `Pragma: no-cache`, `nosniff` and `no-referrer` headers. Request cancellation and an idle read timeout remain active for the full response body. Sources that require the server IP or server-side context use `RelayOnly`.
+Client direct play still passes ticket, permission, library, source-identity and per-hop redirect validation. A new direct-play context validates the address with the actual request; after the same address correctly serves one reuse request, later requests receive a direct 302 for the short context lifetime and only the client reads the media body. Ordinary relay preserves status, content type, content length when valid, byte-range metadata, validators and safe content disposition. Responses carry `private, no-store`, `Pragma: no-cache`, `nosniff` and `no-referrer` headers. Request cancellation and an idle read timeout remain active for the full response body. Sources that require the server IP or server-side context use `RelayOnly`.
 
 ### 10. Redirect leases
 
-A successful redirected file request creates a memory-only lease keyed by a digest of:
+The transport keeps a memory-only validation lease for each redirect, keyed by a digest of:
 
 - playback ticket;
 - normalized GET or HEAD method;
 - normalized User-Agent;
 - `Accept` and `Accept-Language`.
 
-Range values stay outside the key so nearby byte requests can share one validated target. Every Range reuse requires a single identity-encoded `206 Content-Range` whose requested start and end, total file length and response body length are consistent. A source- or ticket-keyed single-flight gate merges simultaneous first resolutions. Each cached target is policy-validated again before use, expires after 30 seconds and is evicted on expiry, transport rejection, range mismatch, or status 401, 403, 404 or 410, then resolves from the STRM source within the current total timeout budget. Exhausting that budget times out the current request and makes the next request resolve from the source. The same statuses on the final target of a fresh redirect chain release that response and permit one retry from the source. Runtime invalidation uses a generation check so late in-flight resolutions cannot repopulate cleared leases.
+Range values stay outside the key so nearby byte requests can share one validated target. Every Range reuse requires a single identity-encoded `206 Content-Range` whose requested start and end, total file length and response body length are consistent. A source- or ticket-keyed single-flight gate merges simultaneous first resolutions. Only a final status of 200 or 206 is stored as a lease. Each cached target is policy-validated again before use, expires after 30 seconds and is evicted on expiry, transport rejection, range mismatch, or status 401, 403, 404 or 410, then resolves from the STRM source within the current total timeout budget. Exhausting that budget times out the current request and makes the next request resolve from the source. The same statuses on the final target of a fresh redirect chain release that response and permit one retry from the source. Runtime invalidation uses generation checks; the single-flight gate and upstream open carry the same generation so a waiter or in-flight resolution that began before clearing cannot repopulate cleared leases.
+
+Direct-client delivery also has a memory-only direct-play context. Its digest contains the ticket depth, actual upstream resource, item, media source, STRM source fingerprint, authorization binding, and a runtime HMAC of Emby's reported device identifier; method, User-Agent, `Accept` and `Accept-Language` remain part of the final key, while Range does not. The raw device identifier is absent from keys, persistence and logs. When no device identifier is available, the context narrows to one playback ticket. Different HLS resources, users and devices remain isolated, while newly issued playback tickets for the same user and device can share the result. A reference-counted, generation-bound single-flight gate merges concurrent first resolutions before they consume relay capacity. A new redirected address requires two-step confirmation: initial resolution and validation from the STRM source, followed by one actual reuse request that validates status and Range. Only a direct source or a redirected address that completes this reuse enters the 30-second fast handoff. Fast handoff still applies redirect-policy validation but performs no CDN pre-read, avoiding one plugin validation request plus one player body request for every M2TS Range.
+
+When redirect reuse is rejected, or the final response is 401, 403, 404, 410, 429 or 5xx, `Adaptive` records a 30-second relay decision for the same direct-play context. New Range requests in that window open the original STRM source on the relay path instead of returning the unstable address to the player. Successful relay responses do not renew the decision, so direct delivery is retried after the original window expires. A request-specific 416 does not poison the context. `RedirectOnly` keeps its explicit redirect semantics but does not hand off a final response whose status is not 200 or 206. Direct-play contexts, fast-handoff addresses, fallback decisions and single-flight state are memory-only, contain no raw user or device identifier and are absent from logs.
 
 Fast-seek probes also create a 30-second candidate lease scoped to the source fingerprint. The candidate key includes the method, `Accept`, and `Accept-Language`. Only server-FFmpeg media retrieval consumes the candidate and preserves its own User-Agent; direct-client delivery never reads it. Reuse requires a single identity-encoded `206 Content-Range` whose start, end, total length and body length match the request. A status, range, or encoding mismatch clears the candidate and resolves from the original STRM source. Redirect policy validation runs again before every candidate use.
 
@@ -472,6 +483,7 @@ Capacity limits:
 - playback tickets: 4,096;
 - HLS tickets: 20,000;
 - redirect leases: 4,096;
+- direct-play context decisions: 4,096 for 30 seconds, memory only;
 - relay concurrency: 1–16; above one, fast-seek probes leave at least one configured slot available for playback delivery;
 - redirect hops: 1–8;
 - gateway timeout: 10–180 seconds;

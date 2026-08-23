@@ -23,6 +23,8 @@ public sealed class GatewayTransport : IDisposable
     private readonly object sync = new();
     private readonly Dictionary<string, RedirectLeaseEntry> redirectLeases = new(StringComparer.Ordinal);
     private readonly Dictionary<string, SemaphoreSlim> redirectLeaseGates = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DirectRouteEntry> directRoutes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DirectRouteGateEntry> directRouteGates = new(StringComparer.Ordinal);
     private readonly HttpClient client;
     private readonly RedirectPolicy redirectPolicy;
     private readonly IClock clock;
@@ -55,6 +57,21 @@ public sealed class GatewayTransport : IDisposable
         get { lock (sync) return redirectLeases.Count; }
     }
 
+    internal int DirectRouteCount
+    {
+        get { lock (sync) return directRoutes.Count; }
+    }
+
+    internal int DirectRouteGateCount
+    {
+        get { lock (sync) return directRouteGates.Count; }
+    }
+
+    internal int DirectRouteGateReferenceCount
+    {
+        get { lock (sync) return directRouteGates.Values.Sum(entry => entry.ReferenceCount); }
+    }
+
     public Uri ValidateResource(Uri source, Uri target) =>
         redirectPolicy.Validate(source, target.AbsoluteUri);
 
@@ -63,6 +80,182 @@ public sealed class GatewayTransport : IDisposable
         if (source is null || source.SourceFingerprint.Length < 32)
             throw new ArgumentException("The source identity is unavailable.", nameof(source));
         return "source-" + source.SourceFingerprint.Substring(0, 32);
+    }
+
+    internal static string CreateDirectRouteScope(TicketPayload ticket, string ticketValue)
+    {
+        if (ticket is null) throw new ArgumentNullException(nameof(ticket));
+        if (string.IsNullOrWhiteSpace(ticketValue)) throw new ArgumentException("The ticket is unavailable.", nameof(ticketValue));
+        var clientBinding = ticket.DeviceBindingHash.Length > 0
+            ? "device-" + Convert.ToBase64String(ticket.DeviceBindingHash)
+            : "ticket-" + ticketValue;
+        using var hash = SHA256.Create();
+        var input = Encoding.UTF8.GetBytes(
+            ((int)ticket.Scope).ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n" +
+            ticket.HlsDepth.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n" +
+            ticket.ItemId.ToString("N") + "\n" +
+            ticket.MediaSourceId + "\n" +
+            ticket.Source.SourceFingerprint + "\n" +
+            ticket.UpstreamUri.AbsoluteUri + "\n" +
+            Convert.ToBase64String(ticket.UserBindingHash) + "\n" +
+            clientBinding);
+        var digest = Convert.ToBase64String(hash.ComputeHash(input))
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+        return "direct-" + digest;
+    }
+
+    internal async Task<DirectRouteGateLease?> AcquireDirectRouteGateAsync(
+        string scope,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        CancellationToken cancellationToken)
+    {
+        var key = CreateRedirectLeaseKey(
+            scope,
+            NormalizeMethod(method),
+            NormalizeUserAgent(userAgent),
+            requestHeaders);
+        if (key.Length == 0) return null;
+
+        DirectRouteGateEntry entry;
+        int generation;
+        lock (sync)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(GatewayTransport));
+            generation = redirectLeaseGeneration;
+            if (!directRouteGates.TryGetValue(key, out entry!))
+            {
+                if (directRouteGates.Count >= MaximumRedirectLeases) throw new GatewayCapacityException();
+                entry = new DirectRouteGateEntry();
+                directRouteGates.Add(key, entry);
+            }
+            entry.ReferenceCount++;
+        }
+
+        var acquired = false;
+        try
+        {
+            await entry.Semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            acquired = true;
+            lock (sync)
+                if (disposed || generation != redirectLeaseGeneration)
+                    throw new InvalidOperationException("The direct-route generation has changed.");
+            return new DirectRouteGateLease(
+                generation,
+                () => ReleaseDirectRouteGate(key, entry, acquired: true));
+        }
+        catch
+        {
+            ReleaseDirectRouteGate(key, entry, acquired);
+            throw;
+        }
+    }
+
+    internal bool TryGetDirectRoute(
+        Uri source,
+        string scope,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        out DirectRouteDecision decision)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        decision = default;
+        var key = CreateRedirectLeaseKey(
+            scope,
+            NormalizeMethod(method),
+            NormalizeUserAgent(userAgent),
+            requestHeaders);
+        if (key.Length == 0) return false;
+
+        DirectRouteEntry? found;
+        int generation;
+        lock (sync)
+        {
+            if (disposed) return false;
+            generation = redirectLeaseGeneration;
+            if (!directRoutes.TryGetValue(key, out found)) return false;
+            if (clock.UtcNow >= found.ExpiresAtUtc)
+            {
+                directRoutes.Remove(key);
+                return false;
+            }
+            if (found.RelayRequired)
+            {
+                decision = DirectRouteDecision.Relay;
+                return true;
+            }
+        }
+
+        Uri validated;
+        try { validated = redirectPolicy.Validate(source, found!.EffectiveUri!.AbsoluteUri); }
+        catch (RedirectRejectedException)
+        {
+            lock (sync)
+                if (directRoutes.TryGetValue(key, out var current) && ReferenceEquals(current, found))
+                    directRoutes.Remove(key);
+            return false;
+        }
+
+        lock (sync)
+        {
+            if (disposed || generation != redirectLeaseGeneration ||
+                !directRoutes.TryGetValue(key, out var current) || !ReferenceEquals(current, found) ||
+                clock.UtcNow >= current.ExpiresAtUtc)
+                return false;
+            decision = DirectRouteDecision.Redirect(validated, current.Behavior);
+            return true;
+        }
+    }
+
+    internal void RememberDirectRedirect(
+        Uri source,
+        string scope,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        GatewayTransportLease lease,
+        SourceTransportBehavior behavior)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (lease is null) throw new ArgumentNullException(nameof(lease));
+        var validated = redirectPolicy.Validate(source, lease.EffectiveUri.AbsoluteUri);
+        var key = CreateRedirectLeaseKey(
+            scope,
+            NormalizeMethod(method),
+            NormalizeUserAgent(userAgent),
+            requestHeaders);
+        if (key.Length == 0) return;
+        StoreDirectRoute(
+            key,
+            new DirectRouteEntry(validated, behavior, relayRequired: false, clock.UtcNow + RedirectLeaseLifetime),
+            lease.CacheGeneration,
+            removeRedirectLease: false);
+    }
+
+    internal void RememberDirectRelay(
+        string scope,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        GatewayTransportLease lease)
+    {
+        if (lease is null) throw new ArgumentNullException(nameof(lease));
+        var key = CreateRedirectLeaseKey(
+            scope,
+            NormalizeMethod(method),
+            NormalizeUserAgent(userAgent),
+            requestHeaders);
+        if (key.Length == 0) return;
+        StoreDirectRoute(
+            key,
+            new DirectRouteEntry(null, SourceTransportBehavior.FileBody, relayRequired: true,
+                clock.UtcNow + RedirectLeaseLifetime),
+            lease.CacheGeneration,
+            removeRedirectLease: true);
     }
 
     public async Task<GatewayTransportLease> OpenAsync(
@@ -112,6 +305,29 @@ public sealed class GatewayTransport : IDisposable
                 requestHeaders,
                 options,
                 isProbe: false,
+                expectedGeneration: null,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal async Task<GatewayTransportLease> OpenDirectAsync(
+        Uri source,
+        string redirectLeaseScope,
+        int expectedGeneration,
+        string method,
+        string? userAgent,
+        IReadOnlyDictionary<string, string> requestHeaders,
+        PluginConfiguration options,
+        CancellationToken cancellationToken)
+        => await OpenCoreAsync(
+                source,
+                redirectLeaseScope,
+                null,
+                method,
+                userAgent,
+                requestHeaders,
+                options,
+                isProbe: false,
+                expectedGeneration,
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -133,6 +349,7 @@ public sealed class GatewayTransport : IDisposable
                 requestHeaders,
                 options,
                 isProbe: true,
+                expectedGeneration: null,
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -145,11 +362,12 @@ public sealed class GatewayTransport : IDisposable
         IReadOnlyDictionary<string, string> requestHeaders,
         PluginConfiguration options,
         bool isProbe,
+        int? expectedGeneration,
         CancellationToken cancellationToken)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (options is null) throw new ArgumentNullException(nameof(options));
-        var leaseGeneration = Enter(options.RelayConcurrency, isProbe);
+        var leaseGeneration = Enter(options.RelayConcurrency, isProbe, expectedGeneration);
         SemaphoreSlim? resolutionGate = null;
         var resolutionGateHeld = false;
         try
@@ -179,13 +397,15 @@ public sealed class GatewayTransport : IDisposable
                 : null;
             var resolutionGateKey = candidateKey.Length > 0 ? candidateKey : leaseKey;
             GatewayTransportLease? cachedLease;
+            var rejectedCachedRedirect = false;
             try
             {
                 if (leaseKey.Length > 0)
                 {
                     cachedLease = await TryOpenRedirectLeaseAsync(
                             source, leaseKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
-                            requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator)
+                            requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator,
+                            () => rejectedCachedRedirect = true)
                         .ConfigureAwait(false);
                     if (cachedLease is not null) return cachedLease;
                 }
@@ -195,7 +415,8 @@ public sealed class GatewayTransport : IDisposable
                     var candidateLease = await TryOpenRedirectLeaseAsync(
                             source, candidateKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
                             requestHeaders, options, cancellationToken, timeout.Token,
-                            rangeResponseValidator)
+                            rangeResponseValidator,
+                            () => rejectedCachedRedirect = true)
                         .ConfigureAwait(false);
                     if (candidateLease is not null)
                     {
@@ -220,7 +441,8 @@ public sealed class GatewayTransport : IDisposable
                         {
                             cachedLease = await TryOpenRedirectLeaseAsync(
                                     source, leaseKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
-                                    requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator)
+                                    requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator,
+                                    () => rejectedCachedRedirect = true)
                                 .ConfigureAwait(false);
                             if (cachedLease is not null) return cachedLease;
                         }
@@ -229,7 +451,8 @@ public sealed class GatewayTransport : IDisposable
                         {
                             var candidateLease = await TryOpenRedirectLeaseAsync(
                                     source, candidateKey, leaseGeneration, normalizedMethod, normalizedUserAgent,
-                                    requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator)
+                                    requestHeaders, options, cancellationToken, timeout.Token, rangeResponseValidator,
+                                    () => rejectedCachedRedirect = true)
                                 .ConfigureAwait(false);
                             if (candidateLease is not null)
                             {
@@ -254,7 +477,7 @@ public sealed class GatewayTransport : IDisposable
                         options,
                         timeout.Token)
                     .ConfigureAwait(false);
-                var retriedRejectedRedirect = false;
+                var retriedRejectedRedirect = rejectedCachedRedirect;
                 if (resolved.RedirectCount > 0 && InvalidatesRedirectLease(resolved.Response))
                 {
                     resolved.Response.Dispose();
@@ -269,7 +492,8 @@ public sealed class GatewayTransport : IDisposable
                             timeout.Token)
                         .ConfigureAwait(false);
                 }
-                if (leaseKey.Length > 0 && resolved.RedirectCount > 0 && !InvalidatesRedirectLease(resolved.Response))
+                if (leaseKey.Length > 0 && resolved.RedirectCount > 0 &&
+                    IsReusableRedirectLeaseResponse(resolved.Response))
                     StoreRedirectLease(
                         leaseKey,
                         resolved.EffectiveUri,
@@ -291,6 +515,7 @@ public sealed class GatewayTransport : IDisposable
                     resolved.RedirectCount,
                     usedCachedRedirect: false,
                     retriedRejectedRedirect,
+                    leaseGeneration,
                     cancellationToken,
                     TimeSpan.FromSeconds(options.GatewayTimeoutSeconds),
                     Exit);
@@ -314,12 +539,17 @@ public sealed class GatewayTransport : IDisposable
             redirectLeaseGeneration++;
             redirectLeases.Clear();
             redirectLeaseGates.Clear();
+            directRoutes.Clear();
         }
     }
 
     public int RemoveExpiredRedirectLeases()
     {
-        lock (sync) return RemoveExpiredRedirectLeasesUnsafe(clock.UtcNow);
+        lock (sync)
+        {
+            var now = clock.UtcNow;
+            return RemoveExpiredRedirectLeasesUnsafe(now) + RemoveExpiredDirectRoutesUnsafe(now);
+        }
     }
 
     public void Dispose()
@@ -331,15 +561,18 @@ public sealed class GatewayTransport : IDisposable
             redirectLeaseGeneration++;
             redirectLeases.Clear();
             redirectLeaseGates.Clear();
+            directRoutes.Clear();
         }
         client.Dispose();
     }
 
-    private int Enter(int limit, bool isProbe)
+    private int Enter(int limit, bool isProbe, int? expectedGeneration)
     {
         lock (sync)
         {
             if (disposed) throw new ObjectDisposedException(nameof(GatewayTransport));
+            if (expectedGeneration.HasValue && expectedGeneration.Value != redirectLeaseGeneration)
+                throw new InvalidOperationException("The direct-route generation has changed.");
             var effectiveLimit = isProbe && limit > 1 ? limit - 1 : limit;
             if (activeRequests >= effectiveLimit) throw new GatewayCapacityException();
             activeRequests++;
@@ -478,6 +711,53 @@ public sealed class GatewayTransport : IDisposable
         return expired.Length;
     }
 
+    private int RemoveExpiredDirectRoutesUnsafe(DateTimeOffset now)
+    {
+        var expired = directRoutes
+            .Where(pair => now >= pair.Value.ExpiresAtUtc)
+            .Select(pair => pair.Key)
+            .ToArray();
+        foreach (var key in expired) directRoutes.Remove(key);
+        return expired.Length;
+    }
+
+    private void StoreDirectRoute(
+        string key,
+        DirectRouteEntry entry,
+        int expectedGeneration,
+        bool removeRedirectLease)
+    {
+        lock (sync)
+        {
+            if (disposed || expectedGeneration != redirectLeaseGeneration) return;
+            RemoveExpiredDirectRoutesUnsafe(clock.UtcNow);
+            if (!directRoutes.ContainsKey(key) && directRoutes.Count >= MaximumRedirectLeases)
+            {
+                var oldest = directRoutes.OrderBy(pair => pair.Value.ExpiresAtUtc).First();
+                directRoutes.Remove(oldest.Key);
+            }
+            directRoutes[key] = entry;
+            if (removeRedirectLease) redirectLeases.Remove(key);
+        }
+    }
+
+    private void ReleaseDirectRouteGate(string key, DirectRouteGateEntry entry, bool acquired)
+    {
+        if (acquired) entry.Semaphore.Release();
+        var dispose = false;
+        lock (sync)
+        {
+            if (entry.ReferenceCount > 0) entry.ReferenceCount--;
+            if (entry.ReferenceCount == 0 &&
+                directRouteGates.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
+            {
+                directRouteGates.Remove(key);
+                dispose = true;
+            }
+        }
+        if (dispose) entry.Semaphore.Dispose();
+    }
+
     private SemaphoreSlim? GetRedirectLeaseGate(string key)
     {
         lock (sync)
@@ -512,7 +792,8 @@ public sealed class GatewayTransport : IDisposable
         PluginConfiguration options,
         CancellationToken requestCancellation,
         CancellationToken timeoutCancellation,
-        Func<HttpResponseMessage, bool>? responseValidator = null)
+        Func<HttpResponseMessage, bool>? responseValidator = null,
+        Action? rejectionObserver = null)
     {
         if (!TryGetRedirectLease(leaseKey, out var cached)) return null;
         try
@@ -527,7 +808,7 @@ public sealed class GatewayTransport : IDisposable
                     options,
                     timeoutCancellation)
                 .ConfigureAwait(false);
-            if (!InvalidatesRedirectLease(cachedResponse.Response) &&
+            if (IsReusableRedirectLeaseResponse(cachedResponse.Response) &&
                 (responseValidator is null || responseValidator(cachedResponse.Response)))
             {
                 var effectiveRedirectCount = Math.Max(cached.RedirectCount, cachedResponse.RedirectCount);
@@ -542,6 +823,7 @@ public sealed class GatewayTransport : IDisposable
                     effectiveRedirectCount,
                     usedCachedRedirect: true,
                     retriedRejectedRedirect: false,
+                    leaseGeneration,
                     requestCancellation,
                     TimeSpan.FromSeconds(options.GatewayTimeoutSeconds),
                     Exit);
@@ -559,6 +841,7 @@ public sealed class GatewayTransport : IDisposable
             RemoveRedirectLease(leaseKey);
             throw;
         }
+        rejectionObserver?.Invoke();
         RemoveRedirectLease(leaseKey);
         return null;
     }
@@ -568,6 +851,9 @@ public sealed class GatewayTransport : IDisposable
         var status = (int)response.StatusCode;
         return status is 401 or 403 or 404 or 410;
     }
+
+    private static bool IsReusableRedirectLeaseResponse(HttpResponseMessage response) =>
+        TransportPlanner.CanHandoffRedirect((int)response.StatusCode);
 
     private static bool IsRedirectRangeResponseCompatible(
         HttpResponseMessage response,
@@ -673,6 +959,51 @@ public sealed class GatewayTransport : IDisposable
         public DateTimeOffset ExpiresAtUtc { get; }
     }
 
+    private sealed class DirectRouteEntry
+    {
+        public DirectRouteEntry(
+            Uri? effectiveUri,
+            SourceTransportBehavior behavior,
+            bool relayRequired,
+            DateTimeOffset expiresAtUtc)
+        {
+            EffectiveUri = effectiveUri;
+            Behavior = behavior;
+            RelayRequired = relayRequired;
+            ExpiresAtUtc = expiresAtUtc;
+        }
+
+        public Uri? EffectiveUri { get; }
+
+        public SourceTransportBehavior Behavior { get; }
+
+        public bool RelayRequired { get; }
+
+        public DateTimeOffset ExpiresAtUtc { get; }
+    }
+
+    private sealed class DirectRouteGateEntry
+    {
+        public SemaphoreSlim Semaphore { get; } = new(1, 1);
+
+        public int ReferenceCount { get; set; }
+    }
+
+    internal sealed class DirectRouteGateLease : IDisposable
+    {
+        private Action? release;
+
+        public DirectRouteGateLease(int generation, Action release)
+        {
+            Generation = generation;
+            this.release = release ?? throw new ArgumentNullException(nameof(release));
+        }
+
+        public int Generation { get; }
+
+        public void Dispose() => Interlocked.Exchange(ref release, null)?.Invoke();
+    }
+
     private sealed class TransportResponse
     {
         public TransportResponse(HttpResponseMessage response, Uri effectiveUri, int redirectCount)
@@ -690,6 +1021,31 @@ public sealed class GatewayTransport : IDisposable
     }
 }
 
+internal readonly struct DirectRouteDecision
+{
+    private DirectRouteDecision(
+        bool relayRequired,
+        Uri? effectiveUri,
+        SourceTransportBehavior behavior)
+    {
+        RelayRequired = relayRequired;
+        EffectiveUri = effectiveUri;
+        Behavior = behavior;
+    }
+
+    public static DirectRouteDecision Relay { get; } =
+        new(relayRequired: true, null, SourceTransportBehavior.FileBody);
+
+    public static DirectRouteDecision Redirect(Uri effectiveUri, SourceTransportBehavior behavior) =>
+        new(false, effectiveUri ?? throw new ArgumentNullException(nameof(effectiveUri)), behavior);
+
+    public bool RelayRequired { get; }
+
+    public Uri? EffectiveUri { get; }
+
+    public SourceTransportBehavior Behavior { get; }
+}
+
 public sealed class GatewayTransportLease : IDisposable
 {
     private readonly Action release;
@@ -705,6 +1061,7 @@ public sealed class GatewayTransportLease : IDisposable
         int redirectCount,
         bool usedCachedRedirect,
         bool retriedRejectedRedirect,
+        int cacheGeneration,
         CancellationToken requestCancellation,
         TimeSpan idleTimeout,
         Action release)
@@ -714,6 +1071,7 @@ public sealed class GatewayTransportLease : IDisposable
         RedirectCount = redirectCount;
         UsedCachedRedirect = usedCachedRedirect;
         RetriedRejectedRedirect = retriedRejectedRedirect;
+        CacheGeneration = cacheGeneration;
         this.requestCancellation = requestCancellation;
         this.idleTimeout = idleTimeout;
         this.release = release ?? throw new ArgumentNullException(nameof(release));
@@ -728,6 +1086,8 @@ public sealed class GatewayTransportLease : IDisposable
     public bool UsedCachedRedirect { get; }
 
     public bool RetriedRejectedRedirect { get; }
+
+    internal int CacheGeneration { get; }
 
     public async Task<ReadOnlyMemory<byte>> PeekPrefixAsync(int maximumBytes, CancellationToken cancellationToken)
     {

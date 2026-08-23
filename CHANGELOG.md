@@ -4,8 +4,8 @@
 
 - Adds Adaptive routing for direct playback and server-side media processing.
 - Adds fast positioning for remote TS and M2TS media.
-- Improves repeated seeking and playback recovery.
-- Improves simultaneous playback across users and sessions.
+- Improves direct client delivery, repeated seeking, reconnects and playback recovery.
+- Isolates simultaneous playback across users, devices and sessions.
 - Improves HLS playback continuity and gateway compatibility.
 - Makes configuration labels and descriptions follow the active Emby Web language without changing setting values.
 

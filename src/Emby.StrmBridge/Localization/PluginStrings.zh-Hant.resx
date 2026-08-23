@@ -9,7 +9,7 @@
   <data name="EditorDescription" xml:space="preserve"><value>擷取技術媒體資訊，並透過程序內閘道路由已選 STRM 媒體庫的播放請求。</value></data>
   <data name="Enabled" xml:space="preserve"><value>啟用外掛程式</value></data>
   <data name="PlaybackMode" xml:space="preserve"><value>播放路由模式</value></data>
-  <data name="PlaybackModeDescription" xml:space="preserve"><value>僅對參與處理媒體庫中的 STRM 生效。Adaptive（建議）：自動選擇直連或中繼。一般檔案直放時，播放器直接存取經驗證的來源位址，媒體資料不經過 Emby；轉碼和 HLS 由 Emby 中繼，遠端 TS/M2TS 在伺服器端處理時支援快速定位。RedirectOnly：一律回傳經驗證的來源位址，由請求端直接存取。RelayOnly：一律由 Emby 中繼媒體資料，適合播放器無法直接存取來源位址的情境。Native：完全使用 Emby 原生播放流程。</value></data>
+  <data name="PlaybackModeDescription" xml:space="preserve"><value>僅對參與處理媒體庫中的 STRM 生效。Adaptive（建議）：自動選擇直連或中繼。一般檔案直放時，播放器直接存取經驗證的來源位址，媒體資料不經過 Emby；位址複驗異常時，該播放情境會短期改用 Emby 中繼。轉碼和 HLS 由 Emby 中繼，遠端 TS/M2TS 在伺服器端處理時支援快速定位。RedirectOnly：一律回傳可用且經驗證的來源位址，由請求端直接存取。RelayOnly：一律由 Emby 中繼媒體資料，適合播放器無法直接存取來源位址的情境。Native：完全使用 Emby 原生播放流程。</value></data>
   <data name="ExtractAfterLibraryScan" xml:space="preserve"><value>媒體庫掃描後擷取</value></data>
   <data name="OnlyMissingMediaInfo" xml:space="preserve"><value>僅擷取缺少的媒體資訊</value></data>
   <data name="OnlyMissingMediaInfoDescription" xml:space="preserve"><value>啟用時略過未變更且完整的技術資訊，並可用相符快照還原缺少的資料。關閉時重新探測所有已選 STRM，並取代原快照。</value></data>

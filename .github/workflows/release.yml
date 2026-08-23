@@ -48,4 +48,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/Emby.StrmBridge-*.zip --verify-tag --notes-file artifacts/RELEASE_NOTES.md
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/Emby.StrmBridge-*.zip --clobber
+            gh release edit "$GITHUB_REF_NAME" --verify-tag --notes-file artifacts/RELEASE_NOTES.md
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/Emby.StrmBridge-*.zip --verify-tag --notes-file artifacts/RELEASE_NOTES.md
+          fi

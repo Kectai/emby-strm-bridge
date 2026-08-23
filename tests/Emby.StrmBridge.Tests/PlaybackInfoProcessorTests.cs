@@ -35,7 +35,7 @@ public sealed class PlaybackInfoProcessorTests
         var response = new PlaybackInfoResponse { MediaSources = new[] { original } };
 
         var count = fixture.Processor.TryRewrite(
-            response, fixture.Item.Id, "user-id", "/emby");
+            response, fixture.Item.Id, "user-id", "/emby", "device-id");
 
         Assert.AreEqual(1, count);
         Assert.AreEqual(1, response.MediaSources.Length);
@@ -53,6 +53,7 @@ public sealed class PlaybackInfoProcessorTests
             .Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)[^2];
         Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(ticket, out var payload));
         Assert.AreEqual(PlaybackTicketPurpose.DirectClient, payload!.Purpose);
+        Assert.AreEqual(32, payload.DeviceBindingHash.Length);
     }
 
     [TestMethod]

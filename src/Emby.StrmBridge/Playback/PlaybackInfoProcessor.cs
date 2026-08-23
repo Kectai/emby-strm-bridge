@@ -10,6 +10,7 @@ using Emby.StrmBridge.Policy;
 using Emby.StrmBridge.Runtime;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Net;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Logging;
 using MediaBrowser.Model.MediaInfo;
@@ -23,15 +24,18 @@ public sealed class PlaybackInfoProcessor
     private readonly ILibraryManager libraryManager;
     private readonly IMediaSourceManager mediaSourceManager;
     private readonly ILogger logger;
+    private readonly Func<IRequest?, string?> resolveDeviceId;
 
     public PlaybackInfoProcessor(
         PluginRuntime runtime,
         ILibraryManager libraryManager,
         IMediaSourceManager mediaSourceManager,
+        IAuthorizationContext authorizationContext,
         ILogManager logManager)
         : this(runtime, libraryManager, mediaSourceManager,
             (logManager ?? throw new ArgumentNullException(nameof(logManager)))
-            .GetLogger(Plugin.Instance?.Name ?? "STRM Bridge"))
+            .GetLogger(Plugin.Instance?.Name ?? "STRM Bridge"),
+            request => ResolveDeviceId(authorizationContext, request))
     {
     }
 
@@ -40,11 +44,22 @@ public sealed class PlaybackInfoProcessor
         ILibraryManager libraryManager,
         IMediaSourceManager mediaSourceManager,
         ILogger logger)
+        : this(runtime, libraryManager, mediaSourceManager, logger, _ => null)
+    {
+    }
+
+    internal PlaybackInfoProcessor(
+        PluginRuntime runtime,
+        ILibraryManager libraryManager,
+        IMediaSourceManager mediaSourceManager,
+        ILogger logger,
+        Func<IRequest?, string?> resolveDeviceId)
     {
         this.runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         this.libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
         this.mediaSourceManager = mediaSourceManager ?? throw new ArgumentNullException(nameof(mediaSourceManager));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        this.resolveDeviceId = resolveDeviceId ?? throw new ArgumentNullException(nameof(resolveDeviceId));
     }
 
     internal async Task<object> WrapAsync(Task<object> original, object service, object request)
@@ -65,7 +80,8 @@ public sealed class PlaybackInfoProcessor
                 playbackInfo,
                 itemIdText,
                 userId,
-                GatewayRouteBuilder.GetApiPathBase(serviceRequest));
+                GatewayRouteBuilder.GetApiPathBase(serviceRequest),
+                resolveDeviceId(serviceRequest));
         }
         catch (Exception exception)
         {
@@ -78,22 +94,24 @@ public sealed class PlaybackInfoProcessor
         PlaybackInfoResponse response,
         Guid requestedItemId,
         string? userId,
-        string apiPathBase)
+        string apiPathBase,
+        string? deviceId = null)
     {
         if (response is null) throw new ArgumentNullException(nameof(response));
         var requestedItem = libraryManager.GetItemById(requestedItemId);
-        return requestedItem is null ? 0 : TryRewrite(response, requestedItem, userId, apiPathBase);
+        return requestedItem is null ? 0 : TryRewrite(response, requestedItem, userId, apiPathBase, deviceId);
     }
 
     internal int TryRewriteForRequest(
         PlaybackInfoResponse response,
         string? requestedItemId,
         string? userId,
-        string apiPathBase)
+        string apiPathBase,
+        string? deviceId = null)
     {
         if (response is null) throw new ArgumentNullException(nameof(response));
         var requestedItem = ResolveItem(requestedItemId);
-        if (requestedItem is not null) return TryRewrite(response, requestedItem, userId, apiPathBase);
+        if (requestedItem is not null) return TryRewrite(response, requestedItem, userId, apiPathBase, deviceId);
         logger.Debug("STRM_BRIDGE_PLAYBACK_SKIPPED reason=request-item-unresolved");
         return 0;
     }
@@ -102,7 +120,8 @@ public sealed class PlaybackInfoProcessor
         PlaybackInfoResponse response,
         BaseItem requestedItem,
         string? userId,
-        string apiPathBase)
+        string apiPathBase,
+        string? deviceId)
     {
         var operation = runtime.BeginOperation();
         var options = runtime.GetOptionsSnapshot();
@@ -143,7 +162,8 @@ public sealed class PlaybackInfoProcessor
                             source,
                             PlaybackTicketPurpose.DirectClient,
                             operation.Generation,
-                            TicketStore.ComputePlaybackLifetime(original.RunTimeTicks ?? sourceItem.RunTimeTicks))))
+                            TicketStore.ComputePlaybackLifetime(original.RunTimeTicks ?? sourceItem.RunTimeTicks),
+                            deviceId)))
                 {
                     foreach (var issued in issuedTickets) runtime.Tickets.Revoke(issued);
                     return 0;
@@ -240,4 +260,12 @@ public sealed class PlaybackInfoProcessor
     }
 
     private static string ShortId(Guid itemId) => itemId.ToString("N").Substring(0, 8);
+
+    private static string? ResolveDeviceId(
+        IAuthorizationContext authorizationContext,
+        IRequest? request)
+    {
+        if (authorizationContext is null) throw new ArgumentNullException(nameof(authorizationContext));
+        return request is null ? null : authorizationContext.GetAuthorizationInfo(request)?.ReportedDeviceId;
+    }
 }

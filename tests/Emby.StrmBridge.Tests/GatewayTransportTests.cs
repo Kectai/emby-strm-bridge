@@ -194,6 +194,205 @@ public sealed class GatewayTransportTests
     }
 
     [TestMethod]
+    public async Task Transport_HandsOffConfirmedDirectRouteAcrossRangeRequestsWithoutAnotherUpstreamCall()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var observed = new List<string>();
+        var server = ServeAsync(listener, observed, new[]
+        {
+            "HTTP/1.1 302 Found\r\nLocation: /media/file.m2ts\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            PartialContent("bytes 0-0/10", "x"),
+            PartialContent("bytes 1-1/10", "y"),
+        });
+        var clock = new ManualClock();
+        using var transport = new GatewayTransport(new RedirectPolicy(), clock);
+        var source = new Uri($"http://127.0.0.1:{port}/start");
+        const string scope = "direct-context";
+        const string userAgent = "GenericClient/1.0";
+        var headers = new Dictionary<string, string> { ["Range"] = "bytes=0-0" };
+
+        using (var first = await transport.OpenAsync(
+                   source, scope, "GET", userAgent, headers, CreateOptions(), CancellationToken.None))
+            Assert.IsFalse(first.UsedCachedRedirect);
+
+        headers["Range"] = "bytes=1-1";
+        using (var confirmed = await transport.OpenAsync(
+                   source, scope, "GET", userAgent, headers, CreateOptions(), CancellationToken.None))
+        {
+            Assert.IsTrue(confirmed.UsedCachedRedirect);
+            transport.RememberDirectRedirect(
+                source, scope, "GET", userAgent, headers, confirmed, SourceTransportBehavior.FileBody);
+        }
+        await server;
+
+        headers["Range"] = "bytes=8-9";
+        Assert.IsTrue(transport.TryGetDirectRoute(
+            source, scope, "GET", userAgent, headers, out var route));
+        Assert.IsFalse(route.RelayRequired);
+        Assert.AreEqual("/media/file.m2ts", route.EffectiveUri!.AbsolutePath);
+        Assert.AreEqual(SourceTransportBehavior.FileBody, route.Behavior);
+        CollectionAssert.AreEqual(
+            new[] { "/start", "/media/file.m2ts", "/media/file.m2ts" },
+            observed.Select(RequestPath).ToArray());
+        clock.Advance(GatewayTransport.RedirectLeaseLifetime);
+        Assert.IsFalse(transport.TryGetDirectRoute(
+            source, scope, "GET", userAgent, headers, out _));
+        Assert.AreEqual(0, transport.DirectRouteCount);
+    }
+
+    [TestMethod]
+    public async Task Transport_DirectRouteGateSerializesTheSameContextWithoutConsumingTransportCapacity()
+    {
+        using var transport = new GatewayTransport(new RedirectPolicy(), new ManualClock());
+        var headers = new Dictionary<string, string> { ["Range"] = "bytes=0-" };
+        using var first = await transport.AcquireDirectRouteGateAsync(
+            "direct-context", "GET", "GenericClient/1.0", headers, CancellationToken.None);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
+            transport.AcquireDirectRouteGateAsync(
+                "direct-context", "GET", "GenericClient/1.0", headers, timeout.Token));
+
+        Assert.AreEqual(0, transport.ActiveRequests);
+        Assert.AreEqual(1, transport.DirectRouteGateCount);
+        first!.Dispose();
+        Assert.AreEqual(0, transport.DirectRouteGateCount);
+    }
+
+    [TestMethod]
+    public async Task Transport_ClearInvalidatesAQueuedDirectRouteGateWaiter()
+    {
+        using var transport = new GatewayTransport(new RedirectPolicy(), new ManualClock());
+        var headers = new Dictionary<string, string>();
+        var first = await transport.AcquireDirectRouteGateAsync(
+            "direct-context", "GET", "GenericClient/1.0", headers, CancellationToken.None);
+        var queued = transport.AcquireDirectRouteGateAsync(
+            "direct-context", "GET", "GenericClient/1.0", headers, CancellationToken.None);
+        Assert.IsTrue(SpinWait.SpinUntil(
+            () => transport.DirectRouteGateReferenceCount == 2,
+            TimeSpan.FromSeconds(2)));
+
+        transport.Clear();
+        first!.Dispose();
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => queued);
+        Assert.AreEqual(0, transport.DirectRouteGateCount);
+    }
+
+    [TestMethod]
+    public async Task Transport_DirectOpenRejectsAGateLeaseFromBeforeClear()
+    {
+        using var transport = new GatewayTransport(new RedirectPolicy(), new ManualClock());
+        var headers = new Dictionary<string, string>();
+        using var gate = await transport.AcquireDirectRouteGateAsync(
+            "direct-context", "GET", "GenericClient/1.0", headers, CancellationToken.None);
+
+        transport.Clear();
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => transport.OpenDirectAsync(
+            new Uri("https://source.invalid/media"),
+            "direct-context",
+            gate!.Generation,
+            "GET",
+            "GenericClient/1.0",
+            headers,
+            CreateOptions(),
+            CancellationToken.None));
+        Assert.AreEqual(0, transport.ActiveRequests);
+        Assert.AreEqual(0, transport.RedirectLeaseCount);
+        Assert.AreEqual(0, transport.DirectRouteCount);
+    }
+
+    [TestMethod]
+    public async Task Transport_DisposeInvalidatesAQueuedDirectRouteGateWaiter()
+    {
+        var transport = new GatewayTransport(new RedirectPolicy(), new ManualClock());
+        var headers = new Dictionary<string, string>();
+        var first = await transport.AcquireDirectRouteGateAsync(
+            "direct-context", "GET", "GenericClient/1.0", headers, CancellationToken.None);
+        var queued = transport.AcquireDirectRouteGateAsync(
+            "direct-context", "GET", "GenericClient/1.0", headers, CancellationToken.None);
+        Assert.IsTrue(SpinWait.SpinUntil(
+            () => transport.DirectRouteGateReferenceCount == 2,
+            TimeSpan.FromSeconds(2)));
+
+        transport.Dispose();
+        first!.Dispose();
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => queued);
+        Assert.AreEqual(0, transport.DirectRouteGateCount);
+    }
+
+    [TestMethod]
+    public async Task Transport_BoundsRememberedDirectRoutes()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var server = ServeAsync(listener, new List<string>(), new[]
+        {
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        });
+        using var transport = new GatewayTransport(new RedirectPolicy(), new ManualClock());
+        var source = new Uri($"http://127.0.0.1:{port}/media");
+        var headers = new Dictionary<string, string>();
+        using var lease = await transport.OpenAsync(
+            source, "GET", "GenericClient/1.0", headers, CreateOptions(), CancellationToken.None);
+        await server;
+
+        for (var index = 0; index <= GatewayTransport.MaximumRedirectLeases; index++)
+            transport.RememberDirectRedirect(
+                source,
+                "direct-context-" + index,
+                "GET",
+                "GenericClient/1.0",
+                headers,
+                lease,
+                SourceTransportBehavior.FileBody);
+
+        Assert.AreEqual(GatewayTransport.MaximumRedirectLeases, transport.DirectRouteCount);
+        Assert.IsFalse(transport.TryGetDirectRoute(
+            source, "direct-context-0", "GET", "GenericClient/1.0", headers, out _));
+        Assert.IsTrue(transport.TryGetDirectRoute(
+            source,
+            "direct-context-" + GatewayTransport.MaximumRedirectLeases,
+            "GET",
+            "GenericClient/1.0",
+            headers,
+            out _));
+    }
+
+    [TestMethod]
+    public async Task Transport_RemembersAdaptiveRelayFallbackOnlyForTheMatchingContext()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var server = ServeAsync(listener, new List<string>(), new[]
+        {
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        });
+        using var transport = new GatewayTransport(new RedirectPolicy(), new ManualClock());
+        var source = new Uri($"http://127.0.0.1:{port}/media");
+        var headers = new Dictionary<string, string>();
+
+        using (var lease = await transport.OpenAsync(
+                   source, "direct-context", "GET", "GenericClient/1.0", headers,
+                   CreateOptions(), CancellationToken.None))
+            transport.RememberDirectRelay(
+                "direct-context", "GET", "GenericClient/1.0", headers, lease);
+        await server;
+
+        Assert.IsTrue(transport.TryGetDirectRoute(
+            source, "direct-context", "GET", "GenericClient/1.0", headers, out var route));
+        Assert.IsTrue(route.RelayRequired);
+        Assert.IsFalse(transport.TryGetDirectRoute(
+            source, "direct-context", "GET", "AnotherClient/1.0", headers, out _));
+    }
+
+    [TestMethod]
     public async Task Transport_ReResolvesWhenATicketLeaseReturnsTheWrongRange()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -224,6 +423,7 @@ public sealed class GatewayTransportTests
                    options, CancellationToken.None))
         {
             Assert.IsFalse(second.UsedCachedRedirect);
+            Assert.IsTrue(second.RetriedRejectedRedirect);
             Assert.AreEqual("/media/new.mkv", second.EffectiveUri.AbsolutePath);
         }
         await server;
@@ -597,6 +797,50 @@ public sealed class GatewayTransportTests
     }
 
     [TestMethod]
+    public async Task Transport_DoesNotCacheARedirectWhoseFinalResponseIsAServerError()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var observed = new List<string>();
+        var server = ServeAsync(listener, observed, new[]
+        {
+            "HTTP/1.1 302 Found\r\nLocation: /media/unavailable.mkv\r\n" +
+            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nLocation: /media/available.mkv\r\n" +
+            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+            PartialContent("bytes 0-0/10", "x"),
+        });
+        using var transport = new GatewayTransport(new RedirectPolicy(), new ManualClock());
+        var source = new Uri($"http://127.0.0.1:{port}/start");
+        var headers = new Dictionary<string, string> { ["Range"] = "bytes=0-0" };
+
+        using (var first = await transport.OpenAsync(
+                   source, "ticket-one", "GET", null, headers, CreateOptions(), CancellationToken.None))
+        {
+            Assert.AreEqual(503, (int)first.Response.StatusCode);
+            Assert.IsFalse(first.UsedCachedRedirect);
+            Assert.IsFalse(first.RetriedRejectedRedirect);
+        }
+        Assert.AreEqual(0, transport.RedirectLeaseCount);
+
+        using (var second = await transport.OpenAsync(
+                   source, "ticket-one", "GET", null, headers, CreateOptions(), CancellationToken.None))
+        {
+            Assert.AreEqual(206, (int)second.Response.StatusCode);
+            Assert.IsFalse(second.UsedCachedRedirect);
+            Assert.AreEqual("/media/available.mkv", second.EffectiveUri.AbsolutePath);
+        }
+        await server;
+
+        CollectionAssert.AreEqual(
+            new[] { "/start", "/media/unavailable.mkv", "/start", "/media/available.mkv" },
+            observed.Select(RequestPath).ToArray());
+        Assert.AreEqual(1, transport.RedirectLeaseCount);
+    }
+
+    [TestMethod]
     public async Task Transport_ReturnsRejectedSecondRedirectWithoutAnotherRetry()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -814,6 +1058,38 @@ public sealed class GatewayTransportTests
                 PlaybackRoutingMode.RedirectOnly,
                 SourceTransportBehavior.HlsManifest,
                 PlaybackTicketPurpose.ServerFfmpeg));
+        Assert.AreEqual(
+            GatewayTransportPlan.RelayFile,
+            TransportPlanner.Create(
+                PlaybackRoutingMode.Adaptive,
+                SourceTransportBehavior.FileBody,
+                PlaybackTicketPurpose.DirectClient,
+                unstableRedirect: true));
+        Assert.AreEqual(
+            GatewayTransportPlan.Redirect,
+            TransportPlanner.Create(
+                PlaybackRoutingMode.RedirectOnly,
+                SourceTransportBehavior.FileBody,
+                PlaybackTicketPurpose.DirectClient,
+                unstableRedirect: true));
+
+        Assert.IsTrue(TransportPlanner.CanHandoffRedirect(200));
+        Assert.IsTrue(TransportPlanner.CanHandoffRedirect(206));
+        Assert.IsFalse(TransportPlanner.CanHandoffRedirect(204));
+        Assert.IsFalse(TransportPlanner.CanHandoffRedirect(503));
+        Assert.IsTrue(TransportPlanner.RequiresAdaptiveRelay(503, retriedRejectedRedirect: false));
+        Assert.IsTrue(TransportPlanner.RequiresAdaptiveRelay(403, retriedRejectedRedirect: false));
+        Assert.IsTrue(TransportPlanner.RequiresAdaptiveRelay(206, retriedRejectedRedirect: true));
+        Assert.IsFalse(TransportPlanner.RequiresAdaptiveRelay(206, retriedRejectedRedirect: false));
+        Assert.IsFalse(TransportPlanner.RequiresAdaptiveRelay(416, retriedRejectedRedirect: false));
+        Assert.IsTrue(TransportPlanner.ShouldUseAdaptiveRelay(
+            rememberedRelay: true,
+            statusCode: 206,
+            retriedRejectedRedirect: false));
+        Assert.IsFalse(TransportPlanner.ShouldUseAdaptiveRelay(
+            rememberedRelay: false,
+            statusCode: 206,
+            retriedRejectedRedirect: false));
     }
 
     private static PluginConfiguration CreateOptions() => new()
