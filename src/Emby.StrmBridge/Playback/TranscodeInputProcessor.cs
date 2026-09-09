@@ -5,7 +5,10 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Emby.StrmBridge.Configuration;
 using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Policy;
@@ -14,6 +17,8 @@ using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.IO;
 using MediaBrowser.Model.Logging;
 using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Services;
@@ -58,12 +63,26 @@ internal sealed class TranscodeInputProcessor
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.localApiUrlProvider = localApiUrlProvider ??
             throw new ArgumentNullException(nameof(localApiUrlProvider));
+        Jobs = new TranscodeJobCoordinator(runtime.Clock, logger);
     }
 
-    internal bool TryRoute(object service, object state)
+    internal TranscodeJobCoordinator Jobs { get; }
+
+    internal bool TryRoute(object service, object state) => TryRoute(service, state, out _, out _, out _);
+
+    private bool TryRoute(
+        object service,
+        object state,
+        out string? retryKey,
+        out TranscodeInputResources? resources,
+        out Action? rollbackStart)
     {
+        retryKey = null;
+        resources = null;
+        rollbackStart = null;
         if (service is null || state is null) return false;
         string? issuedTicket = null;
+        TranscodeInputResources? issuedResources = null;
         object? originalStateMediaSource = null;
         object? originalMediaPath = null;
         object? originalDirectMediaPath = null;
@@ -88,6 +107,8 @@ internal sealed class TranscodeInputProcessor
             var requestedItem = ResolveItem(GetStringProperty(request, "Id"));
             var sourceItem = ResolveItem(currentMediaSource.ItemId) ?? requestedItem;
             if (requestedItem is null || sourceItem is null ||
+                !PlaybackItemPolicy.IsVideo(requestedItem) ||
+                !PlaybackItemPolicy.IsVideo(sourceItem) ||
                 !IsIncludedLibraryItem(requestedItem, options.IncludedLibraryIds) ||
                 !IsIncludedStrmItem(sourceItem, options.IncludedLibraryIds))
                 return false;
@@ -95,8 +116,7 @@ internal sealed class TranscodeInputProcessor
             SourceIdentity source;
             try { source = runtime.SourcePolicy.Read(sourceItem.Path); }
             catch (SourcePolicyException) { return false; }
-            if (!StaticMediaSourcePolicy.Matches(mediaSourceManager, sourceItem, source) ||
-                !StaticMediaSourcePolicy.MatchesPlaybackSource(currentMediaSource, source))
+            if (!StaticMediaSourcePolicy.Matches(mediaSourceManager, sourceItem, source))
                 return false;
 
             string? localApiUrl;
@@ -108,8 +128,24 @@ internal sealed class TranscodeInputProcessor
             }
 
             var operation = runtime.BeginOperation();
-            var userId = GetUserId(GetProperty(state, "AuthorizationInfo"));
+            var userId = GetUserId(state);
             var startTimeTicks = GetLongProperty(request, "StartTimeTicks");
+            var serviceRequest = GetProperty(service, "Request") as IRequest;
+            var container = string.IsNullOrWhiteSpace(currentMediaSource.Container)
+                ? Path.GetExtension(source.SourceUri.AbsolutePath).TrimStart('.')
+                : currentMediaSource.Container;
+            if (!StaticMediaSourcePolicy.MatchesPlaybackSource(currentMediaSource, source) &&
+                !MatchesRoutedInput(currentMediaSource, source, sourceItem.Id, mediaSourceId, userId,
+                    operation.Generation, localApiUrl, serviceRequest, container))
+                return false;
+            if (options.EnableFastSeek && options.PlaybackMode == PlaybackRoutingMode.Adaptive &&
+                startTimeTicks >= FastSeekCoordinator.MinimumTarget.Ticks &&
+                IsTransportStreamCandidate(currentMediaSource, source))
+            {
+                retryKey = CreateRetryKey(source, currentMediaSource, request, userId, startTimeTicks.Value,
+                    GetProperty(state, "VideoStream") as MediaStream);
+                Jobs.CheckRetry(retryKey, operation.Generation);
+            }
             var fastSeekDurationTicks = TryPrepareFastSeek(
                 source,
                 sourceItem,
@@ -118,32 +154,44 @@ internal sealed class TranscodeInputProcessor
                 startTimeTicks,
                 options,
                 operation,
-                GetProperty(service, "Request") as IRequest);
-            var container = string.IsNullOrWhiteSpace(currentMediaSource.Container)
-                ? Path.GetExtension(source.SourceUri.AbsolutePath).TrimStart('.')
-                : currentMediaSource.Container;
+                serviceRequest,
+                GetProperty(state, "VideoStream") as MediaStream,
+                out var videoSelection);
+            if (!runtime.IsOperationCurrent(operation.Generation)) return false;
+            issuedTicket = runtime.Tickets.IssuePlayback(
+                sourceItem.Id,
+                currentMediaSource.Id ?? mediaSourceId,
+                userId,
+                source,
+                PlaybackTicketPurpose.ServerFfmpeg,
+                operation.Generation,
+                TicketStore.ComputePlaybackLifetime(
+                    currentMediaSource.RunTimeTicks ?? sourceItem.RunTimeTicks));
+            var route = GatewayRouteBuilder.CreateInternalPlaybackRoute(
+                localApiUrl,
+                GatewayRouteBuilder.GetApiPathBase(serviceRequest),
+                issuedTicket,
+                container);
+            if (route is null)
+                throw new InvalidOperationException("The local gateway origin is unavailable.");
+            if (!runtime.Tickets.TryInspect(issuedTicket, out var issuedPayload) || issuedPayload is null)
+                throw new InvalidOperationException("The transcode input ticket is unavailable.");
+            issuedResources = new TranscodeInputResources(
+                runtime,
+                logger,
+                route,
+                issuedTicket,
+                issuedPayload);
+            if (serviceRequest?.CancellationToken.IsCancellationRequested == true)
+            {
+                issuedResources.Release();
+                return false;
+            }
             if (!runtime.TryCommit(
                     operation.Generation,
                     () => true,
                     () =>
                     {
-                        issuedTicket = runtime.Tickets.IssuePlayback(
-                            sourceItem.Id,
-                            currentMediaSource.Id ?? mediaSourceId,
-                            userId,
-                            source,
-                            PlaybackTicketPurpose.ServerFfmpeg,
-                            operation.Generation,
-                            TicketStore.ComputePlaybackLifetime(
-                                currentMediaSource.RunTimeTicks ?? sourceItem.RunTimeTicks));
-                        var route = GatewayRouteBuilder.CreateInternalPlaybackRoute(
-                            localApiUrl,
-                            GatewayRouteBuilder.GetApiPathBase(GetProperty(service, "Request") as IRequest),
-                            issuedTicket,
-                            container);
-                        if (route is null)
-                            throw new InvalidOperationException("The local gateway origin is unavailable.");
-
                         originalStateMediaSource = currentMediaSource;
                         originalMediaPath = GetProperty(state, "MediaPath");
                         originalDirectMediaPath = GetProperty(state, "DirectMediaPath");
@@ -171,13 +219,28 @@ internal sealed class TranscodeInputProcessor
                                 fastSeekDurationTicks.Value,
                                 operation.Generation,
                                 route,
-                                options);
+                                options,
+                                videoSelection,
+                                issuedTicket);
                     }))
+            {
+                issuedResources.Release();
                 return false;
+            }
 
+            resources = issuedResources;
+            rollbackStart = () => RestoreState(
+                state,
+                mutated,
+                originalStateMediaSource,
+                originalMediaPath,
+                originalDirectMediaPath,
+                originalMediaProtocol,
+                originalDirectMediaProtocol);
             logger.Debug("STRM_BRIDGE_TRANSCODE_INPUT_ROUTED item=" + ShortId(sourceItem.Id));
             return true;
         }
+        catch (TranscodeStartRejectedException) { throw; }
         catch (TicketCapacityException)
         {
             RestoreState(
@@ -188,7 +251,8 @@ internal sealed class TranscodeInputProcessor
                 originalDirectMediaPath,
                 originalMediaProtocol,
                 originalDirectMediaProtocol);
-            if (issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
+            if (issuedResources is not null) issuedResources.Release();
+            else if (issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
             logger.Warn("STRM_BRIDGE_TRANSCODE_INPUT_CAPACITY");
             return false;
         }
@@ -202,10 +266,87 @@ internal sealed class TranscodeInputProcessor
                 originalDirectMediaPath,
                 originalMediaProtocol,
                 originalDirectMediaProtocol);
-            if (issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
+            if (issuedResources is not null) issuedResources.Release();
+            else if (issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
             logger.Debug("STRM_BRIDGE_TRANSCODE_INPUT_SKIPPED error=" + exception.GetType().Name);
             return false;
         }
+    }
+
+    internal TranscodeJobCoordinator.Attempt? BeforeStart(object service, object state, string outputPath)
+    {
+        var startedAt = runtime.Clock.UtcNow;
+        if (!TryRoute(service, state, out var retryKey, out var resources, out var rollbackStart))
+        {
+            Jobs.ObserveUnmanagedStart(outputPath);
+            return null;
+        }
+        try
+        {
+            var source = (MediaSourceInfo)GetProperty(state, "MediaSource")!;
+            return Jobs.Register(
+                source,
+                outputPath,
+                retryKey,
+                runtime.Generation,
+                startedAt,
+                resources!.Release,
+                rollbackStart);
+        }
+        catch
+        {
+            try { rollbackStart?.Invoke(); }
+            catch (Exception exception)
+            {
+                logger.Warn("STRM_BRIDGE_TRANSCODE_START_ROLLBACK_FAILED error=" + exception.GetType().Name);
+            }
+            resources!.Release();
+            throw;
+        }
+    }
+
+    internal static void SetRetryAfter(object service, int seconds)
+    {
+        if (GetProperty(service, "Request") is not IRequest request) return;
+        request.Response?.AddHeader("Retry-After", seconds.ToString(CultureInfo.InvariantCulture));
+    }
+
+    internal bool TryCleanup(object manager, object job, int retryCount, int delayMilliseconds, out Task? task)
+    {
+        task = null;
+        if (GetProperty(job, "MediaSource") is not MediaSourceInfo source ||
+            GetProperty(job, "Path") is not string path || !Jobs.TryGetOwner(source, path, out var attempt))
+            return false;
+        var type = GetProperty(job, "Type");
+        var activeMethod = type is null ? null : manager.GetType().GetMethod("GetTranscodingJob",
+            new[] { typeof(string), type.GetType() });
+        var fileSystem = manager.GetType().GetField("_fileSystem",
+            BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(manager) as IFileSystem;
+        if (fileSystem is null || activeMethod is null) return false;
+        task = Jobs.CleanupAsync(attempt!, retryCount, delayMilliseconds,
+            directory => fileSystem.DeleteDirectory(directory, true),
+            output => activeMethod.Invoke(manager, new[] { output, type }) is not null);
+        return true;
+    }
+
+    private static string? CreateRetryKey(SourceIdentity source, MediaSourceInfo mediaSource,
+        object? request, string? userId, long targetTicks, MediaStream? selectedVideo)
+    {
+        var session = GetStringProperty(request, "PlaySessionId");
+        var device = GetStringProperty(request, "DeviceId");
+        if (string.IsNullOrWhiteSpace(session) && string.IsNullOrWhiteSpace(device)) return null;
+        var parts = new[]
+        {
+            source.SourceFingerprint, mediaSource.Id, userId, device, session,
+            source.LocalFileLength.ToString(CultureInfo.InvariantCulture),
+            source.LocalLastWriteUtc.UtcTicks.ToString(CultureInfo.InvariantCulture),
+            selectedVideo?.Index.ToString(CultureInfo.InvariantCulture) ?? GetStringProperty(request, "VideoStreamIndex"),
+            mediaSource.RunTimeTicks?.ToString(CultureInfo.InvariantCulture),
+            (targetTicks / TimeSpan.TicksPerSecond).ToString(CultureInfo.InvariantCulture),
+        };
+        using var hash = SHA256.Create();
+        return Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(string.Concat(
+            parts.Select(value => (value?.Length ?? 0).ToString(CultureInfo.InvariantCulture) + ":" + value)))));
     }
 
     private BaseItem? ResolveItem(string? itemId)
@@ -230,9 +371,27 @@ internal sealed class TranscodeInputProcessor
             allowed.Contains(folder.Id.ToString("N")) || allowed.Contains(folder.Id.ToString()));
     }
 
-    private static string? GetUserId(object? authorizationInfo)
+    private bool MatchesRoutedInput(MediaSourceInfo mediaSource, SourceIdentity source, Guid itemId,
+        string mediaSourceId, string? userId, int generation, string? localApiUrl, IRequest? request, string? container)
     {
-        var id = GetProperty(GetProperty(authorizationInfo, "User"), "Id");
+        if (mediaSource.RequiresOpening || !string.IsNullOrEmpty(mediaSource.OpenToken) ||
+            mediaSource.RequiredHttpHeaders?.Count > 0 ||
+            string.IsNullOrEmpty(mediaSource.Path) || mediaSource.Path.Length > 2048 ||
+            !string.Equals(mediaSource.Path, mediaSource.ProbePath, StringComparison.Ordinal))
+            return false;
+        var segments = mediaSource.Path.Split('/');
+        if (segments.Length < 2) return false;
+        var ticket = segments[^2];
+        var expected = GatewayRouteBuilder.CreateInternalPlaybackRoute(localApiUrl,
+            GatewayRouteBuilder.GetApiPathBase(request), ticket, container);
+        return string.Equals(mediaSource.Path, expected, StringComparison.Ordinal) &&
+               runtime.Tickets.MatchesTranscodeInput(ticket, itemId, mediaSourceId, userId, source, generation);
+    }
+
+    private static string? GetUserId(object state)
+    {
+        var user = GetProperty(state, "User") ?? GetProperty(GetProperty(state, "AuthorizationInfo"), "User");
+        var id = GetProperty(user, "Id");
         return id is Guid guid ? guid.ToString("N") : id?.ToString();
     }
 
@@ -277,15 +436,24 @@ internal sealed class TranscodeInputProcessor
         long? startTimeTicks,
         PluginConfiguration options,
         OperationContext operation,
-        IRequest? serviceRequest)
+        IRequest? serviceRequest,
+        MediaStream? selectedVideo,
+        out FastSeekVideoSelection? videoSelection)
     {
+        videoSelection = null;
         var fastSeek = runtime.FastSeek;
         var durationTicks = mediaSource.RunTimeTicks ?? sourceItem.RunTimeTicks;
-        if (fastSeek is null || options.PlaybackMode != PlaybackRoutingMode.Adaptive ||
+        if (fastSeek is null || !options.EnableFastSeek ||
+            options.PlaybackMode != PlaybackRoutingMode.Adaptive ||
             !startTimeTicks.HasValue || startTimeTicks.Value < FastSeekCoordinator.MinimumTarget.Ticks ||
             !durationTicks.HasValue || durationTicks.Value <= startTimeTicks.Value ||
             !IsTransportStreamCandidate(mediaSource, source))
             return null;
+        if (!FastSeekVideoSelection.TryCreate(mediaSource, selectedVideo, out videoSelection))
+        {
+            logger.Debug("STRM_BRIDGE_FAST_SEEK_SKIPPED reason=streamselection");
+            return null;
+        }
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
             operation.CancellationToken,
             serviceRequest?.CancellationToken ?? CancellationToken.None);
@@ -296,7 +464,8 @@ internal sealed class TranscodeInputProcessor
                 durationTicks.Value,
                 operation.Generation,
                 options,
-                cancellation.Token)
+                cancellation.Token,
+                videoSelection)
             .GetAwaiter()
             .GetResult();
         return prepared ? durationTicks.Value : null;
@@ -335,4 +504,43 @@ internal sealed class TranscodeInputProcessor
     }
 
     private static string ShortId(Guid itemId) => itemId.ToString("N").Substring(0, 8);
+
+    private sealed class TranscodeInputResources
+    {
+        private readonly PluginRuntime runtime;
+        private readonly ILogger logger;
+        private readonly string inputUrl;
+        private readonly string ticket;
+        private readonly TicketPayload payload;
+        private int released;
+
+        public TranscodeInputResources(
+            PluginRuntime runtime,
+            ILogger logger,
+            string inputUrl,
+            string ticket,
+            TicketPayload payload)
+        {
+            this.runtime = runtime;
+            this.logger = logger;
+            this.inputUrl = inputUrl;
+            this.ticket = ticket;
+            this.payload = payload;
+        }
+
+        public void Release()
+        {
+            if (Interlocked.Exchange(ref released, 1) != 0) return;
+            try { runtime.FastSeek?.DisableInput(inputUrl, ticket, payload); }
+            catch (Exception exception)
+            {
+                logger.Warn("STRM_BRIDGE_FAST_SEEK_RELEASE_FAILED error=" + exception.GetType().Name);
+            }
+            try { runtime.Tickets.Revoke(ticket); }
+            catch (Exception exception)
+            {
+                logger.Warn("STRM_BRIDGE_TRANSCODE_TICKET_REVOKE_FAILED error=" + exception.GetType().Name);
+            }
+        }
+    }
 }

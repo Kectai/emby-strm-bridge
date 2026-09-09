@@ -9,12 +9,38 @@ namespace Emby.StrmBridge.Tests;
 public sealed class PluginRuntimeTests
 {
     [TestMethod]
+    public async Task MediaCommit_DoesNotBlockPlaybackSnapshotsAndFencesInvalidation()
+    {
+        using var runtime = new PluginRuntime();
+        using var release = new ManualResetEventSlim();
+        var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var operation = runtime.BeginOperation();
+        var commit = Task.Run(() => runtime.TryCommitMediaInfo(operation.Generation, () => true, () =>
+        {
+            started.TrySetResult(true);
+            if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+        }));
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            await Task.Run(() => runtime.GetOptionsSnapshot()).WaitAsync(TimeSpan.FromSeconds(2));
+            await Task.Run(() => runtime.BeginOperation()).WaitAsync(TimeSpan.FromSeconds(2));
+            var invalidate = Task.Run(() => runtime.ClearSensitiveState());
+            Assert.IsFalse(invalidate.IsCompleted);
+            release.Set();
+            Assert.IsTrue(await commit.WaitAsync(TimeSpan.FromSeconds(5)));
+            await invalidate.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.IsFalse(runtime.TryCommitMediaInfo(operation.Generation, () => true, () => Assert.Fail()));
+        }
+        finally { release.Set(); }
+    }
+
+    [TestMethod]
     public void DetectedRedirectHost_IsIgnoredAfterDisableOrDispose()
     {
         using var workspace = new TestWorkspace();
         var runtime = new PluginRuntime();
-        runtime.Initialize(workspace.Path, new ManualClock(), new StubRedirectClient((_, _, _, _) =>
-            Task.FromResult(new RedirectSourceResponse(404, null, null))));
+        runtime.Initialize(workspace.Path, new ManualClock());
         runtime.UpdateOptions(new PluginConfiguration { Enabled = false }, invalidateSensitiveState: true);
 
         runtime.RecordDetectedRedirectHost("disabled.invalid");
@@ -43,36 +69,11 @@ public sealed class PluginRuntimeTests
     }
 
     [TestMethod]
-    public async Task RedirectRejection_PublishesOnlyTheTargetHostToConfigurationCandidates()
-    {
-        using var workspace = new TestWorkspace();
-        using var runtime = new PluginRuntime();
-        runtime.Initialize(
-            workspace.Path,
-            new ManualClock(),
-            new StubRedirectClient((_, _, _, _) => Task.FromResult(
-                new Emby.StrmBridge.Playback.RedirectSourceResponse(
-                    302,
-                    "https://detected.invalid/private/path?credential=not-retained",
-                    null))));
-
-        var exception = await Assert.ThrowsExactlyAsync<Emby.StrmBridge.Policy.RedirectRejectedException>(() =>
-            runtime.Redirects!.ResolveForProbeAsync(TestSources.Create(), null, CancellationToken.None));
-
-        Assert.AreEqual(Emby.StrmBridge.Policy.RedirectRejectionReason.UntrustedTargetHost, exception.Reason);
-        CollectionAssert.AreEqual(new[] { "detected.invalid" }, runtime.GetDetectedRedirectHosts());
-    }
-
-    [TestMethod]
     public void ClearSensitiveState_CancelsOldGenerationAndRejectsLateCommit()
     {
         using var workspace = new TestWorkspace();
         using var runtime = new PluginRuntime();
-        runtime.Initialize(
-            workspace.Path,
-            new ManualClock(),
-            new StubRedirectClient((_, _, _, _) =>
-                Task.FromResult(new Emby.StrmBridge.Playback.RedirectSourceResponse(404, null, null))));
+        runtime.Initialize(workspace.Path, new ManualClock());
         var operation = runtime.BeginOperation();
         var committed = false;
 
@@ -89,11 +90,7 @@ public sealed class PluginRuntimeTests
     {
         using var workspace = new TestWorkspace();
         using var runtime = new PluginRuntime();
-        runtime.Initialize(
-            workspace.Path,
-            new ManualClock(),
-            new StubRedirectClient((_, _, _, _) =>
-                Task.FromResult(new Emby.StrmBridge.Playback.RedirectSourceResponse(404, null, null))));
+        runtime.Initialize(workspace.Path, new ManualClock());
         var operation = runtime.BeginOperation();
         var ticket = runtime.Tickets.IssuePlayback(
             Guid.NewGuid(),
@@ -136,11 +133,7 @@ public sealed class PluginRuntimeTests
     {
         using var workspace = new TestWorkspace();
         using var runtime = new PluginRuntime();
-        runtime.Initialize(
-            workspace.Path,
-            new ManualClock(),
-            new StubRedirectClient((_, _, _, _) =>
-                Task.FromResult(new RedirectSourceResponse(404, null, null))));
+        runtime.Initialize(workspace.Path, new ManualClock());
         runtime.InitializeFastSeek(
             FastSeekCoordinatorTests.CreateLogger(),
             new SyntheticFastSeekProbeClient());

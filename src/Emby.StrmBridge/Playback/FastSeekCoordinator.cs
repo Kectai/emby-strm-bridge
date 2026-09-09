@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Emby.StrmBridge.Configuration;
@@ -13,46 +15,30 @@ namespace Emby.StrmBridge.Playback;
 internal sealed class FastSeekPlan
 {
     public FastSeekPlan(
-        string sourceFingerprint,
-        string mediaSourceId,
         long targetTimeTicks,
         long totalLength,
         long byteOffset,
         int packetStride,
-        long packetOrigin,
-        int pcrPid,
-        long timelineOriginPacketOffset,
-        long timelineOriginClock27Mhz,
-        double byteRate,
         long durationTicks,
         TimeSpan relativeSeek,
         int probeCount,
         int runtimeGeneration,
-        DateTimeOffset createdAtUtc,
-        DateTimeOffset expiresAtUtc)
+        DateTimeOffset expiresAtUtc,
+        int? videoStreamIndex = null,
+        FastSeekRepresentation? representation = null)
     {
-        SourceFingerprint = sourceFingerprint;
-        MediaSourceId = mediaSourceId;
         TargetTimeTicks = targetTimeTicks;
         TotalLength = totalLength;
         ByteOffset = byteOffset;
         PacketStride = packetStride;
-        PacketOrigin = packetOrigin;
-        PcrPid = pcrPid;
-        TimelineOriginPacketOffset = timelineOriginPacketOffset;
-        TimelineOriginClock27Mhz = timelineOriginClock27Mhz;
-        ByteRate = byteRate;
         DurationTicks = durationTicks;
         RelativeSeek = relativeSeek;
         ProbeCount = probeCount;
         RuntimeGeneration = runtimeGeneration;
-        CreatedAtUtc = createdAtUtc;
         ExpiresAtUtc = expiresAtUtc;
+        VideoStreamIndex = videoStreamIndex;
+        Representation = representation;
     }
-
-    public string SourceFingerprint { get; }
-
-    public string MediaSourceId { get; }
 
     public long TargetTimeTicks { get; }
 
@@ -62,16 +48,6 @@ internal sealed class FastSeekPlan
 
     public int PacketStride { get; }
 
-    public long PacketOrigin { get; }
-
-    public int PcrPid { get; }
-
-    public long TimelineOriginPacketOffset { get; }
-
-    public long TimelineOriginClock27Mhz { get; }
-
-    public double ByteRate { get; }
-
     public long DurationTicks { get; }
 
     public TimeSpan RelativeSeek { get; }
@@ -80,18 +56,26 @@ internal sealed class FastSeekPlan
 
     public int RuntimeGeneration { get; }
 
-    public DateTimeOffset CreatedAtUtc { get; }
-
     public DateTimeOffset ExpiresAtUtc { get; }
+
+    public int? VideoStreamIndex { get; }
+
+    public FastSeekRepresentation? Representation { get; }
 }
 
 internal sealed class FastSeekProbeResult
 {
-    public FastSeekProbeResult(long rangeStart, long totalLength, byte[] bytes)
+    public FastSeekProbeResult(long rangeStart, long totalLength, byte[] bytes,
+        FastSeekRepresentation? representation = null,
+        TimeSpan? setupDuration = null,
+        TimeSpan? bodyDuration = null)
     {
         RangeStart = rangeStart;
         TotalLength = totalLength;
         Bytes = bytes ?? throw new ArgumentNullException(nameof(bytes));
+        Representation = representation;
+        SetupDuration = setupDuration;
+        BodyDuration = bodyDuration;
     }
 
     public long RangeStart { get; }
@@ -99,6 +83,12 @@ internal sealed class FastSeekProbeResult
     public long TotalLength { get; }
 
     public byte[] Bytes { get; }
+
+    public FastSeekRepresentation? Representation { get; }
+
+    public TimeSpan? SetupDuration { get; }
+
+    public TimeSpan? BodyDuration { get; }
 }
 
 internal interface IFastSeekProbeClient
@@ -139,16 +129,18 @@ internal sealed class GatewayFastSeekProbeClient : IFastSeekProbeClient
             ["Accept"] = "*/*",
         };
         var scope = GatewayTransport.CreateRedirectCandidateScope(source);
+        var stopwatch = Stopwatch.StartNew();
         using var lease = await transport.OpenProbeAsync(
                 source.SourceUri,
                 scope,
                 scope,
                 "GET",
-                null,
+                GatewayTransport.ProbeUserAgent,
                 headers,
                 options,
                 cancellationToken)
             .ConfigureAwait(false);
+        var setupDuration = stopwatch.Elapsed;
         var response = lease.Response;
         var contentRange = response.Content.Headers.ContentRange;
         if (response.StatusCode != HttpStatusCode.PartialContent ||
@@ -164,10 +156,14 @@ internal sealed class GatewayFastSeekProbeClient : IFastSeekProbeClient
         if (expectedLength > maximumBytes ||
             response.Content.Headers.ContentLength is long contentLength && contentLength != expectedLength)
             throw new FastSeekProbeException(FastSeekSkipReason.RangeResponse);
+        var bodyStart = stopwatch.Elapsed;
         var prefix = await lease.PeekPrefixAsync((int)expectedLength, cancellationToken).ConfigureAwait(false);
+        var bodyDuration = stopwatch.Elapsed - bodyStart;
         if (prefix.Length != expectedLength)
             throw new FastSeekProbeException(FastSeekSkipReason.TruncatedSample);
-        return new FastSeekProbeResult(offset, contentRange.Length.Value, prefix.ToArray());
+        FastSeekRepresentation.TryCreate(response, out var representation);
+        return new FastSeekProbeResult(offset, contentRange.Length.Value, prefix.ToArray(), representation,
+            setupDuration, bodyDuration);
     }
 }
 
@@ -177,12 +173,15 @@ internal enum FastSeekSkipReason
     TruncatedSample,
     TransportStructure,
     PcrMissing,
+    StreamSelection,
+    RandomAccessMissing,
     Timeline,
     ByteRate,
     Correction,
     Capacity,
     Cancelled,
     Unavailable,
+    Representation,
 }
 
 internal sealed class FastSeekProbeException : Exception
@@ -196,22 +195,29 @@ internal sealed class FastSeekProbeException : Exception
 internal sealed class FastSeekCoordinator
 {
     public static readonly TimeSpan PlanLifetime = TimeSpan.FromMinutes(2);
+    public static readonly TimeSpan FailureLifetime = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan PreRoll = TimeSpan.FromSeconds(4);
+    public static readonly TimeSpan TargetScanDuration = FastSeekBudgetPolicy.TargetScanDuration;
     public static readonly TimeSpan MinimumTarget = TimeSpan.FromSeconds(10);
     public static readonly TimeSpan MinimumRelativeSeek = TimeSpan.FromMilliseconds(250);
     public static readonly TimeSpan MaximumRelativeSeek = TimeSpan.FromSeconds(12);
     public static readonly TimeSpan MaximumInitialRelativeSeekWithoutCorrection = TimeSpan.FromSeconds(6);
-    public static readonly TimeSpan PreparationTimeout = TimeSpan.FromSeconds(5);
-    public const int MaximumProbeBytes = 512 * 1024;
+    public static readonly TimeSpan PreparationTimeout = FastSeekBudgetPolicy.PreparationTimeout;
+    public const int InitialProbeBytes = FastSeekBudgetPolicy.InitialProbeBytes;
+    public const int MaximumProbeBytes = FastSeekBudgetPolicy.MaximumProbeBytes;
+    public const int MaximumTargetScanBytes = FastSeekBudgetPolicy.MaximumTargetScanBytes;
+    public const int MaximumPreparationBytes = FastSeekBudgetPolicy.MaximumPreparationBytes;
+    public const int MaximumCorrections = FastSeekBudgetPolicy.MaximumCorrections;
     public const int MaximumPlans = 512;
     public const int MaximumPendingPreparations = 64;
     private const double MinimumByteRate = 16 * 1024;
     private const double MaximumByteRate = 250 * 1024 * 1024;
     private readonly object sync = new();
     private readonly Dictionary<PreparationKey, FastSeekPlan> prepared = new();
+    private readonly Dictionary<PreparationKey, FastSeekFailure> failed = new();
     private readonly Dictionary<string, FastSeekBinding> boundInputs = new(StringComparer.Ordinal);
     private readonly Dictionary<PreparationKey, PendingFastSeek> pending = new();
-    private readonly Dictionary<PreparationKey, PendingFastSeek> pendingBoundPlans = new();
+    private ConditionalWeakTable<TicketPayload, FastSeekRepresentation> activeRepresentations = new();
     private readonly IFastSeekProbeClient probeClient;
     private readonly IClock clock;
     private readonly ILogger logger;
@@ -248,7 +254,8 @@ internal sealed class FastSeekCoordinator
         long durationTicks,
         int runtimeGeneration,
         PluginConfiguration options,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        FastSeekVideoSelection? videoSelection = null)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (string.IsNullOrWhiteSpace(mediaSourceId) || targetTimeTicks < MinimumTarget.Ticks ||
@@ -260,18 +267,24 @@ internal sealed class FastSeekCoordinator
             return false;
         }
         var key = new PreparationKey(
-            source.SourceFingerprint,
+            source,
             mediaSourceId,
             targetTimeTicks,
             durationTicks,
-            runtimeGeneration);
-        PendingFastSeek entry;
+            runtimeGeneration,
+            videoSelection);
+        PendingFastSeek? entry = null;
+        FastSeekSkipReason? cachedFailure = null;
         var shouldStart = false;
         lock (sync)
         {
             RemoveExpiredUnsafe();
             if (prepared.ContainsKey(key)) return true;
-            if (!pending.TryGetValue(key, out entry!))
+            if (failed.TryGetValue(key, out var failure))
+            {
+                cachedFailure = failure.Reason;
+            }
+            else if (!pending.TryGetValue(key, out entry))
             {
                 if (pending.Count >= MaximumPendingPreparations)
                 {
@@ -282,57 +295,91 @@ internal sealed class FastSeekCoordinator
                 pending.Add(key, entry);
                 shouldStart = true;
             }
+            entry?.AddWaiter();
         }
 
-        if (shouldStart)
-            _ = CompleteInitialPreparationAsync(
-                key,
-                entry,
-                source,
-                mediaSourceId,
-                targetTimeTicks,
-                durationTicks,
-                runtimeGeneration,
-                options);
+        if (cachedFailure.HasValue)
+        {
+            LogSkipped(cachedFailure.Value, cached: true);
+            return false;
+        }
+        if (entry is null) return false;
 
-        FastSeekPlan? plan;
         try
         {
-            plan = await AwaitWithCancellation(entry.Task, cancellationToken).ConfigureAwait(false);
+            if (shouldStart)
+                _ = CompleteInitialPreparationAsync(
+                    key,
+                    entry,
+                    source,
+                    targetTimeTicks,
+                    durationTicks,
+                    runtimeGeneration,
+                    options,
+                    videoSelection);
+
+            FastSeekPlan? plan;
+            try
+            {
+                using var waiterCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                    cancellationToken, entry.CancellationToken);
+                plan = await AwaitWithCancellation(entry.Task, waiterCancellation.Token).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                entry.ThrowIfExpired();
+            }
+            catch (OperationCanceledException)
+            {
+                LogSkipped(FastSeekSkipReason.Cancelled);
+                return false;
+            }
+            if (plan is null || plan.DurationTicks != durationTicks ||
+                runtimeGenerationProvider is not null && runtimeGenerationProvider() != plan.RuntimeGeneration)
+                return false;
+            return true;
         }
-        catch (OperationCanceledException)
+        finally
         {
-            LogSkipped(FastSeekSkipReason.Cancelled);
-            return false;
+            ReleaseWaiter(key, entry);
         }
-        if (plan is null || plan.DurationTicks != durationTicks ||
-            runtimeGenerationProvider is not null && runtimeGenerationProvider() != plan.RuntimeGeneration)
-            return false;
-        return true;
+    }
+
+    private void ReleaseWaiter(PreparationKey key, PendingFastSeek entry)
+    {
+        var cancel = false;
+        lock (sync)
+        {
+            if (!entry.RemoveWaiter() || entry.Task.IsCompleted ||
+                !pending.TryGetValue(key, out var current) || !ReferenceEquals(current, entry)) return;
+            pending.Remove(key);
+            cancel = true;
+        }
+        if (cancel) entry.Cancel();
     }
 
     private async Task CompleteInitialPreparationAsync(
         PreparationKey key,
         PendingFastSeek entry,
         SourceIdentity source,
-        string mediaSourceId,
         long targetTimeTicks,
         long durationTicks,
         int runtimeGeneration,
-        PluginConfiguration options)
+        PluginConfiguration options,
+        FastSeekVideoSelection? videoSelection)
     {
         FastSeekPlan? plan = null;
+        FastSeekSkipReason? failureReason = null;
         try
         {
             plan = await PrepareCoreAsync(
                     source,
-                    mediaSourceId,
                     targetTimeTicks,
                     durationTicks,
                     runtimeGeneration,
                     options,
-                    entry.CancellationToken)
+                    entry,
+                    videoSelection)
                 .ConfigureAwait(false);
+            entry.ThrowIfExpired();
             if (plan is not null && (runtimeGenerationProvider is null ||
                                     runtimeGenerationProvider() == plan.RuntimeGeneration))
             {
@@ -342,13 +389,15 @@ internal sealed class FastSeekCoordinator
                     RemoveExpiredUnsafe();
                     if (pending.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
                     {
+                        entry.ThrowIfExpired();
                         StorePreparedUnsafe(key, plan);
                         stored = true;
                     }
                 }
                 if (stored)
                     logger.Debug("STRM_BRIDGE_FAST_SEEK_READY packets=" + plan.PacketStride +
-                                 " probes=" + plan.ProbeCount);
+                                 " probes=" + plan.ProbeCount +
+                                 (plan.VideoStreamIndex.HasValue ? " video_index=" + plan.VideoStreamIndex.Value : string.Empty));
                 else
                     plan = null;
             }
@@ -357,18 +406,47 @@ internal sealed class FastSeekCoordinator
                 plan = null;
             }
         }
+        catch (FastSeekProbeException exception)
+        {
+            failureReason = exception.Reason;
+            plan = null;
+        }
+        catch (OperationCanceledException)
+        {
+            failureReason = FastSeekSkipReason.Cancelled;
+            plan = null;
+        }
         catch (Exception)
         {
-            LogSkipped(FastSeekSkipReason.Unavailable);
+            failureReason = FastSeekSkipReason.Unavailable;
             plan = null;
         }
         finally
         {
             lock (sync)
             {
+                if (entry.IsExpired)
+                {
+                    if (plan is not null && prepared.TryGetValue(key, out var stored) &&
+                        ReferenceEquals(stored, plan)) prepared.Remove(key);
+                    failureReason = FastSeekSkipReason.Cancelled;
+                    plan = null;
+                }
                 if (pending.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
+                {
                     pending.Remove(key);
+                    if (plan is not null)
+                    {
+                        failed.Remove(key);
+                    }
+                    else if (failureReason.HasValue && ShouldCacheFailure(failureReason.Value) &&
+                             !entry.UsedNetworkSizing)
+                    {
+                        StoreFailureUnsafe(key, failureReason.Value);
+                    }
+                }
             }
+            if (failureReason.HasValue) LogSkipped(failureReason.Value);
             entry.Complete(plan);
             entry.Dispose();
         }
@@ -381,24 +459,27 @@ internal sealed class FastSeekCoordinator
         long durationTicks,
         int runtimeGeneration,
         string inputUrl,
-        PluginConfiguration options)
+        PluginConfiguration options,
+        FastSeekVideoSelection? videoSelection = null,
+        string? ticket = null)
     {
         if (source is null || string.IsNullOrWhiteSpace(mediaSourceId) ||
             string.IsNullOrWhiteSpace(inputUrl) || inputUrl.Length > 2048 || options is null)
             return false;
         var key = new PreparationKey(
-            source.SourceFingerprint,
+            source,
             mediaSourceId,
             targetTimeTicks,
             durationTicks,
-            runtimeGeneration);
+            runtimeGeneration,
+            videoSelection);
         lock (sync)
         {
             RemoveExpiredUnsafe();
             if (!prepared.TryGetValue(key, out var plan)) return false;
             if (!boundInputs.ContainsKey(inputUrl) && boundInputs.Count >= MaximumPlans)
                 EvictOldestBindingUnsafe();
-            boundInputs[inputUrl] = new FastSeekBinding(source, options, plan);
+            boundInputs[inputUrl] = new FastSeekBinding(plan, key.ResourceKey, ticket);
             return true;
         }
     }
@@ -414,174 +495,100 @@ internal sealed class FastSeekCoordinator
         if (string.IsNullOrWhiteSpace(inputUrl) || inputUrl.Length > 2048 ||
             targetTimeTicks < MinimumTarget.Ticks)
             return false;
-        try
-        {
-            plan = GetBoundPlanAsync(
-                    inputUrl,
-                    runtimeGeneration,
-                    targetTimeTicks,
-                    cancellationToken)
-                .GetAwaiter()
-                .GetResult();
-            return plan is not null;
-        }
-        catch (OperationCanceledException)
-        {
-            LogSkipped(FastSeekSkipReason.Cancelled);
-            return false;
-        }
-        catch (Exception)
-        {
-            LogSkipped(FastSeekSkipReason.Unavailable);
-            return false;
-        }
-    }
-
-    private async Task<FastSeekPlan?> GetBoundPlanAsync(
-        string inputUrl,
-        int runtimeGeneration,
-        long targetTimeTicks,
-        CancellationToken cancellationToken)
-    {
         cancellationToken.ThrowIfCancellationRequested();
-        FastSeekBinding binding;
-        PreparationKey key;
-        PendingFastSeek entry;
-        var shouldStart = false;
         lock (sync)
         {
             RemoveExpiredUnsafe();
-            if (!boundInputs.TryGetValue(inputUrl, out binding!) ||
-                binding.Calibration.RuntimeGeneration != runtimeGeneration)
-                return null;
-            if (binding.Plans.TryGetValue(targetTimeTicks, out var cached))
-            {
-                return cached;
-            }
-            key = new PreparationKey(
-                binding.Calibration.SourceFingerprint,
-                binding.Calibration.MediaSourceId,
-                targetTimeTicks,
-                binding.Calibration.DurationTicks,
-                runtimeGeneration);
-            if (prepared.TryGetValue(key, out var shared))
-            {
-                if (IsCompatible(binding.Calibration, shared))
-                {
-                    binding.Store(shared);
-                    return shared;
-                }
-                prepared.Remove(key);
-            }
-            if (!pendingBoundPlans.TryGetValue(key, out entry!))
-            {
-                if (pendingBoundPlans.Count >= MaximumPendingPreparations)
-                {
-                    LogSkipped(FastSeekSkipReason.Capacity);
-                    return null;
-                }
-                entry = new PendingFastSeek(PreparationTimeout);
-                pendingBoundPlans.Add(key, entry);
-                shouldStart = true;
-            }
+            if (!boundInputs.TryGetValue(inputUrl, out var binding) ||
+                binding.Plan.RuntimeGeneration != runtimeGeneration ||
+                binding.Plan.TargetTimeTicks != targetTimeTicks)
+                return false;
+            plan = binding.Plan;
+            return true;
         }
-
-        if (shouldStart)
-            _ = CompleteBoundPreparationAsync(key, entry, binding, targetTimeTicks);
-
-        var plan = await AwaitWithCancellation(entry.Task, cancellationToken).ConfigureAwait(false);
-        if (plan is null || runtimeGenerationProvider is not null &&
-            runtimeGenerationProvider() != plan.RuntimeGeneration)
-            return null;
-        lock (sync)
-        {
-            RemoveExpiredUnsafe();
-            if (!boundInputs.TryGetValue(inputUrl, out var current) ||
-                !ReferenceEquals(current, binding) || !IsCompatible(current.Calibration, plan))
-                return null;
-            current.Store(plan);
-        }
-        return plan;
     }
 
-    private async Task CompleteBoundPreparationAsync(
-        PreparationKey key,
-        PendingFastSeek entry,
-        FastSeekBinding binding,
-        long targetTimeTicks)
+    internal bool TryActivateInput(string inputUrl, FastSeekPlan plan, TicketStore tickets,
+        out TicketPayload? ticket)
     {
-        FastSeekPlan? plan = null;
-        try
+        ticket = null;
+        FastSeekBinding binding;
+        lock (sync)
         {
-            plan = await PrepareBoundTargetCoreAsync(
-                    binding,
-                    targetTimeTicks,
-                    entry.CancellationToken)
-                .ConfigureAwait(false);
-            if (plan is not null && (runtimeGenerationProvider is null ||
-                                    runtimeGenerationProvider() == plan.RuntimeGeneration))
-            {
-                var stored = false;
-                lock (sync)
-                {
-                    RemoveExpiredUnsafe();
-                    if (pendingBoundPlans.TryGetValue(key, out var current) &&
-                        ReferenceEquals(current, entry))
-                    {
-                        StorePreparedUnsafe(key, plan);
-                        stored = true;
-                    }
-                }
-                if (stored)
-                    logger.Debug("STRM_BRIDGE_FAST_SEEK_READY packets=" + plan.PacketStride +
-                                 " probes=" + plan.ProbeCount);
-                else
-                    plan = null;
-            }
-            else
-            {
-                plan = null;
-            }
+            RemoveExpiredUnsafe();
+            if (!boundInputs.TryGetValue(inputUrl, out binding!) || !ReferenceEquals(binding.Plan, plan) ||
+                binding.Ticket is null || plan.Representation is null) return false;
         }
-        catch (Exception)
+        if (!tickets.TryInspect(binding.Ticket, out var payload) || payload is null ||
+            payload.Purpose != PlaybackTicketPurpose.ServerFfmpeg ||
+            payload.RuntimeGeneration != plan.RuntimeGeneration) return false;
+        lock (sync)
         {
-            LogSkipped(FastSeekSkipReason.Unavailable);
-            plan = null;
-        }
-        finally
-        {
-            lock (sync)
-            {
-                if (pendingBoundPlans.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
-                    pendingBoundPlans.Remove(key);
-            }
-            entry.Complete(plan);
-            entry.Dispose();
+            if (!boundInputs.TryGetValue(inputUrl, out var current) || !ReferenceEquals(current, binding)) return false;
+            activeRepresentations.Remove(payload);
+            activeRepresentations.Add(payload, plan.Representation);
+            ticket = payload;
+            return true;
         }
     }
 
-    private static bool IsCompatible(FastSeekPlan calibration, FastSeekPlan candidate) =>
-        string.Equals(calibration.SourceFingerprint, candidate.SourceFingerprint, StringComparison.Ordinal) &&
-        string.Equals(calibration.MediaSourceId, candidate.MediaSourceId, StringComparison.Ordinal) &&
-        calibration.TotalLength == candidate.TotalLength &&
-        calibration.PacketStride == candidate.PacketStride &&
-        calibration.PacketOrigin == candidate.PacketOrigin &&
-        calibration.PcrPid == candidate.PcrPid &&
-        calibration.TimelineOriginPacketOffset == candidate.TimelineOriginPacketOffset &&
-        calibration.TimelineOriginClock27Mhz == candidate.TimelineOriginClock27Mhz &&
-        calibration.DurationTicks == candidate.DurationTicks &&
-        calibration.RuntimeGeneration == candidate.RuntimeGeneration;
+    internal bool TryGetInputRepresentation(TicketPayload ticket, int runtimeGeneration,
+        out FastSeekRepresentation? representation)
+    {
+        representation = null;
+        lock (sync)
+            return ticket.Purpose == PlaybackTicketPurpose.ServerFfmpeg &&
+                   ticket.RuntimeGeneration == runtimeGeneration && clock.UtcNow < ticket.ExpiresAtUtc &&
+                   activeRepresentations.TryGetValue(ticket, out representation);
+    }
+
+    internal void DisableInput(string inputUrl, TicketPayload ticket)
+    {
+        lock (sync)
+        {
+            boundInputs.Remove(inputUrl);
+            activeRepresentations.Remove(ticket);
+        }
+    }
+
+    internal void DisableInput(string inputUrl, string ticket, TicketPayload payload)
+    {
+        lock (sync)
+        {
+            if (boundInputs.TryGetValue(inputUrl, out var binding) &&
+                string.Equals(binding.Ticket, ticket, StringComparison.Ordinal))
+                boundInputs.Remove(inputUrl);
+            activeRepresentations.Remove(payload);
+        }
+    }
+
+    internal void InvalidateSource(Uri source)
+    {
+        var resource = GatewayTransport.ResourceDigest(source);
+        PendingFastSeek[] active;
+        lock (sync)
+        {
+            active = pending.Where(pair => pair.Key.ResourceKey == resource).Select(pair => pair.Value).ToArray();
+            foreach (var key in pending.Keys.Where(key => key.ResourceKey == resource).ToArray()) pending.Remove(key);
+            foreach (var key in prepared.Keys.Where(key => key.ResourceKey == resource).ToArray()) prepared.Remove(key);
+            foreach (var key in failed.Keys.Where(key => key.ResourceKey == resource).ToArray()) failed.Remove(key);
+            foreach (var key in boundInputs.Where(pair => pair.Value.ResourceKey == resource).Select(pair => pair.Key).ToArray())
+                boundInputs.Remove(key);
+        }
+        foreach (var entry in active) entry.Cancel();
+    }
 
     public void Clear()
     {
         PendingFastSeek[] active;
         lock (sync)
         {
-            active = pending.Values.Concat(pendingBoundPlans.Values).Distinct().ToArray();
+            active = pending.Values.Distinct().ToArray();
             prepared.Clear();
+            failed.Clear();
             boundInputs.Clear();
+            activeRepresentations = new ConditionalWeakTable<TicketPayload, FastSeekRepresentation>();
             pending.Clear();
-            pendingBoundPlans.Clear();
         }
         foreach (var entry in active) entry.Cancel();
     }
@@ -598,333 +605,325 @@ internal sealed class FastSeekCoordinator
 
     private async Task<FastSeekPlan?> PrepareCoreAsync(
         SourceIdentity source,
-        string mediaSourceId,
         long targetTimeTicks,
         long durationTicks,
         int runtimeGeneration,
         PluginConfiguration options,
-        CancellationToken cancellationToken)
+        PendingFastSeek entry,
+        FastSeekVideoSelection? videoSelection)
     {
-        try
+        var cancellationToken = entry.CancellationToken;
+        var budget = new ProbeBudget(entry);
+        var firstProbe = await ReadProbeAsync(
+                source,
+                0,
+                InitialProbeBytes,
+                options,
+                budget,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (firstProbe.Representation is null || firstProbe.Representation.TotalLength != firstProbe.TotalLength)
+            throw new FastSeekProbeException(FastSeekSkipReason.Representation);
+        var analyzed = TransportStreamClockParser.TryAnalyze(
+                firstProbe.Bytes,
+                firstProbe.RangeStart,
+                null,
+                out var firstAnalysis);
+        entry.ThrowIfExpired();
+        if (!analyzed)
+            throw new FastSeekProbeException(FastSeekSkipReason.TransportStructure);
+        if (!firstAnalysis!.TrySelectVideo(videoSelection, out var randomAccessPid, out var clockPid,
+                out var program))
+            throw new FastSeekProbeException(FastSeekSkipReason.StreamSelection);
+        if (clockPid < 0 || !firstAnalysis.TryGetFirstPcr(clockPid, out var firstPcr))
+            throw new FastSeekProbeException(FastSeekSkipReason.PcrMissing);
+
+        var durationSeconds = TimeSpan.FromTicks(durationTicks).TotalSeconds;
+        var targetSeconds = TimeSpan.FromTicks(targetTimeTicks).TotalSeconds;
+        var desiredSeconds = targetSeconds - PreRoll.TotalSeconds;
+        var targetScanBytes = FastSeekBudgetPolicy.CalculateTargetScanBytes(
+            firstProbe.TotalLength,
+            durationSeconds,
+            firstAnalysis.Format.PacketStride);
+        budget.Configure(targetScanBytes);
+        logger.Debug("STRM_BRIDGE_FAST_SEEK_BUDGET scan_bytes=" + targetScanBytes +
+                     " preparation_bytes=" + budget.MaximumBytes);
+        var estimatedOffset = AlignAndClamp(
+            firstProbe.TotalLength * (desiredSeconds / durationSeconds),
+            firstAnalysis.Format,
+            firstProbe.TotalLength,
+            targetScanBytes);
+        var estimatedEvidence = await ReadTargetEvidenceAsync(
+                source,
+                estimatedOffset,
+                targetScanBytes,
+                firstProbe,
+                firstAnalysis.Format,
+                clockPid,
+                randomAccessPid,
+                program,
+                options,
+                budget,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        var estimatedSeconds = TransportStreamClockParser.SecondsBetween(
+            firstPcr.Clock27Mhz,
+            estimatedEvidence.Pcr.Clock27Mhz);
+        if (!IsFinitePositive(estimatedSeconds) || estimatedSeconds > durationSeconds * 1.25)
+            throw new FastSeekProbeException(FastSeekSkipReason.Timeline);
+        var byteDelta = estimatedEvidence.Pcr.PacketOffset - firstPcr.PacketOffset;
+        var byteRate = byteDelta / estimatedSeconds;
+        if (!IsFinitePositive(byteRate) || byteRate < MinimumByteRate || byteRate > MaximumByteRate)
+            throw new FastSeekProbeException(FastSeekSkipReason.ByteRate);
+
+        var estimatedIsValid = TryCalculateRelativeSeek(
+                targetSeconds,
+                firstPcr,
+                estimatedEvidence,
+                out var estimatedRelativeSeek);
+        if (estimatedIsValid && estimatedRelativeSeek <= MaximumInitialRelativeSeekWithoutCorrection)
         {
-            var firstProbe = await probeClient.ReadAsync(
-                    source, 0, MaximumProbeBytes, options, cancellationToken)
-                .ConfigureAwait(false);
-            if (!TransportStreamClockParser.TryAnalyze(
-                    firstProbe.Bytes,
-                    firstProbe.RangeStart,
-                    null,
-                    out var firstAnalysis))
-                throw new FastSeekProbeException(FastSeekSkipReason.TransportStructure);
-            var clockPid = firstAnalysis!.SelectClockPid();
-            if (clockPid < 0 || !firstAnalysis.TryGetFirstPcr(clockPid, out var firstPcr))
-                throw new FastSeekProbeException(FastSeekSkipReason.PcrMissing);
-
-            var durationSeconds = TimeSpan.FromTicks(durationTicks).TotalSeconds;
-            var targetSeconds = TimeSpan.FromTicks(targetTimeTicks).TotalSeconds;
-            var desiredSeconds = targetSeconds - PreRoll.TotalSeconds;
-            var estimatedOffset = AlignAndClamp(
-                firstProbe.TotalLength * (desiredSeconds / durationSeconds),
-                firstAnalysis.Format,
-                firstProbe.TotalLength);
-            var estimatedProbe = await probeClient.ReadAsync(
-                    source, estimatedOffset, ProbeLength(firstProbe.TotalLength, estimatedOffset), options,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            ValidateTotalLength(firstProbe, estimatedProbe);
-            if (!TransportStreamClockParser.TryAnalyze(
-                    estimatedProbe.Bytes,
-                    estimatedProbe.RangeStart,
-                    firstAnalysis.Format,
-                    out var estimatedAnalysis) ||
-                !estimatedAnalysis!.TryGetFirstPcr(clockPid, out var estimatedPcr))
-                throw new FastSeekProbeException(FastSeekSkipReason.PcrMissing);
-
-            var estimatedSeconds = TransportStreamClockParser.SecondsBetween(
-                firstPcr.Clock27Mhz,
-                estimatedPcr.Clock27Mhz);
-            if (!IsFinitePositive(estimatedSeconds) || estimatedSeconds > durationSeconds * 1.25)
-                throw new FastSeekProbeException(FastSeekSkipReason.Timeline);
-            var byteDelta = estimatedPcr.PacketOffset - firstPcr.PacketOffset;
-            var byteRate = byteDelta / estimatedSeconds;
-            if (!IsFinitePositive(byteRate) || byteRate < MinimumByteRate || byteRate > MaximumByteRate)
-                throw new FastSeekProbeException(FastSeekSkipReason.ByteRate);
-
-            if (TryCalculateRelativeSeek(
-                    targetSeconds,
-                    estimatedProbe,
-                    estimatedPcr,
-                    estimatedSeconds,
-                    byteRate,
-                    out var estimatedRelativeSeek) &&
-                estimatedRelativeSeek <= MaximumInitialRelativeSeekWithoutCorrection)
-            {
-                var estimatedPlanTime = clock.UtcNow;
-                return new FastSeekPlan(
-                    source.SourceFingerprint,
-                    mediaSourceId,
-                    targetTimeTicks,
-                    firstProbe.TotalLength,
-                    estimatedProbe.RangeStart,
-                    firstAnalysis.Format.PacketStride,
-                    firstAnalysis.Format.PacketOrigin,
-                    clockPid,
-                    firstPcr.PacketOffset,
-                    firstPcr.Clock27Mhz,
-                    byteRate,
-                    durationTicks,
-                    estimatedRelativeSeek,
-                    2,
-                    runtimeGeneration,
-                    estimatedPlanTime,
-                    estimatedPlanTime + PlanLifetime);
-            }
-
-            var correctedValue = estimatedPcr.PacketOffset + (desiredSeconds - estimatedSeconds) * byteRate;
-            var correctedOffset = AlignAndClamp(
-                correctedValue,
-                firstAnalysis.Format,
-                firstProbe.TotalLength);
-            var correctedProbe = await probeClient.ReadAsync(
-                    source, correctedOffset, ProbeLength(firstProbe.TotalLength, correctedOffset), options,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            ValidateTotalLength(firstProbe, correctedProbe);
-            if (!TransportStreamClockParser.TryAnalyze(
-                    correctedProbe.Bytes,
-                    correctedProbe.RangeStart,
-                    firstAnalysis.Format,
-                    out var correctedAnalysis) ||
-                !correctedAnalysis!.TryGetFirstPcr(clockPid, out var correctedPcr))
-                throw new FastSeekProbeException(FastSeekSkipReason.PcrMissing);
-            var correctedSeconds = TransportStreamClockParser.SecondsBetween(
-                firstPcr.Clock27Mhz,
-                correctedPcr.Clock27Mhz);
-            if (!TryCalculateRelativeSeek(
-                    targetSeconds,
-                    correctedProbe,
-                    correctedPcr,
-                    correctedSeconds,
-                    byteRate,
-                    out var relativeSeek))
-                throw new FastSeekProbeException(FastSeekSkipReason.Correction);
-
-            var now = clock.UtcNow;
+            var estimatedPlanTime = clock.UtcNow;
             return new FastSeekPlan(
-                source.SourceFingerprint,
-                mediaSourceId,
                 targetTimeTicks,
                 firstProbe.TotalLength,
-                correctedProbe.RangeStart,
+                estimatedEvidence.Anchor.PacketOffset,
                 firstAnalysis.Format.PacketStride,
-                firstAnalysis.Format.PacketOrigin,
-                clockPid,
-                firstPcr.PacketOffset,
-                firstPcr.Clock27Mhz,
-                byteRate,
                 durationTicks,
-                relativeSeek,
-                3,
+                estimatedRelativeSeek,
+                budget.ProbeCount,
                 runtimeGeneration,
-                now,
-                now + PlanLifetime);
+                estimatedPlanTime + PlanLifetime,
+                videoSelection?.StreamIndex,
+                firstProbe.Representation);
         }
-        catch (FastSeekProbeException exception)
+
+        var previousOffset = firstPcr.PacketOffset;
+        var previousSeconds = 0d;
+        var evidence = estimatedEvidence;
+        var seconds = estimatedSeconds;
+        var lowerOffset = firstPcr.PacketOffset;
+        var upperOffset = firstProbe.TotalLength - firstAnalysis.Format.PacketStride;
+        var visited = new HashSet<long> { estimatedOffset };
+        for (var correction = 1; correction <= MaximumCorrections; correction++)
         {
-            LogSkipped(exception.Reason);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (seconds < desiredSeconds) lowerOffset = Math.Max(lowerOffset, evidence.Pcr.PacketOffset);
+            else upperOffset = Math.Min(upperOffset, evidence.Pcr.PacketOffset);
+            var localRate = (evidence.Pcr.PacketOffset - previousOffset) / (seconds - previousSeconds);
+            if (!IsFinitePositive(localRate) || localRate < MinimumByteRate || localRate > MaximumByteRate)
+                throw new FastSeekProbeException(FastSeekSkipReason.Timeline);
+            var candidate = evidence.Pcr.PacketOffset + (desiredSeconds - seconds) * localRate;
+            if (candidate <= lowerOffset || candidate >= upperOffset)
+                candidate = lowerOffset + (upperOffset - lowerOffset) / 2d;
+            var scanBytes = Math.Min(targetScanBytes, budget.RemainingBytes);
+            if (scanBytes < firstAnalysis.Format.PacketStride * 5) break;
+            var offset = AlignAndClamp(candidate, firstAnalysis.Format, firstProbe.TotalLength, scanBytes);
+            if (!visited.Add(offset)) break;
+            previousOffset = evidence.Pcr.PacketOffset;
+            previousSeconds = seconds;
+            evidence = await ReadTargetEvidenceAsync(
+                    source, offset, scanBytes, firstProbe, firstAnalysis.Format,
+                    clockPid, randomAccessPid, program, options, budget, cancellationToken)
+                .ConfigureAwait(false);
+            seconds = TransportStreamClockParser.SecondsBetween(firstPcr.Clock27Mhz, evidence.Pcr.Clock27Mhz);
+            if (!IsFinitePositive(seconds) || seconds > durationSeconds * 1.25)
+                throw new FastSeekProbeException(FastSeekSkipReason.Timeline);
+            if ((seconds - previousSeconds) * (evidence.Pcr.PacketOffset - previousOffset) <= 0)
+                throw new FastSeekProbeException(FastSeekSkipReason.Timeline);
+            logger.Debug("STRM_BRIDGE_FAST_SEEK_CORRECTION step=" + correction +
+                         " probes=" + budget.ProbeCount + " remaining_bytes=" + budget.RemainingBytes +
+                         " error_ms=" + Math.Round((targetSeconds - seconds) * 1000)
+                             .ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (TryCalculateRelativeSeek(targetSeconds, firstPcr, evidence, out var relativeSeek))
+                return new FastSeekPlan(
+                    targetTimeTicks, firstProbe.TotalLength, evidence.Anchor.PacketOffset,
+                    firstAnalysis.Format.PacketStride, durationTicks, relativeSeek, budget.ProbeCount,
+                    runtimeGeneration, clock.UtcNow + PlanLifetime, videoSelection?.StreamIndex,
+                    firstProbe.Representation);
         }
-        catch (OperationCanceledException)
-        {
-            LogSkipped(FastSeekSkipReason.Cancelled);
-        }
-        catch (Exception)
-        {
-            LogSkipped(FastSeekSkipReason.Unavailable);
-        }
-        return null;
+        if (estimatedIsValid)
+            return new FastSeekPlan(
+                targetTimeTicks, firstProbe.TotalLength, estimatedEvidence.Anchor.PacketOffset,
+                firstAnalysis.Format.PacketStride, durationTicks, estimatedRelativeSeek, budget.ProbeCount,
+                runtimeGeneration, clock.UtcNow + PlanLifetime, videoSelection?.StreamIndex,
+                firstProbe.Representation);
+        throw new FastSeekProbeException(FastSeekSkipReason.Correction);
     }
 
-    private static int ProbeLength(long totalLength, long offset) =>
-        (int)Math.Min(MaximumProbeBytes, totalLength - offset);
-
-    private async Task<FastSeekPlan?> PrepareBoundTargetCoreAsync(
-        FastSeekBinding binding,
-        long targetTimeTicks,
+    private async Task<FastSeekProbeResult> ReadProbeAsync(
+        SourceIdentity source,
+        long offset,
+        int requestedBytes,
+        PluginConfiguration options,
+        ProbeBudget budget,
         CancellationToken cancellationToken)
     {
-        var calibration = binding.Calibration;
-        try
+        budget.ThrowIfExpired();
+        var maximumBytes = budget.GetRequestSize(requestedBytes);
+        var result = await probeClient.ReadAsync(
+                source,
+                offset,
+                maximumBytes,
+                options,
+                cancellationToken)
+            .ConfigureAwait(false);
+        budget.ThrowIfExpired();
+        if (result.Bytes.Length > maximumBytes)
+            throw new FastSeekProbeException(FastSeekSkipReason.TruncatedSample);
+        budget.Record(result);
+        return result;
+    }
+
+    private async Task<TargetProbeEvidence> ReadTargetEvidenceAsync(
+        SourceIdentity source,
+        long startOffset,
+        int maximumScanBytes,
+        FastSeekProbeResult firstProbe,
+        TransportStreamFormat format,
+        int clockPid,
+        int randomAccessPid,
+        TransportProgramMap? program,
+        PluginConfiguration options,
+        ProbeBudget budget,
+        CancellationToken cancellationToken)
+    {
+        var offset = startOffset;
+        var scanned = 0;
+        var sawStructure = false;
+        var sawPcr = false;
+        while (scanned < maximumScanBytes && offset < firstProbe.TotalLength && budget.RemainingBytes > 0)
         {
-            if (targetTimeTicks >= calibration.DurationTicks ||
-                !IsFinitePositive(calibration.ByteRate) ||
-                calibration.PacketStride is not 188 and not 192 and not 204 ||
-                calibration.PacketOrigin < 0)
-                throw new FastSeekProbeException(FastSeekSkipReason.Correction);
-            var targetSeconds = TimeSpan.FromTicks(targetTimeTicks).TotalSeconds;
-            var desiredSeconds = targetSeconds - PreRoll.TotalSeconds;
-            var format = new TransportStreamFormat(
-                calibration.PacketStride,
-                calibration.PacketStride == 192 ? 4 : 0,
-                calibration.PacketOrigin);
-            var offset = AlignAndClamp(
-                calibration.TimelineOriginPacketOffset + desiredSeconds * calibration.ByteRate,
-                format,
-                calibration.TotalLength);
-            var probe = await probeClient.ReadAsync(
-                    binding.Source,
+            budget.ThrowIfExpired();
+            var remainingScan = maximumScanBytes - scanned;
+            var remainingSource = firstProbe.TotalLength - offset;
+            var requested = (int)Math.Min(
+                Math.Min(MaximumProbeBytes, remainingScan),
+                Math.Min(remainingSource, budget.RemainingBytes));
+            var candidateBytes = AlignByteCountDown(requested, format.PacketStride);
+            requested = budget.GetTargetRequestSize(requested, format.PacketStride);
+            if (requested < format.PacketStride * 5) break;
+            if (requested < candidateBytes)
+                logger.Debug("STRM_BRIDGE_FAST_SEEK_RANGE candidate_bytes=" + candidateBytes +
+                             " requested_bytes=" + requested + " remaining_bytes=" + budget.RemainingBytes);
+
+            var probe = await ReadProbeAsync(
+                    source,
                     offset,
-                    ProbeLength(calibration.TotalLength, offset),
-                    binding.Options,
+                    requested,
+                    options,
+                    budget,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (probe.TotalLength != calibration.TotalLength)
-                throw new FastSeekProbeException(FastSeekSkipReason.RangeResponse);
-            if (!TransportStreamClockParser.TryAnalyze(
+            ValidateTotalLength(firstProbe, probe);
+            var analyzed = TransportStreamClockParser.TryAnalyze(
                     probe.Bytes,
                     probe.RangeStart,
                     format,
-                    out var analysis) ||
-                !analysis!.TryGetFirstPcr(calibration.PcrPid, out var pcr))
-                throw new FastSeekProbeException(FastSeekSkipReason.PcrMissing);
-            var pcrSeconds = TransportStreamClockParser.SecondsBetween(
-                calibration.TimelineOriginClock27Mhz,
-                pcr.Clock27Mhz);
-            if (!IsFinitePositive(pcrSeconds) ||
-                pcrSeconds > TimeSpan.FromTicks(calibration.DurationTicks).TotalSeconds * 1.25)
-                throw new FastSeekProbeException(FastSeekSkipReason.Timeline);
-            if (TryCalculateRelativeSeek(
-                    targetSeconds,
-                    probe,
-                    pcr,
-                    pcrSeconds,
-                    calibration.ByteRate,
-                    out var relativeSeek))
-                return CreateBoundTargetPlan(
-                    calibration,
-                    targetTimeTicks,
-                    probe.RangeStart,
-                    relativeSeek,
-                    probeCount: 1);
+                    out var analysis);
+            budget.ThrowIfExpired();
+            if (analyzed)
+            {
+                sawStructure = true;
+                var hasPcr = analysis!.TryGetFirstPcr(clockPid, out var pcr);
+                sawPcr |= hasPcr;
+                if (!analysis.MatchesProgram(program))
+                    throw new FastSeekProbeException(FastSeekSkipReason.StreamSelection);
+                if (hasPcr &&
+                    TryGetTimedRandomAccess(analysis, randomAccessPid, clockPid, pcr, out var evidence))
+                    return evidence;
+            }
 
-            var correctedValue = pcr.PacketOffset +
-                                 (desiredSeconds - pcrSeconds) * calibration.ByteRate;
-            var correctedOffset = AlignAndClamp(
-                correctedValue,
-                format,
-                calibration.TotalLength);
-            if (correctedOffset == probe.RangeStart)
-                throw new FastSeekProbeException(FastSeekSkipReason.Correction);
-            var correctedProbe = await probeClient.ReadAsync(
-                    binding.Source,
-                    correctedOffset,
-                    ProbeLength(calibration.TotalLength, correctedOffset),
-                    binding.Options,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            if (correctedProbe.TotalLength != calibration.TotalLength)
-                throw new FastSeekProbeException(FastSeekSkipReason.RangeResponse);
-            if (!TransportStreamClockParser.TryAnalyze(
-                    correctedProbe.Bytes,
-                    correctedProbe.RangeStart,
-                    format,
-                    out var correctedAnalysis) ||
-                !correctedAnalysis!.TryGetFirstPcr(calibration.PcrPid, out var correctedPcr))
-                throw new FastSeekProbeException(FastSeekSkipReason.PcrMissing);
-            var correctedSeconds = TransportStreamClockParser.SecondsBetween(
-                calibration.TimelineOriginClock27Mhz,
-                correctedPcr.Clock27Mhz);
-            if (!IsFinitePositive(correctedSeconds) ||
-                correctedSeconds > TimeSpan.FromTicks(calibration.DurationTicks).TotalSeconds * 1.25)
-                throw new FastSeekProbeException(FastSeekSkipReason.Timeline);
-            if (!TryCalculateRelativeSeek(
-                    targetSeconds,
-                    correctedProbe,
-                    correctedPcr,
-                    correctedSeconds,
-                    calibration.ByteRate,
-                    out relativeSeek))
-                throw new FastSeekProbeException(FastSeekSkipReason.Correction);
-            return CreateBoundTargetPlan(
-                calibration,
-                targetTimeTicks,
-                correctedProbe.RangeStart,
-                relativeSeek,
-                probeCount: 2);
+            if (probe.Bytes.Length <= 0) break;
+            scanned += probe.Bytes.Length;
+            offset = AlignUp(offset + probe.Bytes.Length, format);
         }
-        catch (FastSeekProbeException exception)
-        {
-            LogSkipped(exception.Reason);
-        }
-        catch (OperationCanceledException)
-        {
-            LogSkipped(FastSeekSkipReason.Cancelled);
-        }
-        catch (Exception)
-        {
-            LogSkipped(FastSeekSkipReason.Unavailable);
-        }
-        return null;
+
+        budget.ThrowIfExpired();
+        if (!sawStructure)
+            throw new FastSeekProbeException(FastSeekSkipReason.TransportStructure);
+        if (!sawPcr)
+            throw new FastSeekProbeException(FastSeekSkipReason.PcrMissing);
+        throw new FastSeekProbeException(FastSeekSkipReason.RandomAccessMissing);
     }
 
-    private FastSeekPlan CreateBoundTargetPlan(
-        FastSeekPlan calibration,
-        long targetTimeTicks,
-        long byteOffset,
-        TimeSpan relativeSeek,
-        int probeCount)
+    private static bool TryGetTimedRandomAccess(
+        TransportStreamAnalysis analysis,
+        int pid,
+        int clockPid,
+        PcrSample firstPcr,
+        out TargetProbeEvidence evidence)
     {
-        var now = clock.UtcNow;
-        return new FastSeekPlan(
-            calibration.SourceFingerprint,
-            calibration.MediaSourceId,
-            targetTimeTicks,
-            calibration.TotalLength,
-            byteOffset,
-            calibration.PacketStride,
-            calibration.PacketOrigin,
-            calibration.PcrPid,
-            calibration.TimelineOriginPacketOffset,
-            calibration.TimelineOriginClock27Mhz,
-            calibration.ByteRate,
-            calibration.DurationTicks,
-            relativeSeek,
-            probeCount,
-            calibration.RuntimeGeneration,
-            now,
-            calibration.ExpiresAtUtc);
+        var clocks = analysis.PcrSamples.Where(clock => clock.Pid == clockPid).ToArray();
+        var clockIndex = 0;
+        foreach (var candidate in analysis.RandomAccessSamples)
+        {
+            if (candidate.Pid != pid) continue;
+            while (clockIndex < clocks.Length && clocks[clockIndex].PacketOffset < candidate.PacketOffset)
+                clockIndex++;
+            if (clockIndex >= clocks.Length) break;
+            var after = clocks[clockIndex];
+            var beforeIndex = after.PacketOffset == candidate.PacketOffset ? clockIndex : clockIndex - 1;
+            if (beforeIndex >= 0)
+            {
+                var before = clocks[beforeIndex];
+                if (TransportStreamClockParser.SecondsBetween(before.Clock27Mhz, after.Clock27Mhz) <= 0.1)
+                {
+                    evidence = new TargetProbeEvidence(firstPcr, candidate, before, after);
+                    return true;
+                }
+            }
+        }
+        evidence = default;
+        return false;
+    }
+
+    private static int AlignByteCountDown(int value, int packetStride) =>
+        value < packetStride ? 0 : value / packetStride * packetStride;
+
+    private static long AlignUp(long absoluteOffset, TransportStreamFormat format)
+    {
+        if (absoluteOffset <= format.PacketOrigin) return format.PacketOrigin;
+        var relative = absoluteOffset - format.PacketOrigin;
+        return format.PacketOrigin +
+               (relative + format.PacketStride - 1) / format.PacketStride * format.PacketStride;
     }
 
     private static long AlignAndClamp(
         double candidate,
         TransportStreamFormat format,
-        long totalLength)
+        long totalLength,
+        int maximumProbeBytes)
     {
         if (double.IsNaN(candidate) || double.IsInfinity(candidate) || candidate < format.PacketOrigin ||
             candidate > totalLength - format.PacketStride)
             throw new FastSeekProbeException(FastSeekSkipReason.Correction);
-        var maximumStart = Math.Max(format.PacketOrigin, totalLength - MaximumProbeBytes);
+        var maximumStart = Math.Max(format.PacketOrigin, totalLength - maximumProbeBytes);
         var bounded = Math.Min(candidate, maximumStart);
         return TransportStreamClockParser.AlignDown((long)Math.Floor(bounded), format);
     }
 
     private static bool TryCalculateRelativeSeek(
         double targetSeconds,
-        FastSeekProbeResult probe,
-        PcrSample firstPcr,
-        double firstPcrSeconds,
-        double byteRate,
+        PcrSample origin,
+        TargetProbeEvidence evidence,
         out TimeSpan relativeSeek)
     {
-        var bytesBeforePcr = firstPcr.PacketOffset - probe.RangeStart;
-        var sampleStartSeconds = firstPcrSeconds - bytesBeforePcr / byteRate;
-        relativeSeek = TimeSpan.FromSeconds(targetSeconds - sampleStartSeconds);
-        return relativeSeek >= MinimumRelativeSeek && relativeSeek <= MaximumRelativeSeek;
+        var lower = TransportStreamClockParser.SecondsBetween(origin.Clock27Mhz, evidence.Before.Clock27Mhz);
+        var upper = TransportStreamClockParser.SecondsBetween(origin.Clock27Mhz, evidence.After.Clock27Mhz);
+        relativeSeek = TimeSpan.FromSeconds(targetSeconds - (lower + upper) / 2);
+        return upper >= lower && upper - lower <= 0.1 &&
+               targetSeconds - upper >= MinimumRelativeSeek.TotalSeconds &&
+               targetSeconds - lower <= MaximumRelativeSeek.TotalSeconds;
     }
 
     private static void ValidateTotalLength(FastSeekProbeResult first, FastSeekProbeResult later)
     {
         if (first.TotalLength != later.TotalLength)
             throw new FastSeekProbeException(FastSeekSkipReason.RangeResponse);
+        if (first.Representation is null || !first.Representation.Matches(later.Representation))
+            throw new FastSeekProbeException(FastSeekSkipReason.Representation);
     }
 
     private static bool IsFinitePositive(double value) =>
@@ -948,13 +947,34 @@ internal sealed class FastSeekCoordinator
         prepared[key] = plan;
     }
 
+    private void StoreFailureUnsafe(PreparationKey key, FastSeekSkipReason reason)
+    {
+        if (!failed.ContainsKey(key) && failed.Count >= MaximumPlans)
+        {
+            var oldest = failed.OrderBy(pair => pair.Value.ExpiresAtUtc).First().Key;
+            failed.Remove(oldest);
+        }
+        failed[key] = new FastSeekFailure(reason, clock.UtcNow + FailureLifetime);
+    }
+
+    private static bool ShouldCacheFailure(FastSeekSkipReason reason) =>
+        reason is FastSeekSkipReason.TransportStructure or
+            FastSeekSkipReason.StreamSelection or
+            FastSeekSkipReason.PcrMissing or
+            FastSeekSkipReason.RandomAccessMissing or
+            FastSeekSkipReason.Timeline or
+            FastSeekSkipReason.ByteRate or
+            FastSeekSkipReason.Correction;
+
     private void RemoveExpiredUnsafe()
     {
         var now = clock.UtcNow;
         foreach (var key in prepared.Where(pair => now >= pair.Value.ExpiresAtUtc).Select(pair => pair.Key).ToArray())
             prepared.Remove(key);
+        foreach (var key in failed.Where(pair => now >= pair.Value.ExpiresAtUtc).Select(pair => pair.Key).ToArray())
+            failed.Remove(key);
         foreach (var key in boundInputs
-                     .Where(pair => now >= pair.Value.Calibration.ExpiresAtUtc)
+                     .Where(pair => now >= pair.Value.Plan.ExpiresAtUtc)
                      .Select(pair => pair.Key)
                      .ToArray())
             boundInputs.Remove(key);
@@ -971,32 +991,129 @@ internal sealed class FastSeekCoordinator
     {
         if (boundInputs.Count == 0) return;
         var oldest = boundInputs
-            .OrderBy(pair => pair.Value.Calibration.ExpiresAtUtc)
+            .OrderBy(pair => pair.Value.Plan.ExpiresAtUtc)
             .First()
             .Key;
         boundInputs.Remove(oldest);
     }
 
-    private void LogSkipped(FastSeekSkipReason reason) =>
-        logger.Debug("STRM_BRIDGE_FAST_SEEK_SKIPPED reason=" + reason.ToString().ToLowerInvariant());
+    private void LogSkipped(FastSeekSkipReason reason, bool cached = false) =>
+        logger.Debug("STRM_BRIDGE_FAST_SEEK_SKIPPED reason=" + reason.ToString().ToLowerInvariant() +
+                     (cached ? " cached=true" : string.Empty));
+
+    private readonly struct TargetProbeEvidence
+    {
+        public TargetProbeEvidence(PcrSample pcr, RandomAccessSample anchor, PcrSample before, PcrSample after)
+        {
+            Pcr = pcr;
+            Anchor = anchor;
+            Before = before;
+            After = after;
+        }
+
+        public PcrSample Pcr { get; }
+
+        public RandomAccessSample Anchor { get; }
+
+        public PcrSample Before { get; }
+
+        public PcrSample After { get; }
+    }
+
+    private sealed class ProbeBudget
+    {
+        private readonly PendingFastSeek entry;
+        private long measuredBodyBytes;
+        private double measuredBodySeconds;
+        private TimeSpan? latestSetupDuration;
+
+        private int consumedBytes;
+
+        public ProbeBudget(PendingFastSeek entry) => this.entry = entry;
+
+        public int MaximumBytes { get; private set; } = InitialProbeBytes;
+
+        public int RemainingBytes => MaximumBytes - consumedBytes;
+
+        public int ProbeCount { get; private set; }
+
+        public void Configure(int targetScanBytes) =>
+            MaximumBytes = FastSeekBudgetPolicy.CalculatePreparationBytes(targetScanBytes);
+
+        public void ThrowIfExpired() => entry.ThrowIfExpired();
+
+        public int GetTargetRequestSize(int requestedBytes, int packetStride)
+        {
+            var candidate = GetRequestSize(requestedBytes);
+            var dynamicBytes = FastSeekBudgetPolicy.CalculateRequestBytes(
+                candidate, packetStride, entry.RemainingTime, latestSetupDuration,
+                measuredBodySeconds > 0 ? measuredBodyBytes / measuredBodySeconds : (double?)null);
+            if (dynamicBytes > 0 && dynamicBytes < AlignByteCountDown(candidate, packetStride))
+                entry.UsedNetworkSizing = true;
+            return dynamicBytes;
+        }
+
+        public int GetRequestSize(int requestedBytes)
+        {
+            var bounded = Math.Min(requestedBytes, RemainingBytes);
+            if (bounded < 1) throw new FastSeekProbeException(FastSeekSkipReason.Correction);
+            return bounded;
+        }
+
+        public void Record(FastSeekProbeResult probe)
+        {
+            var actualBytes = probe.Bytes.Length;
+            if (actualBytes < 0 || actualBytes > RemainingBytes)
+                throw new FastSeekProbeException(FastSeekSkipReason.TruncatedSample);
+            consumedBytes += actualBytes;
+            ProbeCount++;
+            if (actualBytes > 0 && probe.SetupDuration is TimeSpan setup && setup >= TimeSpan.Zero &&
+                probe.BodyDuration is TimeSpan body && body > TimeSpan.Zero)
+            {
+                // This is an application-level read estimate, not a bandwidth guarantee. Socket
+                // prefetch can overestimate it, but it can only restore the existing Range ceiling.
+                latestSetupDuration = setup;
+                measuredBodyBytes += actualBytes;
+                measuredBodySeconds += body.TotalSeconds;
+            }
+        }
+    }
+
+    private readonly struct FastSeekFailure
+    {
+        public FastSeekFailure(FastSeekSkipReason reason, DateTimeOffset expiresAtUtc)
+        {
+            Reason = reason;
+            ExpiresAtUtc = expiresAtUtc;
+        }
+
+        public FastSeekSkipReason Reason { get; }
+
+        public DateTimeOffset ExpiresAtUtc { get; }
+    }
 
     private readonly struct PreparationKey : IEquatable<PreparationKey>
     {
         public PreparationKey(
-            string sourceFingerprint,
+            SourceIdentity source,
             string mediaSourceId,
             long targetTimeTicks,
             long durationTicks,
-            int runtimeGeneration)
+            int runtimeGeneration,
+            FastSeekVideoSelection? videoSelection)
         {
-            SourceFingerprint = sourceFingerprint;
+            SourceFingerprint = source.SourceFingerprint;
+            ResourceKey = GatewayTransport.ResourceDigest(source.SourceUri);
             MediaSourceId = mediaSourceId;
             TargetTimeTicks = targetTimeTicks;
             DurationTicks = durationTicks;
             RuntimeGeneration = runtimeGeneration;
+            VideoSelectionKey = videoSelection?.CacheKey ?? string.Empty;
         }
 
         private string SourceFingerprint { get; }
+
+        public string ResourceKey { get; }
 
         private string MediaSourceId { get; }
 
@@ -1006,10 +1123,13 @@ internal sealed class FastSeekCoordinator
 
         private int RuntimeGeneration { get; }
 
+        private string VideoSelectionKey { get; }
+
         public bool Equals(PreparationKey other) =>
             TargetTimeTicks == other.TargetTimeTicks &&
             DurationTicks == other.DurationTicks &&
             RuntimeGeneration == other.RuntimeGeneration &&
+            string.Equals(VideoSelectionKey, other.VideoSelectionKey, StringComparison.Ordinal) &&
             string.Equals(SourceFingerprint, other.SourceFingerprint, StringComparison.Ordinal) &&
             string.Equals(MediaSourceId, other.MediaSourceId, StringComparison.Ordinal);
 
@@ -1023,6 +1143,7 @@ internal sealed class FastSeekCoordinator
                 hash = hash * 397 ^ StringComparer.Ordinal.GetHashCode(MediaSourceId);
                 hash = hash * 397 ^ TargetTimeTicks.GetHashCode();
                 hash = hash * 397 ^ DurationTicks.GetHashCode();
+                hash = hash * 397 ^ StringComparer.Ordinal.GetHashCode(VideoSelectionKey);
                 return hash * 397 ^ RuntimeGeneration;
             }
         }
@@ -1031,18 +1152,44 @@ internal sealed class FastSeekCoordinator
     private sealed class PendingFastSeek : IDisposable
     {
         private readonly CancellationTokenSource timeout;
+        private readonly Stopwatch stopwatch = Stopwatch.StartNew();
+        private readonly TimeSpan lifetime;
         private readonly TaskCompletionSource<FastSeekPlan?> completion =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public PendingFastSeek(TimeSpan lifetime)
         {
+            this.lifetime = lifetime;
             timeout = new CancellationTokenSource();
+            CancellationToken = timeout.Token;
             timeout.CancelAfter(lifetime);
         }
 
-        public CancellationToken CancellationToken => timeout.Token;
+        public CancellationToken CancellationToken { get; }
+
+        public TimeSpan RemainingTime => lifetime - stopwatch.Elapsed;
+
+        public bool IsExpired => CancellationToken.IsCancellationRequested || RemainingTime <= TimeSpan.Zero;
+
+        public bool UsedNetworkSizing { get; set; }
+
+        public void ThrowIfExpired()
+        {
+            if (IsExpired) throw new OperationCanceledException(CancellationToken);
+        }
 
         public Task<FastSeekPlan?> Task => completion.Task;
+
+        public int WaiterCount { get; private set; }
+
+        public void AddWaiter() => WaiterCount++;
+
+        public bool RemoveWaiter()
+        {
+            if (WaiterCount <= 0) return false;
+            WaiterCount--;
+            return WaiterCount == 0;
+        }
 
         public void Complete(FastSeekPlan? plan) => completion.TrySetResult(plan);
 
@@ -1057,36 +1204,17 @@ internal sealed class FastSeekCoordinator
 
     private sealed class FastSeekBinding
     {
-        private const int MaximumTargetPlans = 16;
-
-        public FastSeekBinding(SourceIdentity source, PluginConfiguration options, FastSeekPlan calibration)
+        public FastSeekBinding(FastSeekPlan plan, string resourceKey, string? ticket)
         {
-            Source = source ?? throw new ArgumentNullException(nameof(source));
-            Options = options ?? throw new ArgumentNullException(nameof(options));
-            Calibration = calibration ?? throw new ArgumentNullException(nameof(calibration));
-            Plans.Add(calibration.TargetTimeTicks, calibration);
+            Plan = plan ?? throw new ArgumentNullException(nameof(plan));
+            ResourceKey = resourceKey;
+            Ticket = ticket;
         }
 
-        public SourceIdentity Source { get; }
+        public FastSeekPlan Plan { get; }
 
-        public PluginConfiguration Options { get; }
+        public string ResourceKey { get; }
 
-        public FastSeekPlan Calibration { get; }
-
-        public Dictionary<long, FastSeekPlan> Plans { get; } = new();
-
-        public void Store(FastSeekPlan plan)
-        {
-            if (!Plans.ContainsKey(plan.TargetTimeTicks) && Plans.Count >= MaximumTargetPlans)
-            {
-                var oldestTarget = Plans.Values
-                    .Where(candidate => candidate.TargetTimeTicks != Calibration.TargetTimeTicks)
-                    .OrderBy(candidate => candidate.CreatedAtUtc)
-                    .Select(candidate => candidate.TargetTimeTicks)
-                    .FirstOrDefault();
-                if (oldestTarget != 0) Plans.Remove(oldestTarget);
-            }
-            Plans[plan.TargetTimeTicks] = plan;
-        }
+        public string? Ticket { get; }
     }
 }

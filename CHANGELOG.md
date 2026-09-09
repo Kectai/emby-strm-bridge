@@ -1,28 +1,27 @@
 # Changelog
 
+## 0.2.3 — 2026-09-09
+
+- Add validated first-hop redirects and ticket/profile-scoped caching, configurable from 0–60 seconds, with explicit refresh support.
+- Improve standard static-video routing, exact source matching, Harmony runtime coexistence and loaded-build diagnostics.
+- Bind TS/M2TS positioning to strong validators and actual request profiles; add bounded native recovery, adaptive probe budgets and an independent feature switch.
+- Correct HLS response metadata, dynamic resource retirement and multi-session quotas; remove per-resource global cleanup from large manifests.
+- Fix audio STRM extraction and require current input-open evidence; add independent ffprobe fallback and bounded failure handling.
+- Upgrade recovery snapshots to schema 3, preserving HDR, rotation and negotiation fields; retain existing external streams during technical updates.
+- Improve Range validation, redirect expiry, shared control deadlines, source backoff, cancellation and transcode resource cleanup.
+- Consolidate documentation and document the generic seek-thumbnail workaround and relay limitations.
+- Add package checksums, immutable-release checks and regression coverage totaling 561 tests.
+
 ## 0.2.2
 
-- Adds Adaptive routing for direct playback and server-side media processing.
-- Adds fast positioning for remote TS and M2TS media.
-- Improves direct client delivery, repeated seeking, reconnects and playback recovery.
-- Isolates simultaneous playback across users, devices and sessions.
-- Improves HLS playback continuity and gateway compatibility.
-- Makes configuration labels and descriptions follow the active Emby Web language without changing setting values.
+- Add Adaptive routing and remote TS/M2TS fast positioning.
+- Improve direct delivery, repeated seeking, playback recovery and session isolation.
+- Improve HLS continuity and configuration localization.
 
 ## 0.2.1
 
-- Processes version-gated GET and POST PlaybackInfo responses on Emby Server 4.9.5.x while preserving media-source count, order, IDs and metadata.
-- Routes exact, in-scope STRM matches from Emby's standard static-video GET/HEAD path through the same gateway while retaining native handling for every other video request.
-- Routes the input of exact, in-scope STRM FFmpeg jobs through a runtime-derived local gateway address, including large transport-stream sources, without a configured or hard-coded host and port.
-- Routes matching STRM sources through current-Origin relative gateway URLs with `Native`, `RedirectOnly`, `Adaptive` and `RelayOnly` modes.
-- Embeds and identity-checks the Harmony runtime so installation uses one plugin DLL.
-- Supports validated multi-hop redirects, GET/HEAD and Range forwarding, bounded relay concurrency, request cancellation and full-response idle timeouts.
-- Reuses short-lived validated redirect targets across related byte requests with keyed single flight, method separation, generation-safe invalidation and automatic source fallback.
-- Re-resolves once from the STRM source when a fresh redirected target returns 401, 403, 404 or 410, while keeping direct-source failures and the second result bounded.
-- Relays HLS manifests and resources with MIME, path and content-signature detection, bounded rewriting and reusable child tickets.
-- Uses memory-only, high-entropy playback and HLS tickets with optional user binding, runtime generations, expiry and independent capacity limits.
-- Supports exact host, IP, CIDR and label-bounded subdomain trust rules, detected-host review and bounded retry after trust changes.
-- Extracts and restores bounded video, audio and subtitle technical information while preserving external streams and excluding image and attachment streams.
-- Provides scheduled extraction plus administrator extraction, restore, cleanup and clear operations.
-- Keeps URLs, paths, query values, credentials, headers, tickets, titles, library names and user names outside plugin logs and technical snapshots.
-- Packages current documentation, MIT licensing and the bundled Harmony license notice with exact archive validation.
+- Add version-gated PlaybackInfo, static-video and server-FFmpeg integration for Emby 4.9.5.x.
+- Add relative ticket routes, four playback modes, validated redirects, Range forwarding and HLS rewriting.
+- Add bounded relay, cancellation, redirect reuse and source recovery.
+- Add selected-library technical extraction, recovery snapshots, scheduled tasks and administrator maintenance APIs.
+- Embed the Harmony runtime and package the single DLL with documentation, licenses and privacy checks.

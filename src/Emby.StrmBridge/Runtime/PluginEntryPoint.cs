@@ -65,11 +65,11 @@ public sealed class PluginEntryPoint : IServerEntryPoint, IDisposable
             itemRepository,
             logManager,
             notificationManager,
-            activityManager);
+            activityManager,
+            applicationHost);
         runtime.Extraction = coordinator;
         try
         {
-            EmbeddedAssemblyLoader.EnsureHarmonyLoaded();
             var playbackProcessor = new PlaybackInfoProcessor(
                 runtime,
                 libraryManager,

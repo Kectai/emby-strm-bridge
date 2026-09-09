@@ -78,6 +78,7 @@ internal sealed class NativeVideoStreamProcessor
     {
         result = null;
         string? issuedTicket = null;
+        var requestScoped = false;
         try
         {
             var httpRequest = GetProperty(service, "Request") as IRequest;
@@ -85,7 +86,10 @@ internal sealed class NativeVideoStreamProcessor
             var expectedMethod = isHeadRequest ? "HEAD" : "GET";
             if (!string.Equals(httpRequest.HttpMethod, expectedMethod, StringComparison.OrdinalIgnoreCase))
                 return false;
-            if (GetProperty(request, "Static") is not bool isStatic || !isStatic) return false;
+            // Emby normalizes an original.* progressive request to Static=true inside
+            // ProcessRequest. This prefix runs before that method body, so recognize the
+            // same route shape without mutating the shared request object.
+            if (!IsStaticRequest(request)) return false;
 
             var options = runtime.GetOptionsSnapshot();
             if (!options.Enabled || options.PlaybackMode == PlaybackRoutingMode.Native ||
@@ -95,6 +99,11 @@ internal sealed class NativeVideoStreamProcessor
             var requestedItem = ResolveItem(GetStringProperty(request, "Id"));
             var mediaSourceId = GetStringProperty(request, "MediaSourceId")?.Trim();
             if (requestedItem is null) return false;
+            if (!PlaybackItemPolicy.IsVideo(requestedItem))
+            {
+                LogSkipped(requestedItem, "media-type");
+                return false;
+            }
             if (string.IsNullOrEmpty(mediaSourceId))
             {
                 LogSkipped(requestedItem, "media-source-id");
@@ -118,45 +127,52 @@ internal sealed class NativeVideoStreamProcessor
             var operation = runtime.BeginOperation();
             var userId = resolveUserId(httpRequest);
             var deviceId = resolveDeviceId(httpRequest);
+            var container = ResolveContainer(request, matchedMediaSource, matchedSource);
             if (!runtime.TryCommit(
                     operation.Generation,
                     () => true,
-                    () => issuedTicket = runtime.Tickets.IssuePlayback(
+                    () => issuedTicket = runtime.Tickets.GetOrIssueNativePlayback(
                         matchedItem.Id,
                         matchedMediaSource.Id ?? mediaSourceId,
                         userId,
+                        deviceId,
+                        GetStringProperty(request, "PlaySessionId"),
                         matchedSource,
-                        PlaybackTicketPurpose.DirectClient,
                         operation.Generation,
                         TicketStore.ComputePlaybackLifetime(
                             matchedMediaSource.RunTimeTicks ?? matchedItem.RunTimeTicks),
-                        deviceId)))
+                        out requestScoped,
+                        SourceBehaviorClassifier.IsKnownFileContainer(matchedMediaSource.Container))))
                 return false;
 
-            var container = string.IsNullOrWhiteSpace(matchedMediaSource.Container)
-                ? Path.GetExtension(matchedSource.SourceUri.AbsolutePath).TrimStart('.')
-                : matchedMediaSource.Container;
             result = invokeGateway(
                 httpRequest,
                 issuedTicket!,
                 GatewayRouteBuilder.CreatePlaybackFileName(container),
                 isHeadRequest);
             if (result is null) throw new InvalidOperationException("The gateway returned no task.");
+            if (requestScoped) result = ReleaseRequestTicketAsync(result, issuedTicket!);
             logger.Debug("STRM_BRIDGE_NATIVE_STREAM_ROUTED item=" + ShortId(matchedItem.Id));
             return true;
         }
         catch (TicketCapacityException)
         {
-            if (issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
+            if (requestScoped && issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
             logger.Warn("STRM_BRIDGE_NATIVE_STREAM_CAPACITY");
             return false;
         }
         catch (Exception exception)
         {
-            if (issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
+            if (requestScoped && issuedTicket is not null) runtime.Tickets.Revoke(issuedTicket);
             logger.Debug("STRM_BRIDGE_NATIVE_STREAM_SKIPPED error=" + exception.GetType().Name);
             return false;
         }
+    }
+
+    private async Task<object> ReleaseRequestTicketAsync(Task<object> response, string ticket)
+    {
+        try { return await response.ConfigureAwait(false); }
+        finally { runtime.Tickets.ReleaseRequestTicket(ticket); }
     }
 
     private bool TryResolveSource(
@@ -189,7 +205,9 @@ internal sealed class NativeVideoStreamProcessor
                      string.Equals(candidate.Id, mediaSourceId, StringComparison.Ordinal)))
         {
             var candidateItem = ResolveItem(candidate.ItemId) ?? requestedItem;
-            if (!IsIncludedStrmItem(candidateItem, includedLibraryIds)) continue;
+            if (!PlaybackItemPolicy.IsVideo(candidateItem) ||
+                !IsIncludedStrmItem(candidateItem, includedLibraryIds))
+                continue;
             SourceIdentity candidateSource;
             try { candidateSource = runtime.SourcePolicy!.Read(candidateItem.Path); }
             catch (SourcePolicyException) { continue; }
@@ -268,6 +286,31 @@ internal sealed class NativeVideoStreamProcessor
             ?.GetValue(value);
 
     private static string? GetStringProperty(object value, string name) => GetProperty(value, name)?.ToString();
+
+    private static bool IsStaticRequest(object request)
+    {
+        if (GetProperty(request, "Static") is bool isStatic && isStatic) return true;
+        var streamFileName = GetStringProperty(request, "StreamFileName");
+        if (string.IsNullOrWhiteSpace(streamFileName)) return false;
+        var fileName = Path.GetFileName(streamFileName);
+        return fileName.Length > "original.".Length &&
+               fileName.StartsWith("original.", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ResolveContainer(
+        object request,
+        MediaSourceInfo mediaSource,
+        SourceIdentity source)
+    {
+        if (!string.IsNullOrWhiteSpace(mediaSource.Container)) return mediaSource.Container;
+        var requestContainer = GetStringProperty(request, "Container");
+        if (!string.IsNullOrWhiteSpace(requestContainer)) return requestContainer;
+        var streamFileName = GetStringProperty(request, "StreamFileName");
+        var streamExtension = Path.GetExtension(streamFileName ?? string.Empty).TrimStart('.');
+        return !string.IsNullOrWhiteSpace(streamExtension)
+            ? streamExtension
+            : Path.GetExtension(source.SourceUri.AbsolutePath).TrimStart('.');
+    }
 
     private static string ShortId(Guid itemId) => itemId.ToString("N").Substring(0, 8);
 }

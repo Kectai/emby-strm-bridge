@@ -26,11 +26,9 @@ cp "$project_root/README.md" "$project_root/LICENSE" "$project_root/CHANGELOG.md
 mkdir -p "$stage/LICENSES"
 cp "$project_root/LICENSES/Lib.Harmony-LICENSE.txt" "$stage/LICENSES/"
 mkdir -p "$stage/docs"
-cp "$project_root/docs/ARCHITECTURE.md" \
+cp "$project_root/docs/STRM_BRIDGE_DESIGN.md" \
   "$project_root/docs/COMPATIBILITY.md" \
-  "$project_root/docs/FAST_SEEK_DESIGN.md" \
   "$project_root/docs/INSTALL.md" \
-  "$project_root/docs/PLAYBACK_GATEWAY_DESIGN.md" \
   "$project_root/docs/SECURITY.md" \
   "$project_root/docs/TESTING.md" \
   "$stage/docs/"
@@ -50,6 +48,9 @@ cmp "$project_root/.local/build/bin/Release/netstandard2.1/Emby.StrmBridge.dll" 
 if [ -f "$archive" ]; then
   rm "$archive"
 fi
+if [ -f "$archive.sha256" ]; then
+  rm "$archive.sha256"
+fi
 
 (cd "$project_root/.local/package" && zip -X -q -r "$archive" Emby.StrmBridge)
 cp "$project_root/RELEASE_NOTES.md" "$project_root/artifacts/RELEASE_NOTES.md"
@@ -64,7 +65,7 @@ if [ -z "$dated_entries" ] || printf '%s\n' "$dated_entries" | \
 fi
 
 unexpected=$(unzip -Z1 "$archive" | rg -v \
-  '^Emby\.StrmBridge/$|^Emby\.StrmBridge/(Emby\.StrmBridge\.dll|README\.md|LICENSE|CHANGELOG\.md|RELEASE_NOTES\.md|THIRD_PARTY_NOTICES\.md)$|^Emby\.StrmBridge/LICENSES/$|^Emby\.StrmBridge/LICENSES/Lib\.Harmony-LICENSE\.txt$|^Emby\.StrmBridge/docs/$|^Emby\.StrmBridge/docs/(ARCHITECTURE|COMPATIBILITY|FAST_SEEK_DESIGN|INSTALL|PLAYBACK_GATEWAY_DESIGN|SECURITY|TESTING)\.md$' \
+  '^Emby\.StrmBridge/$|^Emby\.StrmBridge/(Emby\.StrmBridge\.dll|README\.md|LICENSE|CHANGELOG\.md|RELEASE_NOTES\.md|THIRD_PARTY_NOTICES\.md)$|^Emby\.StrmBridge/LICENSES/$|^Emby\.StrmBridge/LICENSES/Lib\.Harmony-LICENSE\.txt$|^Emby\.StrmBridge/docs/$|^Emby\.StrmBridge/docs/(STRM_BRIDGE_DESIGN|COMPATIBILITY|INSTALL|SECURITY|TESTING)\.md$' \
   || true)
 if [ -n "$unexpected" ]; then
   echo "Package validation failed: the archive contains an unexpected entry."
@@ -73,7 +74,7 @@ if [ -n "$unexpected" ]; then
 fi
 
 entry_count=$(unzip -Z1 "$archive" | wc -l | tr -d ' ')
-if [ "$entry_count" -ne 17 ]; then
+if [ "$entry_count" -ne 15 ]; then
   echo "Package validation failed: the archive allowlist is incomplete."
   exit 1
 fi
@@ -88,4 +89,8 @@ unzip -p "$archive" Emby.StrmBridge/Emby.StrmBridge.dll > "$verified_dll"
 cmp "$project_root/.local/build/bin/Release/netstandard2.1/Emby.StrmBridge.dll" "$verified_dll"
 rm "$verified_dll"
 
+archive_name=$(basename "$archive")
+(cd "$project_root/artifacts" && shasum -a 256 "$archive_name" > "$archive_name.sha256")
+
 echo "$archive"
+echo "$archive.sha256"

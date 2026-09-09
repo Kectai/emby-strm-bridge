@@ -43,23 +43,6 @@ internal sealed class TestWorkspace : IDisposable
     }
 }
 
-internal sealed class StubRedirectClient : IRedirectSourceClient
-{
-    private readonly Func<int, Uri, string, CancellationToken, Task<RedirectSourceResponse>> handler;
-    private int calls;
-
-    public StubRedirectClient(Func<int, Uri, string, CancellationToken, Task<RedirectSourceResponse>> handler) =>
-        this.handler = handler;
-
-    public int Calls => Volatile.Read(ref calls);
-
-    public Task<RedirectSourceResponse> SendAsync(Uri source, string userAgent, CancellationToken cancellationToken)
-    {
-        var call = Interlocked.Increment(ref calls);
-        return handler(call, source, userAgent, cancellationToken);
-    }
-}
-
 internal static class TestSources
 {
     public static SourceIdentity Create(string suffix = "one") => new(

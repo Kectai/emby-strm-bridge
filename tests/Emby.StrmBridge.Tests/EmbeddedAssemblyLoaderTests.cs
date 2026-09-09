@@ -7,6 +7,13 @@ namespace Emby.StrmBridge.Tests;
 public sealed class EmbeddedAssemblyLoaderTests
 {
     [TestMethod]
+    public void ProductionAssemblyDoesNotReferenceHarmonyAtLoadTime()
+    {
+        Assert.IsFalse(typeof(Plugin).Assembly.GetReferencedAssemblies()
+            .Any(reference => string.Equals(reference.Name, "0Harmony", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
     public void PluginContainsAndLoadsExpectedHarmonyRuntime()
     {
         Assert.Contains(

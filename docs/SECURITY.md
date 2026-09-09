@@ -1,88 +1,47 @@
 # Security and privacy
 
-## Trust boundary
+## STRM and network trust
 
-A selected STRM file is an administrator-controlled media source that Emby can already access. The plugin accepts one stable HTTP(S) URL from that file. Same-host redirect hops remain inside that source authority; every cross-host target requires an administrator rule.
+STRM files must be local regular files, at most 16 KiB, containing exactly one HTTP(S) URL in strict UTF-8. File and ancestor reparse/symlink checks, source-version checks and library scope restrict processing. URLs with user information, fragments or control characters are rejected. These checks do not replace operating-system permissions on the media library.
 
-Rules support exact DNS names, exact IP addresses, CIDR ranges and label-bounded subdomain patterns. `*.example.com` matches subdomains such as `edge.example.com` and keeps the bare domain and lookalike suffixes outside the rule.
+The initial STRM host is the source authority. Cross-host redirects require administrator trust, and HTTPS-to-HTTP downgrade is rejected. Exact hosts, wildcard suffixes, IPs and CIDRs have distinct meanings: a wildcard excludes the bare suffix domain and does not authorize private IP ranges. Detected hosts are suggestions for administrator review, not automatic approvals.
 
-Each redirect hop is parsed before connection. Accepted targets use HTTP or HTTPS, contain no userinfo, fragment or control characters, and prevent HTTPS-to-HTTP downgrade. The redirect hop limit is configurable from 1 to 8.
+For direct connections, the transport validates all resolved candidate addresses, connects to validated IPs, and preserves the original Host, TLS SNI and certificate validation. Named services resolving to private, loopback, link-local or special-use addresses need explicit IP/CIDR approval. Literal-IP sources and policy-approved exact-IP redirects constitute explicit address authorization. Trust-rule changes rotate direct connection pools for new requests; already-delivered bodies may finish.
 
-HLS URI lines and URI attributes pass through the same cross-host policy before a child ticket is issued. Child access and descendant issuance require the exact registered root ticket. Per-root mutation serialization keeps issuance, reuse and failure rollback atomic across concurrent manifest requests.
+The transport honors .NET's default system/environment proxy and bypass rules. A selected proxy handles destination DNS and egress; destination-IP restrictions then belong to the administrator's proxy configuration. URI, redirect-host and HTTPS checks still apply to plugin-followed redirects. Proxy selection or connection failure terminates the request.
 
-## STRM input
+Direct handoff transfers control to the reader. The plugin cannot enforce DNS/IP rules, cancel connections, inspect later responses or schedule requests after that boundary. Relay retains server-side transport checks and capacity limits, but does not prioritize playback over thumbnail generation.
 
-- rooted local `.strm` regular file
-- maximum 16 KiB
-- strict UTF-8 with optional BOM
-- one non-empty HTTP(S) record
-- stable length and modification time across the read
-- ancestor reparse-point checks before and after reading
+## Tickets and request headers
 
-The local principal able to replace media-library files remains part of the Emby library trust boundary.
+Playback tickets contain 256 random bits, are stored only in bounded memory, and act as bearer credentials. When an authenticated identity is supplied, it is checked against the user binding. Device digests isolate sessions and leases; they are not authentication. Tickets bind the item, exact media source, STRM version, purpose and runtime generation.
 
-## Capability tickets
+Client tickets start with a ten-minute lifetime; known media duration plus grace can extend this within a 24-hour maximum. Probe and server-job tickets are loopback-only. Probe tickets are limited to their operation budget and revoked on completion. Configuration invalidation and shutdown revoke plugin state and cancel its transport operations; they cannot revoke a URL already handed to a client.
 
-- generated with a cryptographic random-number generator
-- 256 bits of entropy
-- Base64URL representation
-- memory-only payload
-- item, media source, runtime generation and optional user binding
-- 10-minute preview window
-- playback lifetime derived from runtime plus reconnect grace
-- 24-hour absolute maximum
-- independent playback and HLS capacities
+Only supported upstream request headers are forwarded: Range, If-Range, If-None-Match, If-Modified-Since, Accept, Accept-Language, Cache-Control and Pragma. User-Agent is handled as part of the request profile. The internal fast-positioning path may add a validated If-Match guard. Emby authentication, API keys, client cookies and arbitrary headers are not forwarded to the source. The transport has no shared cookie jar.
 
-External players may use a ticket without forwarding Emby authentication. When an authenticated Emby identity is present, the gateway verifies it against the ticket's user binding. Tickets are bearer capabilities and can appear in Emby or reverse-proxy access logs; redact `/StrmBridge/Playback/` paths and keep access-log retention bounded.
+The gateway is scoped to ticket-authorized resources, not a general URL proxy. Administrator maintenance and diagnostic APIs require Emby's administrator authentication; see [INSTALL.md](INSTALL.md#administrator-apis).
 
-The standard static-video adapter derives its ticket binding from the authorization context of the current Emby request. It requires `Static=true`, an exact media-source ID, a selected library, a local `.strm` owner and an eligible static source whose URL equals the current STRM value. PlaybackInfo and standard-video tickets carry a direct-client purpose; per-job transcode tickets carry a server-FFmpeg purpose. HLS child tickets inherit their parent purpose. Other video requests retain Emby's native execution.
+## Persistence
 
-The FFmpeg adapter applies the same item, library, local-file, exact media-source ID and current-source checks to a single in-memory transcode job. A full-transcode command without a native segment delta is eligible only when its timestamp flags, absent offsets, segment number, actual segment duration, and absolute target prove the indexed timeline within 250 milliseconds. It uses only the loopback API origin reported by Emby and never writes the generated route to the library item, STRM file, configuration or media-information snapshot.
+Recovery snapshots store bounded technical fields using schema 3: container, duration, size/bitrate, valid default-stream selections and whitelisted internal-stream properties, including HDR/Dolby Vision and rotation. They exclude URLs, source headers, local paths, titles, credentials and arbitrary codec extradata. Snapshots allow at most 256 internal streams and validate their structure, values and references before use. Older schemas are ignored; invalid primary files use only a validated backup and are otherwise preserved as a cache miss.
 
-Fast-seek preparation normally reads two and at most three 512 KiB partial responses through the same redirect and trust policy. Its two-minute memory plan contains HMAC identity, media-source identity, timing, packet framing and byte offsets only. A 30-second source candidate may retain the validated effective address in memory; only the server-FFmpeg media request consumes it, using its own User-Agent and requiring an exact matching 206 range and length. Direct-client requests resolve independently, so a candidate created by another server-side operation cannot enter a client 302 response. The final address, query, headers and sampled bytes stay outside persistence and logs. The FFmpeg command retains the loopback gateway URL.
+Source identities use HMAC rather than persisted plaintext paths or URLs. Extraction state has bounded entries and validated failure/expiry fields. Successful technical writes to Emby remain possible when snapshot saving is disabled. Existing external stream paths remain in Emby's own records, not plugin snapshots.
 
-## Upstream headers
+Configuration necessarily persists selected library IDs and normalized trusted/detected hosts or IP rules. Protect configuration and recovery backups with the same filesystem permissions as other Emby plugin data.
 
-Request forwarding uses a fixed allowlist:
+## Logging and diagnostics
 
-- `Range`
-- `If-Range`
-- `If-None-Match`
-- `If-Modified-Since`
-- `Accept`
-- `Accept-Language`
-- `Cache-Control`
+Plugin logs use fixed event/reason codes, mode/status, host ABI, exception type, numeric timing/capacity data and shortened item IDs. They exclude URLs, signatures, local paths, titles, usernames, device names, full User-Agent, authentication headers and FFmpeg command lines. Short item IDs are diagnostic identifiers, not anonymization.
 
-The upstream request uses `Accept-Encoding: identity`. Emby authorization, cookies and API keys remain outside upstream requests. The transport has no shared cookie jar.
+Emby, reverse proxies, players and FFmpeg have independent logging behavior. Playback ticket paths, redirect Location values, signed URLs and conditional headers may appear there even when plugin logs are clean. Redact these before sharing and keep retention bounded. Health/Diagnostics exposes version/build, configuration counts and name-free prefix metadata without invoking third-party patch factories.
 
-Response forwarding uses status codes and a fixed metadata allowlist including content type, content length, content range, range support, validators and content disposition. Gateway responses force private, non-cacheable handling instead of forwarding upstream cache policy.
+## Failure and lifecycle behavior
 
-## Logging
+Before routing is committed, ABI, source mapping or mutation failures retain native behavior and revoke newly allocated state. Insufficient fast-positioning evidence retains the original FFmpeg command. Once a gateway response is in progress, failure may terminate the stream rather than restart native playback.
 
-Plugin logs contain fixed event names and these bounded dynamic fields:
+Transport capacity returns 503 with Retry-After, connection failure 502, connection-stage address rejection 403 and control timeout 504 when headers remain writable. A timeout after body delivery begins aborts the stream. Errors do not become media-body caches or reusable final-address leases. Source backoff is bounded and excludes client/runtime cancellation and trust rejection.
 
-- exception type
-- ABI version
-- target count
-- transport event
-- item ID first eight hexadecimal characters
-- aggregate count
-- packet stride, probe count and pre-roll milliseconds
+Cancellation remains linked to returned body streams until disposal. Configuration changes prevent stale task commits; shutdown cancels requests and clears tickets, leases and plans. Delayed output cleanup checks the exact registered path, latest job ownership and active jobs before deleting through Emby's filesystem API.
 
-Plugin logs exclude paths, hosts, URLs, query values, signatures, `Location`, User-Agent values, tickets, headers, media titles, library names and user names. Debug logging keeps the same field policy.
-
-Detected-host persistence contains normalized exact hostnames only. It excludes schemes, ports, paths, queries, fragments and credentials. Administrator activities and notifications contain aggregate counts.
-
-Redirect leases are keyed by a SHA-256 digest of the capability ticket, HTTP method and normalized request context. Range values are excluded so nearby byte requests can share one lease. Effective addresses exist only in bounded process memory, receive redirect-policy validation on every use, expire after 30 seconds, and are cleared with runtime-sensitive state. Generation checks prevent late in-flight resolutions from repopulating cleared leases.
-
-Direct-play decisions use a separate SHA-256 context over ticket depth, actual upstream resource, item identity, media-source identity, the HMAC-backed STRM fingerprint, the runtime-salted authorization binding and a separate runtime-HMAC device binding, followed by method, User-Agent, `Accept` and `Accept-Language`. When Emby reports no device identifier, the context is isolated to one playback ticket. Raw upstream resources, user identities and device identifiers are absent from keys and logs. A redirected target becomes eligible for no-pre-read handoff only after a second actual request validates its status and Range response. Different HLS resources, authorization identities or devices do not share targets or Adaptive relay decisions. Both decisions expire after 30 seconds, are bounded to 4,096 entries, remain memory-only and obey runtime generation invalidation through both their single-flight gate and upstream open.
-
-## Configuration localization
-
-Emby's authenticated Generic UI service selects `CurrentUICulture` from its native `ClientLocale` before invoking the plugin page lifecycle. The plugin does not parse locale input or inspect the HTTP request. It reads embedded resources through the SDK's localization attributes and assigns only display names and descriptions on the request-owned native editor model. It does not refresh global type metadata or read or change authentication values, form values, host rules or media data.
-
-Async-local execution context isolates concurrent request cultures. Configuration descriptions are selected from embedded resources, HTML-encoded, and wrapped only with fixed selectable-text styling. The plugin does not modify Emby Web files and exposes no browser module, custom configuration page, localization endpoint or UI Harmony patch.
-
-## Failure behavior
-
-PlaybackInfo processing retains the native response after ABI, mapping, ticket or rewrite failure. Standard static-video requests and per-job FFmpeg state retain native execution until every STRM scope and source check has passed; a transcode mutation failure restores the original state and revokes its ticket. Gateway capacity returns 503 with a bounded retry hint, upstream header or body-idle timeout returns 504, and trust or source validation failure returns a uniform unavailable response. Only final 200 and 206 responses can populate a redirect lease. A fresh redirect target or leased target returning 401, 403, 404 or 410 is released and resolved once from the original source. The same total timeout bounds both attempts, direct sources are not retried, and the second result is returned without another retry. Adaptive direct play records a short relay decision after rejected reuse, authorization or missing-resource failures, rate limiting, or server errors. Successful relay responses do not extend that decision, and a request-specific 416 does not affect later ranges. Configuration invalidation and shutdown cancel active control operations and clear memory-only tickets, redirect leases, direct-play decisions and fast-seek plans. A fast-seek probe, calibration or command-shape failure keeps the original FFmpeg command unchanged.
+Detailed budgets, cache keys, Range validation, HLS resource limits and retry contracts are maintained in the [design](STRM_BRIDGE_DESIGN.md). Regression and deployment checks are in [TESTING.md](TESTING.md).

@@ -9,8 +9,10 @@ namespace Emby.StrmBridge.Persistence;
 
 public sealed class ExtractionStateStore
 {
-    internal const int DefaultMaximumEntries = 16384;
-    private const int MaximumDocumentBytes = 16 * 1024 * 1024;
+    private const int MaximumConsecutiveFailures = 7;
+    private const int MaximumRetryDelaySeconds = 24 * 60 * 60;
+    internal const int DefaultMaximumEntries = 32768;
+    private const int MaximumDocumentBytes = 32 * 1024 * 1024;
     private const int MaximumObjectGraphItemsPerEntry = 8;
     private readonly object sync = new();
     private readonly string path;
@@ -72,7 +74,8 @@ public sealed class ExtractionStateStore
         ValidateKey(sourceFingerprint, nameof(sourceFingerprint));
         lock (sync)
         {
-            var entry = GetOrCreateEntry(storageKey);
+            var entry = GetOrCreateSuccessEntry(storageKey);
+            if (entry is null) return;
             entry.ConsecutiveFailures = 0;
             entry.RetryAtUtcTicks = 0;
             entry.LastSuccessfulSourceFingerprint = sourceFingerprint;
@@ -96,11 +99,16 @@ public sealed class ExtractionStateStore
                 dirty = true;
                 return true;
             }
-            if (document.CapacityExceeded || document.Entries.Count >= maximumEntries)
+            if (document.Entries.Count >= maximumEntries)
             {
                 document.CapacityExceeded = true;
                 dirty = true;
                 return false;
+            }
+            if (document.CapacityExceeded)
+            {
+                document.CapacityExceeded = false;
+                dirty = true;
             }
             var entry = new ExtractionStateEntry
             {
@@ -128,14 +136,18 @@ public sealed class ExtractionStateStore
         ValidateKey(sourceFingerprint, nameof(sourceFingerprint));
         lock (sync)
         {
-            var entry = GetOrCreateEntry(storageKey);
-            entry.ConsecutiveFailures = string.Equals(
-                entry.LastFailureSourceFingerprint,
-                sourceFingerprint,
-                StringComparison.Ordinal)
-                ? Math.Min(entry.ConsecutiveFailures + 1, 8)
-                : 1;
-            var seconds = Math.Min(3600, 15 * (1 << Math.Min(entry.ConsecutiveFailures, 7)));
+            var entry = GetOrCreateFailureEntry(storageKey, now);
+            if (entry is null) return;
+            var previousFailures = string.Equals(
+                                       entry.LastFailureSourceFingerprint,
+                                       sourceFingerprint,
+                                       StringComparison.Ordinal) &&
+                                   entry.ConsecutiveFailures is >= 1 and <= MaximumConsecutiveFailures
+                ? entry.ConsecutiveFailures
+                : 0;
+            entry.ConsecutiveFailures = Math.Min(previousFailures + 1, MaximumConsecutiveFailures);
+            var exponent = Math.Min(2 * (entry.ConsecutiveFailures - 1), 12);
+            var seconds = Math.Min(MaximumRetryDelaySeconds, 30 * (1 << exponent));
             entry.RetryAtUtcTicks = now.AddSeconds(seconds).UtcDateTime.Ticks;
             entry.LastFailureSourceFingerprint = sourceFingerprint;
             dirty = true;
@@ -196,9 +208,7 @@ public sealed class ExtractionStateStore
         {
             var changed = document.Entries.RemoveAll(item => !activeStorageKeys.Contains(item.StorageKey)) > 0;
             if (changed) RebuildIndex();
-            if (document.CapacityExceeded &&
-                activeStorageKeys.Count <= maximumEntries &&
-                activeStorageKeys.All(entriesByKey.ContainsKey))
+            if (document.CapacityExceeded && document.Entries.Count < maximumEntries)
             {
                 document.CapacityExceeded = false;
                 changed = true;
@@ -293,18 +303,14 @@ public sealed class ExtractionStateStore
             }
             using var buffer = new MemoryStream(data, writable: false);
             loaded = serializer.ReadObject(buffer) as ExtractionStateDocument;
-            if (loaded?.SchemaVersion != 2 || loaded.Entries is null) return false;
-            loaded.Entries = loaded.Entries
-                .Where(entry => IsKey(entry.StorageKey) &&
-                                (string.IsNullOrEmpty(entry.LastSuccessfulSourceFingerprint) ||
-                                 IsKey(entry.LastSuccessfulSourceFingerprint)) &&
-                                (string.IsNullOrEmpty(entry.LastFailureSourceFingerprint) ||
-                                 IsKey(entry.LastFailureSourceFingerprint)))
-                .GroupBy(entry => entry.StorageKey, StringComparer.Ordinal)
-                .Select(group => group.First())
-                .Take(maximumEntries)
-                .ToList();
-            if (loaded.Entries.Count >= maximumEntries) loaded.CapacityExceeded = true;
+            if (loaded?.SchemaVersion != 3 || loaded.Entries is null ||
+                loaded.Entries.Count > maximumEntries)
+                return false;
+            var storageKeys = new HashSet<string>(StringComparer.Ordinal);
+            if (loaded.Entries.Any(entry =>
+                    !IsValidEntry(entry) || !storageKeys.Add(entry.StorageKey)))
+                return false;
+            loaded.CapacityExceeded = loaded.Entries.Count >= maximumEntries;
             return true;
         }
         catch (Exception exception) when (
@@ -315,16 +321,45 @@ public sealed class ExtractionStateStore
         }
     }
 
-    private ExtractionStateEntry GetOrCreateEntry(string storageKey)
+    private ExtractionStateEntry? GetOrCreateSuccessEntry(string storageKey)
     {
         if (entriesByKey.TryGetValue(storageKey, out var entry)) return entry;
         if (document.Entries.Count >= maximumEntries)
         {
             document.CapacityExceeded = true;
-            entriesByKey.Remove(document.Entries[0].StorageKey);
-            document.Entries.RemoveAt(0);
+            dirty = true;
+            return null;
         }
-        entry = new ExtractionStateEntry { StorageKey = storageKey };
+        return AddEntry(storageKey);
+    }
+
+    private ExtractionStateEntry? GetOrCreateFailureEntry(string storageKey, DateTimeOffset now)
+    {
+        if (entriesByKey.TryGetValue(storageKey, out var entry)) return entry;
+        if (document.Entries.Count >= maximumEntries)
+        {
+            // A new failure must never rotate out a source whose retry delay is still
+            // active. Prefer state that no longer controls probing: successful baselines,
+            // then an expired failure. If every retained failure is active, preserve them
+            // and leave the new source untracked instead of cascading through the whole
+            // state set in stable library order.
+            var nowTicks = now.UtcDateTime.Ticks;
+            var removable = document.Entries.FirstOrDefault(candidate =>
+                candidate.ConsecutiveFailures == 0);
+            removable ??= document.Entries.FirstOrDefault(candidate =>
+                candidate.RetryAtUtcTicks <= nowTicks);
+            document.CapacityExceeded = true;
+            dirty = true;
+            if (removable is null) return null;
+            entriesByKey.Remove(removable.StorageKey);
+            document.Entries.Remove(removable);
+        }
+        return AddEntry(storageKey);
+    }
+
+    private ExtractionStateEntry AddEntry(string storageKey)
+    {
+        var entry = new ExtractionStateEntry { StorageKey = storageKey };
         document.Entries.Add(entry);
         entriesByKey.Add(storageKey, entry);
         return entry;
@@ -345,10 +380,25 @@ public sealed class ExtractionStateStore
         value?.Length == 64 && value.All(character =>
             character >= '0' && character <= '9' || character >= 'a' && character <= 'f');
 
+    private static bool IsValidEntry(ExtractionStateEntry? entry)
+    {
+        if (entry is null || !IsKey(entry.StorageKey) ||
+            (!string.IsNullOrEmpty(entry.LastSuccessfulSourceFingerprint) &&
+             !IsKey(entry.LastSuccessfulSourceFingerprint)) ||
+            entry.ConsecutiveFailures is < 0 or > MaximumConsecutiveFailures ||
+            entry.RetryAtUtcTicks < 0 || entry.RetryAtUtcTicks > DateTime.MaxValue.Ticks)
+            return false;
+
+        if (entry.ConsecutiveFailures == 0)
+            return entry.RetryAtUtcTicks == 0 &&
+                   string.IsNullOrEmpty(entry.LastFailureSourceFingerprint);
+        return entry.RetryAtUtcTicks > 0 && IsKey(entry.LastFailureSourceFingerprint);
+    }
+
     [DataContract]
     private sealed class ExtractionStateDocument
     {
-        [DataMember(Order = 1)] public int SchemaVersion { get; set; } = 2;
+        [DataMember(Order = 1)] public int SchemaVersion { get; set; } = 3;
         [DataMember(Order = 2)] public List<ExtractionStateEntry> Entries { get; set; } = new();
         [DataMember(Order = 3, EmitDefaultValue = false)] public bool CapacityExceeded { get; set; }
     }

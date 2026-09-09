@@ -10,7 +10,7 @@ namespace Emby.StrmBridge.Domain;
 [DataContract]
 public sealed class MediaInfoSnapshot
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
     public const int MaximumMediaStreams = 256;
 
     [DataMember(Order = 1)]
@@ -63,14 +63,12 @@ public sealed class MediaInfoSnapshot
             LocalLastWriteUtcTicks = source.LocalLastWriteUtc.UtcDateTime.Ticks,
             ExtractedAtUtcTicks = extractedAtUtc.UtcDateTime.Ticks,
             Container = NullIfSensitive(mediaSource.Container),
-            Size = mediaSource.Size,
-            Bitrate = mediaSource.Bitrate,
+            Size = NonNegative(mediaSource.Size),
+            Bitrate = NonNegative(mediaSource.Bitrate),
             RunTimeTicks = mediaSource.RunTimeTicks,
             DefaultAudioStreamIndex = mediaSource.DefaultAudioStreamIndex,
             DefaultSubtitleStreamIndex = mediaSource.DefaultSubtitleStreamIndex,
-            MediaStreams = (mediaSource.MediaStreams ?? new List<MediaStream>())
-                .Where(stream => !stream.IsExternal && IsSupportedStreamType(stream.Type))
-                .Take(MaximumMediaStreams)
+            MediaStreams = SelectInternalStreams(mediaSource.MediaStreams)
                 .Select(MediaStreamSnapshot.FromMediaStream)
                 .ToList(),
         };
@@ -81,11 +79,30 @@ public sealed class MediaInfoSnapshot
         type == MediaStreamType.Audio ||
         type == MediaStreamType.Subtitle;
 
+    internal static List<MediaStream> SelectInternalStreams(IEnumerable<MediaStream>? mediaStreams)
+    {
+        var supported = (mediaStreams ?? Enumerable.Empty<MediaStream>())
+            .Where(stream => !stream.IsExternal && IsSupportedStreamType(stream.Type))
+            .ToList();
+        if (supported.Count <= MaximumMediaStreams) return supported;
+
+        var selected = supported.Take(MaximumMediaStreams).ToList();
+        if (selected.Any(stream => stream.Type == MediaStreamType.Video)) return selected;
+        var video = supported.FirstOrDefault(stream => stream.Type == MediaStreamType.Video);
+        if (video is not null) selected[selected.Count - 1] = video;
+        return selected;
+    }
+
     public bool Matches(SourceIdentity source) =>
         SchemaVersion == CurrentSchemaVersion &&
         string.Equals(SourceFingerprint, source.SourceFingerprint, StringComparison.Ordinal) &&
         LocalFileLength == source.LocalFileLength &&
-        LocalLastWriteUtcTicks == source.LocalLastWriteUtc.UtcDateTime.Ticks;
+        TechnicalMediaInfo.IsComplete(
+            Container,
+            RunTimeTicks,
+            MediaStreams?.Any(stream =>
+                stream is not null &&
+                (stream.Type == MediaStreamType.Video || stream.Type == MediaStreamType.Audio)) == true);
 
     public MediaSourceInfo ToMediaSource(string id)
     {
@@ -107,8 +124,13 @@ public sealed class MediaInfoSnapshot
         value.IndexOfAny(new[] { '/', '\\', '?', '#', '@' }) >= 0
             ? null
             : value;
+
+    private static long? NonNegative(long? value) => value is >= 0 ? value : null;
+
+    private static int? NonNegative(int? value) => value is >= 0 ? value : null;
 }
 
+#pragma warning disable CS0612 // Preserve the SDK's legacy AVC negotiation field across snapshots.
 [DataContract]
 public sealed class MediaStreamSnapshot
 {
@@ -136,6 +158,18 @@ public sealed class MediaStreamSnapshot
     [DataMember(Order = 23)] public bool IsForced { get; set; }
     [DataMember(Order = 24)] public string? Language { get; set; }
 
+    [DataMember(Order = 25)] public ExtendedVideoTypes ExtendedVideoType { get; set; }
+    [DataMember(Order = 26)] public ExtendedVideoSubTypes ExtendedVideoSubType { get; set; }
+    [DataMember(Order = 27)] public int? Rotation { get; set; }
+    [DataMember(Order = 28)] public string? CodecTag { get; set; }
+    [DataMember(Order = 29)] public int? RefFrames { get; set; }
+    [DataMember(Order = 30)] public bool? IsAVC { get; set; }
+    [DataMember(Order = 31)] public string? NalLengthSize { get; set; }
+    [DataMember(Order = 32)] public long? StreamStartTimeTicks { get; set; }
+    [DataMember(Order = 33)] public bool? IsAnamorphic { get; set; }
+    [DataMember(Order = 34)] public bool IsHearingImpaired { get; set; }
+    [DataMember(Order = 35)] public string? TimeBase { get; set; }
+
     public static MediaStreamSnapshot FromMediaStream(MediaStream stream)
     {
         if (stream is null) throw new ArgumentNullException(nameof(stream));
@@ -145,17 +179,17 @@ public sealed class MediaStreamSnapshot
             Index = stream.Index,
             Codec = TechnicalString(stream.Codec),
             Profile = TechnicalString(stream.Profile),
-            Level = stream.Level,
+            Level = NonNegativeFinite(stream.Level),
             PixelFormat = TechnicalString(stream.PixelFormat),
-            BitRate = stream.BitRate,
-            Channels = stream.Channels,
-            SampleRate = stream.SampleRate,
+            BitRate = NonNegative(stream.BitRate),
+            Channels = NonNegative(stream.Channels),
+            SampleRate = NonNegative(stream.SampleRate),
             ChannelLayout = TechnicalString(stream.ChannelLayout),
-            BitDepth = stream.BitDepth,
-            Width = stream.Width,
-            Height = stream.Height,
-            AverageFrameRate = stream.AverageFrameRate,
-            RealFrameRate = stream.RealFrameRate,
+            BitDepth = NonNegative(stream.BitDepth),
+            Width = NonNegative(stream.Width),
+            Height = NonNegative(stream.Height),
+            AverageFrameRate = NonNegativeFinite(stream.AverageFrameRate),
+            RealFrameRate = NonNegativeFinite(stream.RealFrameRate),
             AspectRatio = TechnicalString(stream.AspectRatio),
             ColorSpace = TechnicalString(stream.ColorSpace),
             ColorTransfer = TechnicalString(stream.ColorTransfer),
@@ -164,6 +198,17 @@ public sealed class MediaStreamSnapshot
             IsDefault = stream.IsDefault,
             IsForced = stream.IsForced,
             Language = TechnicalString(stream.Language),
+            ExtendedVideoType = stream.ExtendedVideoType,
+            ExtendedVideoSubType = stream.ExtendedVideoSubType,
+            Rotation = stream.Rotation,
+            CodecTag = TechnicalString(stream.CodecTag),
+            RefFrames = NonNegative(stream.RefFrames),
+            IsAVC = stream.IsAVC,
+            NalLengthSize = TechnicalString(stream.NalLengthSize),
+            StreamStartTimeTicks = stream.StreamStartTimeTicks,
+            IsAnamorphic = stream.IsAnamorphic,
+            IsHearingImpaired = stream.IsHearingImpaired,
+            TimeBase = IsTimeBase(stream.TimeBase) ? stream.TimeBase : null,
         };
     }
 
@@ -192,7 +237,29 @@ public sealed class MediaStreamSnapshot
         IsDefault = IsDefault,
         IsForced = IsForced,
         Language = Language,
+        ExtendedVideoType = ExtendedVideoType,
+        ExtendedVideoSubType = ExtendedVideoSubType,
+        Rotation = Rotation,
+        CodecTag = CodecTag,
+        RefFrames = RefFrames,
+        IsAVC = IsAVC,
+        NalLengthSize = NalLengthSize,
+        StreamStartTimeTicks = StreamStartTimeTicks,
+        IsAnamorphic = IsAnamorphic,
+        IsHearingImpaired = IsHearingImpaired,
+        TimeBase = TimeBase,
     };
+
+    internal static bool IsTimeBase(string? value)
+    {
+        if (value is null) return true;
+        var parts = value.Split('/');
+        return value.Length <= 32 && parts.Length == 2 &&
+               long.TryParse(parts[0], System.Globalization.NumberStyles.None,
+                   System.Globalization.CultureInfo.InvariantCulture, out var numerator) && numerator > 0 &&
+               long.TryParse(parts[1], System.Globalization.NumberStyles.None,
+                   System.Globalization.CultureInfo.InvariantCulture, out var denominator) && denominator > 0;
+    }
 
     private static string? TechnicalString(string? value)
     {
@@ -203,4 +270,18 @@ public sealed class MediaStreamSnapshot
         }
         return value;
     }
+
+    private static int? NonNegative(int? value) => value is >= 0 ? value : null;
+
+    private static double? NonNegativeFinite(double? value) =>
+        value.HasValue && !double.IsNaN(value.Value) && !double.IsInfinity(value.Value) && value.Value >= 0
+            ? value
+            : null;
+
+    private static float? NonNegativeFinite(float? value) =>
+        value.HasValue && !float.IsNaN(value.Value) && !float.IsInfinity(value.Value) && value.Value >= 0
+            ? value
+            : null;
 }
+
+#pragma warning restore CS0612

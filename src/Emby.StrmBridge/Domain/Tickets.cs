@@ -12,6 +12,7 @@ public enum PlaybackTicketPurpose
 {
     DirectClient = 1,
     ServerFfmpeg = 2,
+    ExtractionProbe = 3,
 }
 
 public sealed class TicketPayload
@@ -27,6 +28,7 @@ public sealed class TicketPayload
         PlaybackTicketPurpose purpose,
         int runtimeGeneration,
         int hlsDepth,
+        bool sourceRedirectHandoffAllowed,
         DateTimeOffset issuedAtUtc,
         DateTimeOffset expiresAtUtc,
         DateTimeOffset maximumExpiresAtUtc,
@@ -42,6 +44,7 @@ public sealed class TicketPayload
         Purpose = purpose;
         RuntimeGeneration = runtimeGeneration;
         HlsDepth = hlsDepth;
+        SourceRedirectHandoffAllowed = sourceRedirectHandoffAllowed;
         IssuedAtUtc = issuedAtUtc;
         ExpiresAtUtc = expiresAtUtc;
         MaximumExpiresAtUtc = maximumExpiresAtUtc;
@@ -68,6 +71,8 @@ public sealed class TicketPayload
 
     public int HlsDepth { get; }
 
+    internal bool SourceRedirectHandoffAllowed { get; }
+
     public DateTimeOffset IssuedAtUtc { get; }
 
     public DateTimeOffset ExpiresAtUtc { get; internal set; }
@@ -75,5 +80,15 @@ public sealed class TicketPayload
     internal DateTimeOffset MaximumExpiresAtUtc { get; }
 
     internal TimeSpan PlaybackLifetime { get; }
+
+    internal int ProbeRejectionReason = -1;
+
+    internal int ProbeRequestObserved;
+
+    internal int ProbeLocalFailureObserved;
+
+    internal Action? ProbeInputObservedCallback;
+
+    internal System.Threading.CancellationToken ProbeCancellation { get; set; }
 
 }

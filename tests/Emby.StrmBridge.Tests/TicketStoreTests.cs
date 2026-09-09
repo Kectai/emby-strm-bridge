@@ -7,6 +7,131 @@ namespace Emby.StrmBridge.Tests;
 public sealed class TicketStoreTests
 {
     [TestMethod]
+    public void TranscodeInput_MatchesExactPurposeUserSourceVersionAndGenerationWithoutExtendingExpiry()
+    {
+        var clock = new ManualClock();
+        var store = new TicketStore(clock);
+        var item = Guid.NewGuid();
+        var source = TestSources.Create();
+        var ticket = store.IssuePlayback(item, "media", "user", source, PlaybackTicketPurpose.ServerFfmpeg, 3);
+        Assert.IsTrue(store.MatchesTranscodeInput(ticket, item, "media", "user", source, 3));
+        Assert.IsFalse(store.MatchesTranscodeInput(ticket, item, "media", null, source, 3));
+        Assert.IsFalse(store.MatchesTranscodeInput(ticket, item, "other", "user", source, 3));
+        Assert.IsFalse(store.MatchesTranscodeInput(ticket, Guid.NewGuid(), "media", "user", source, 3));
+        Assert.IsFalse(store.MatchesTranscodeInput(ticket, item, "media", "user", source, 4));
+        var clientTicket = store.IssuePlayback(item, "media", "user", source, PlaybackTicketPurpose.DirectClient, 3);
+        Assert.IsFalse(store.MatchesTranscodeInput(clientTicket, item, "media", "user", source, 3));
+        var changedSource = new SourceIdentity(source.StorageKey, source.SourceFingerprint, source.SourceUri,
+            source.LocalPath, source.LocalFileLength + 1, source.LocalLastWriteUtc);
+        Assert.IsFalse(store.MatchesTranscodeInput(ticket, item, "media", "user", changedSource, 3));
+        clock.Advance(TicketStore.PreviewLifetime);
+        Assert.IsFalse(store.MatchesTranscodeInput(ticket, item, "media", "user", source, 3));
+    }
+
+    [TestMethod]
+    public void NativePlayback_ReusesSessionButSeparatesUsersDevicesAndNewPlayback()
+    {
+        var store = new TicketStore(new ManualClock());
+        var item = Guid.NewGuid();
+        var source = TestSources.Create();
+        var lifetime = TimeSpan.FromHours(2);
+        var first = store.GetOrIssueNativePlayback(item, "media", "user", "device", "session-one",
+            source, 0, lifetime, out var transient);
+        Assert.IsFalse(transient);
+        for (var i = 0; i < TicketStore.MaximumPlaybackTickets + 1; i++)
+        {
+            var next = store.GetOrIssueNativePlayback(item, "media", "user", "device", "session-one",
+                source, 0, lifetime, out transient);
+            Assert.AreEqual(first, next);
+            Assert.IsTrue(store.TryRedeem(next, "user", out _));
+        }
+        Assert.AreEqual(1, store.Count);
+        Assert.AreNotEqual(first, store.GetOrIssueNativePlayback(item, "media", "user2", "device", "session-one",
+            source, 0, lifetime, out _));
+        Assert.AreNotEqual(first, store.GetOrIssueNativePlayback(item, "media", "user", "device2", "session-one",
+            source, 0, lifetime, out _));
+        var fresh = store.IssuePlayback(item, "media", "user", source, PlaybackTicketPurpose.DirectClient, 0,
+            lifetime, "device");
+        store.RegisterNativePlayback(fresh, "session-two");
+        Assert.AreEqual(fresh, store.GetOrIssueNativePlayback(item, "media", "user", "device", null,
+            source, 0, lifetime, out transient));
+        Assert.IsFalse(transient);
+        Assert.AreNotEqual(first, fresh);
+        store.Clear();
+        var anonymous = store.GetOrIssueNativePlayback(item, "media", null, null, null,
+            source, 1, lifetime, out transient);
+        Assert.IsTrue(transient);
+        store.ReleaseRequestTicket(anonymous);
+        Assert.AreEqual(0, store.Count);
+    }
+
+    [TestMethod]
+    public void SourceRedirectHandoffHint_IsLimitedToDirectPlaybackAndDoesNotReachHlsChildren()
+    {
+        var store = new TicketStore(new ManualClock());
+        var item = Guid.NewGuid();
+        var source = TestSources.Create();
+        var directTicket = store.IssuePlayback(
+            item, "media", "user", source, PlaybackTicketPurpose.DirectClient, 1,
+            sourceRedirectHandoffAllowed: true);
+        var ffmpegTicket = store.IssuePlayback(
+            item, "media", "user", source, PlaybackTicketPurpose.ServerFfmpeg, 1,
+            sourceRedirectHandoffAllowed: true);
+
+        Assert.IsTrue(store.TryInspect(directTicket, out var direct));
+        Assert.IsTrue(direct!.SourceRedirectHandoffAllowed);
+        Assert.IsTrue(store.TryInspect(ffmpegTicket, out var ffmpeg));
+        Assert.IsFalse(ffmpeg!.SourceRedirectHandoffAllowed);
+
+        var childTicket = store.IssueHlsResource(
+            directTicket,
+            directTicket,
+            direct,
+            new Uri("https://source.invalid/segment.ts"),
+            out _);
+        Assert.IsTrue(store.TryInspect(childTicket, out var child));
+        Assert.IsFalse(child!.SourceRedirectHandoffAllowed);
+    }
+
+    [TestMethod]
+    public void NativePlayback_SeparatesKnownFileAndUnknownSourceHintsWithinOneSession()
+    {
+        var store = new TicketStore(new ManualClock());
+        var item = Guid.NewGuid();
+        var source = TestSources.Create();
+        var lifetime = TimeSpan.FromHours(2);
+        var unknown = store.GetOrIssueNativePlayback(
+            item, "media", "user", "device", "session", source, 1, lifetime, out _,
+            sourceRedirectHandoffAllowed: false);
+        var knownFile = store.GetOrIssueNativePlayback(
+            item, "media", "user", "device", "session", source, 1, lifetime, out _,
+            sourceRedirectHandoffAllowed: true);
+        var knownFileAgain = store.GetOrIssueNativePlayback(
+            item, "media", "user", "device", "session", source, 1, lifetime, out _,
+            sourceRedirectHandoffAllowed: true);
+
+        Assert.AreNotEqual(unknown, knownFile);
+        Assert.AreEqual(knownFile, knownFileAgain);
+        Assert.IsTrue(store.TryInspect(unknown, out var unknownPayload));
+        Assert.IsFalse(unknownPayload!.SourceRedirectHandoffAllowed);
+        Assert.IsTrue(store.TryInspect(knownFile, out var knownFilePayload));
+        Assert.IsTrue(knownFilePayload!.SourceRedirectHandoffAllowed);
+    }
+
+    [TestMethod]
+    public void ProbeTicket_CannotOutliveItsShortProbeBudget()
+    {
+        var clock = new ManualClock();
+        var store = new TicketStore(clock);
+        var ticket = store.IssuePlayback(Guid.NewGuid(), "probe", null, TestSources.Create(),
+            PlaybackTicketPurpose.ExtractionProbe, 0, TimeSpan.FromSeconds(30));
+        clock.Advance(TimeSpan.FromSeconds(29));
+        Assert.IsTrue(store.TryRedeem(ticket, null, out _));
+        clock.Advance(TimeSpan.FromSeconds(1));
+        Assert.IsFalse(store.TryRedeem(ticket, null, out _));
+    }
+
+    [TestMethod]
     public void PlaybackTicket_IsOpaqueUserBoundAndCapabilityAccessible()
     {
         var store = new TicketStore(new ManualClock(), 2, 2);
@@ -30,7 +155,7 @@ public sealed class TicketStoreTests
     }
 
     [TestMethod]
-    public void DirectRouteScope_IsStableAcrossTicketsAndSeparatedByUserAndDevice()
+    public void DirectRouteScope_IsStableWithinOneTicketAndSeparatedAcrossPlaybackTickets()
     {
         var store = new TicketStore(new ManualClock(), 6, 2);
         var itemId = Guid.NewGuid();
@@ -65,7 +190,8 @@ public sealed class TicketStoreTests
         Assert.IsTrue(store.TryInspect(anotherUnboundTicket, out var anotherUnbound));
 
         var firstScope = GatewayTransport.CreateDirectRouteScope(first!, firstTicket);
-        Assert.AreEqual(firstScope, GatewayTransport.CreateDirectRouteScope(reconnect!, reconnectTicket));
+        Assert.AreEqual(firstScope, GatewayTransport.CreateDirectRouteScope(first!, firstTicket));
+        Assert.AreNotEqual(firstScope, GatewayTransport.CreateDirectRouteScope(reconnect!, reconnectTicket));
         Assert.AreNotEqual(
             firstScope,
             GatewayTransport.CreateDirectRouteScope(anotherUser!, anotherUserTicket));

@@ -4,28 +4,33 @@
   <resheader name="version"><value>2.0</value></resheader>
   <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
   <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
-  <data name="PluginDescription" xml:space="preserve"><value>Extracts STRM media information and routes playback through the current Emby server.</value></data>
+  <data name="PluginDescription" xml:space="preserve"><value>Extracts technical media information for audio and video STRM items and routes video playback through the current Emby server.</value></data>
   <data name="EditorTitle" xml:space="preserve"><value>STRM Bridge</value></data>
-  <data name="EditorDescription" xml:space="preserve"><value>Extracts technical media information and routes selected STRM playback through an in-process gateway.</value></data>
+  <data name="EditorDescription" xml:space="preserve"><value>Extracts technical media information for selected audio and video STRM items. The in-process playback gateway applies only to video STRM items.</value></data>
   <data name="Enabled" xml:space="preserve"><value>Enable plugin</value></data>
   <data name="PlaybackMode" xml:space="preserve"><value>Playback routing mode</value></data>
-  <data name="PlaybackModeDescription" xml:space="preserve"><value>Applies only to STRM items in included libraries. Adaptive (recommended): automatically chooses direct access or relay. For ordinary file direct play, the player reads from the validated source address and media data bypasses Emby; if address reuse fails validation, that playback context temporarily uses Emby relay. Transcoding and HLS are relayed through Emby, with fast positioning for remote TS/M2TS during server-side processing. RedirectOnly: always returns a usable validated source address for direct access by the requester. RelayOnly: always relays media data through Emby, for players that cannot reach the source directly. Native: uses Emby's original playback flow.</value></data>
+  <data name="PlaybackModeDescription" xml:space="preserve"><value>Applies only to video STRM items in included libraries. Adaptive (recommended): players read ordinary direct-play files from a validated source address; server-side transcode or remux jobs use a job-local loopback address and hand off to the final source as early as possible; the plugin rewrites HLS manifests and Emby relays resources that cannot be handed off safely; remote TS/M2TS server processing supports evidence-based fast positioning. RedirectOnly: the requester reads directly from a validated final source without HLS manifest relay rewriting. RelayOnly: Emby relays all media data. Native: uses Emby's original playback flow.</value></data>
+  <data name="EnableFastSeek" xml:space="preserve"><value>Enable evidence-based fast positioning</value></data>
+  <data name="EnableFastSeekDescription" xml:space="preserve"><value>Enabled by default. Disabling it keeps normal gateway routing, redirects, relay, and HLS behavior, and disables only evidence-based positioning for remote TS/M2TS server processing. Use this capability switch to isolate seek behavior; routing never depends on client names.</value></data>
   <data name="ExtractAfterLibraryScan" xml:space="preserve"><value>Extract after library scan</value></data>
   <data name="OnlyMissingMediaInfo" xml:space="preserve"><value>Only extract missing media information</value></data>
-  <data name="OnlyMissingMediaInfoDescription" xml:space="preserve"><value>Enabled: unchanged complete technical information is skipped and matching snapshots may restore missing data. Disabled: every selected STRM is probed again and its snapshot is replaced.</value></data>
-  <data name="EnablePersistence" xml:space="preserve"><value>Persist media information</value></data>
+  <data name="OnlyMissingMediaInfoDescription" xml:space="preserve"><value>When enabled, audio sources with an internal audio stream and video sources with an internal video stream are skipped when duration and container are also valid. Disable it or explicitly force extraction to probe again.</value></data>
+  <data name="EnablePersistence" xml:space="preserve"><value>Save recovery snapshots</value></data>
+  <data name="EnablePersistenceDescription" xml:space="preserve"><value>Controls only the plugin's recovery snapshots. Disabling it stops new recovery snapshots from being saved; successfully extracted technical fields are still written to Emby.</value></data>
   <data name="MaximumExtractionConcurrency" xml:space="preserve"><value>Maximum extraction concurrency</value></data>
   <data name="ExtractionTimeoutSeconds" xml:space="preserve"><value>Per-item timeout in seconds</value></data>
   <data name="GatewayTimeoutSeconds" xml:space="preserve"><value>Gateway upstream timeout in seconds</value></data>
+  <data name="DirectRedirectCacheSeconds" xml:space="preserve"><value>Direct redirect cache duration (seconds)</value></data>
+  <data name="DirectRedirectCacheSecondsDescription" xml:space="preserve"><value>Defaults to 20 seconds. Set to 0 to resolve a fresh Location from the source for every request. A value from 1 to 60 reuses a validated redirect target only within the playback ticket, without the plugin requesting its media, and advertises the same private cache lifetime to the client. Set to 0 for single-use signed URLs.</value></data>
   <data name="RedirectHopLimit" xml:space="preserve"><value>Maximum redirect hops</value></data>
   <data name="RelayConcurrency" xml:space="preserve"><value>Maximum relay concurrency</value></data>
   <data name="IncludedLibraryIds" xml:space="preserve"><value>Included media libraries</value></data>
-  <data name="IncludedLibraryIdsDescription" xml:space="preserve"><value>Select one or more Emby media libraries. Leave empty to disable all STRM Bridge processing.</value></data>
+  <data name="IncludedLibraryIdsDescription" xml:space="preserve"><value>Select one or more Emby libraries containing STRM items. Extraction supports audio and video; playback routing applies only to video. Leave empty to disable all STRM Bridge processing.</value></data>
   <data name="DetectedRedirectHosts" xml:space="preserve"><value>Detected redirect hosts</value></data>
-  <data name="DetectedRedirectHostsDescription" xml:space="preserve"><value>Select only pending hostnames you trust and save. Trusted detections remain listed and marked; saving new trust automatically retries waiting media. You can also enter exact hosts, IP ranges, or an explicit subdomain rule such as *.example.com below. Full URLs, paths, and query strings are never retained.</value></data>
+  <data name="DetectedRedirectHostsDescription" xml:space="preserve"><value>Select only pending hosts you trust and save. Detections are persisted as normalized hostnames or IP addresses, remain visible after restart, and show current trust status; schemes, ports, paths, queries, fragments, and credentials are not retained. Saving new trust automatically retries waiting media. You can also enter an exact host, IP range, or explicit subdomain rule such as *.example.com below.</value></data>
   <data name="TrustedHostSuffix" xml:space="preserve"><value> (trusted)</value></data>
   <data name="AllowedRedirectHosts" xml:space="preserve"><value>Trusted upstream hosts</value></data>
-  <data name="AllowedRedirectHostsDescription" xml:space="preserve"><value>Enter an exact host, IP address, CIDR, or *.example.com subdomain rule. Same-host hops from a selected STRM source are trusted automatically. Every cross-host redirect is checked before connection.</value></data>
+  <data name="AllowedRedirectHostsDescription" xml:space="preserve"><value>Enter an exact host, IP address, CIDR, or *.example.com subdomain rule. Same-host hops are trusted; cross-host redirects are checked before connection. Direct connections to names resolving to private or special-use addresses also require IP/CIDR approval. System-proxied destinations are resolved by the proxy. Rejected addresses appear in the detection list; literal IP sources remain supported.</value></data>
   <data name="AwaitingApprovalNotificationTitle" xml:space="preserve"><value>STRM Bridge is waiting for approval</value></data>
   <data name="AwaitingApprovalNotificationDescription" xml:space="preserve"><value>Detected {0} unapproved redirect host(s). Some media are waiting for approval. Open STRM Bridge settings to review them.</value></data>
   <data name="RetryCompletedNotificationTitle" xml:space="preserve"><value>STRM Bridge automatic retry completed</value></data>
@@ -33,13 +38,14 @@
   <data name="ConcurrencyValidation" xml:space="preserve"><value>Concurrency must be 1 or 2.</value></data>
   <data name="TimeoutValidation" xml:space="preserve"><value>Extraction and gateway timeouts must stay within their displayed ranges.</value></data>
   <data name="GatewayValidation" xml:space="preserve"><value>Redirect hops and relay concurrency must stay within their displayed ranges.</value></data>
+  <data name="DirectRedirectCacheValidation" xml:space="preserve"><value>Direct redirect cache duration must be between 0 and 60 seconds.</value></data>
   <data name="LibraryValidation" xml:space="preserve"><value>Every media library ID must be a GUID.</value></data>
   <data name="RedirectHostValidation" xml:space="preserve"><value>Each entry must be an exact DNS name, IP address, CIDR range, or one explicit subdomain rule such as *.example.com. Schemes, paths, ports, and other wildcard forms are not allowed.</value></data>
   <data name="RedirectHostCapacityValidation" xml:space="preserve"><value>No more than 256 redirect-host rules may be configured.</value></data>
   <data name="ScheduledTaskName" xml:space="preserve"><value>Extract missing STRM media information</value></data>
-  <data name="ScheduledTaskDescription" xml:space="preserve"><value>Safely probes missing technical media information for supported local STRM files.</value></data>
+  <data name="ScheduledTaskDescription" xml:space="preserve"><value>Safely probes missing technical media information for supported local audio and video STRM files.</value></data>
   <data name="ClearStoredMediaInfoTaskName" xml:space="preserve"><value>Clear stored STRM Bridge media information</value></data>
-  <data name="ClearStoredMediaInfoTaskDescription" xml:space="preserve"><value>Manually clears STRM Bridge snapshots and extraction state, plus internal technical media information in selected libraries. External streams and media files are retained.</value></data>
+  <data name="ClearStoredMediaInfoTaskDescription" xml:space="preserve"><value>Manually clears STRM Bridge snapshots and extraction state, plus internal technical media information for STRM items in selected libraries. External streams and media files are retained.</value></data>
   <data name="ScheduledTaskCategory" xml:space="preserve"><value>Library</value></data>
   <data name="TaskInitializationError" xml:space="preserve"><value>STRM Bridge has not finished initializing.</value></data>
   <data name="InvalidItemIdError" xml:space="preserve"><value>The item ID must be a GUID.</value></data>

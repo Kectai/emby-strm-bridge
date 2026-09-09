@@ -10,6 +10,7 @@ using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Logging;
 using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Services;
+using AudioItem = MediaBrowser.Controller.Entities.Audio.Audio;
 
 namespace Emby.StrmBridge.Tests;
 
@@ -45,7 +46,7 @@ public sealed class PlaybackInfoProcessorTests
         Assert.AreEqual(original.ProbePath, response.MediaSources[0].ProbePath);
         Assert.AreSame(original.MediaStreams, response.MediaSources[0].MediaStreams);
         Assert.IsTrue(response.MediaSources[0].DirectStreamUrl.StartsWith(
-            "/emby/StrmBridge/Playback/v2/", StringComparison.Ordinal));
+            "/emby/StrmBridge/Playback/v3/", StringComparison.Ordinal));
         Assert.IsTrue(response.MediaSources[0].DirectStreamUrl.EndsWith("/stream.mkv", StringComparison.Ordinal));
         Assert.IsFalse(response.MediaSources[0].AddApiKeyToDirectStreamUrl);
         Assert.AreEqual(1, fixture.Runtime.Tickets.Count);
@@ -53,6 +54,7 @@ public sealed class PlaybackInfoProcessorTests
             .Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)[^2];
         Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(ticket, out var payload));
         Assert.AreEqual(PlaybackTicketPurpose.DirectClient, payload!.Purpose);
+        Assert.IsTrue(payload.SourceRedirectHandoffAllowed);
         Assert.AreEqual(32, payload.DeviceBindingHash.Length);
     }
 
@@ -103,26 +105,70 @@ public sealed class PlaybackInfoProcessorTests
             string.Empty);
 
         Assert.AreEqual(1, count);
-        StringAssert.StartsWith(response.MediaSources[0].DirectStreamUrl, "/StrmBridge/Playback/v2/");
+        StringAssert.StartsWith(response.MediaSources[0].DirectStreamUrl, "/StrmBridge/Playback/v3/");
+    }
+
+    [TestMethod]
+    public void AudioStrmInSelectedLibrary_KeepsOriginalPlaybackInfo()
+    {
+        using var fixture = CreateFixture(PlaybackRoutingMode.Adaptive, container: "mp3", isAudio: true);
+        var source = new MediaSourceInfo
+        {
+            Id = "audio-source",
+            ItemId = fixture.Item.Id.ToString("N"),
+            Path = fixture.SourceUrl,
+            ProbePath = fixture.SourceUrl,
+            Container = "mp3",
+        };
+        var response = new PlaybackInfoResponse { MediaSources = new[] { source } };
+
+        Assert.AreEqual(0, fixture.Processor.TryRewrite(
+            response, fixture.Item.Id, "user-id", "/emby", "device-id"));
+        Assert.AreSame(source, response.MediaSources[0]);
+        Assert.AreEqual(0, fixture.Runtime.Tickets.Count);
+    }
+
+    [TestMethod]
+    [DataRow("requires-opening")]
+    [DataRow("requires-closing")]
+    [DataRow("open-token")]
+    [DataRow("required-headers")]
+    public void CurrentIneligibleMediaSource_KeepsOriginalPlaybackInfo(string constraint)
+    {
+        using var fixture = CreateFixture(PlaybackRoutingMode.Adaptive);
+        var source = new MediaSourceInfo
+        {
+            Id = "current-source",
+            ItemId = fixture.Item.Id.ToString("N"),
+            Path = fixture.SourceUrl,
+            ProbePath = fixture.SourceUrl,
+            Container = "mkv",
+        };
+        MakeIneligible(source, constraint);
+        var response = new PlaybackInfoResponse { MediaSources = new[] { source } };
+
+        Assert.AreEqual(0, fixture.Processor.TryRewrite(
+            response, fixture.Item.Id, "user-id", "/emby", "device-id"));
+        Assert.AreSame(source, response.MediaSources[0]);
+        Assert.AreEqual(0, fixture.Runtime.Tickets.Count);
     }
 
     private static Fixture CreateFixture(
         PlaybackRoutingMode mode,
         string sourceUrl = "https://source.invalid/media",
-        string container = "mkv")
+        string container = "mkv",
+        bool isAudio = false)
     {
         var workspace = new TestWorkspace();
         var path = workspace.Write("playback.strm", sourceUrl);
         var library = new Folder { Id = Guid.NewGuid(), Name = "Library" };
-        var item = new Movie
-        {
-            Id = Guid.NewGuid(),
-            InternalId = Random.Shared.NextInt64(1, long.MaxValue),
-            Path = path,
-            Container = container,
-            Parent = library,
-            MediaStreams = new List<MediaBrowser.Model.Entities.MediaStream>(),
-        };
+        BaseItem item = isAudio ? new AudioItem() : new Movie();
+        item.Id = Guid.NewGuid();
+        item.InternalId = Random.Shared.NextInt64(1, long.MaxValue);
+        item.Path = path;
+        item.Container = container;
+        item.Parent = library;
+        item.MediaStreams = new List<MediaBrowser.Model.Entities.MediaStream>();
         item.SetParent(library);
         item.SetCachedParent(library);
         var libraryManager = TestProxy.Create<ILibraryManager>((method, args) => method.Name switch
@@ -137,8 +183,7 @@ public sealed class PlaybackInfoProcessorTests
                 : TestDispatchProxy.DefaultValue(method.ReturnType));
         var logger = TestProxy.Create<ILogger>((method, _) => TestDispatchProxy.DefaultValue(method.ReturnType));
         var runtime = new PluginRuntime();
-        runtime.Initialize(workspace.Path, new ManualClock(), new StubRedirectClient((_, _, _, _) =>
-            Task.FromResult(new RedirectSourceResponse(404, null, null))));
+        runtime.Initialize(workspace.Path, new ManualClock());
         runtime.UpdateOptions(new PluginConfiguration
         {
             Enabled = true,
@@ -157,12 +202,24 @@ public sealed class PlaybackInfoProcessorTests
                 logger));
     }
 
+    private static void MakeIneligible(MediaSourceInfo source, string constraint)
+    {
+        switch (constraint)
+        {
+            case "requires-opening": source.RequiresOpening = true; break;
+            case "requires-closing": source.RequiresClosing = true; break;
+            case "open-token": source.OpenToken = "open-token"; break;
+            case "required-headers": source.RequiredHttpHeaders = new() { ["Authorization"] = "secret" }; break;
+            default: throw new ArgumentOutOfRangeException(nameof(constraint));
+        }
+    }
+
     private sealed class Fixture : IDisposable
     {
         public Fixture(
             TestWorkspace workspace,
             PluginRuntime runtime,
-            Movie item,
+            BaseItem item,
             string sourceUrl,
             PlaybackInfoProcessor processor)
         {
@@ -177,7 +234,7 @@ public sealed class PlaybackInfoProcessorTests
 
         public PluginRuntime Runtime { get; }
 
-        public Movie Item { get; }
+        public BaseItem Item { get; }
 
         public string SourceUrl { get; }
 

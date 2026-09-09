@@ -17,9 +17,12 @@ public sealed class TicketStore
     public static readonly TimeSpan PlaybackReconnectGrace = TimeSpan.FromHours(2);
     public const int MaximumPlaybackTickets = 4096;
     public const int MaximumHlsTickets = 20000;
+    public const int MaximumHlsTicketsPerRoot = 12000;
     private readonly object sync = new();
     private readonly Dictionary<string, TicketPayload> entries = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> nativeSessions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Dictionary<string, string>> hlsTicketsByParent = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HlsManifestWindow> hlsManifests = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HlsTicketIndex> hlsTicketIndexes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, SemaphoreSlim> hlsMutationGates = new(StringComparer.Ordinal);
     private readonly IClock clock;
@@ -27,19 +30,30 @@ public sealed class TicketStore
     private readonly int hlsCapacity;
     private readonly byte[] userBindingSalt = CreateRandomBytes(32);
     private readonly byte[] deviceBindingSalt = CreateRandomBytes(32);
+    private const int MaximumHlsReferences = 40000;
+    private const int MaximumHlsReferencesPerRoot = 24000;
+    private readonly Dictionary<string, int> hlsReferenceCounts = new(StringComparer.Ordinal);
+    private int hlsReferenceCount;
+    private readonly int hlsRootCapacity;
     private int playbackCount;
     private int hlsCount;
+    private DateTimeOffset nextExpirationSweep;
+    internal long ExpirationSweepCount { get; private set; }
 
     public TicketStore(
         IClock clock,
         int playbackCapacity = MaximumPlaybackTickets,
-        int hlsCapacity = MaximumHlsTickets)
+        int hlsCapacity = MaximumHlsTickets,
+        int hlsRootCapacity = MaximumHlsTicketsPerRoot)
     {
         this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
         if (playbackCapacity < 1 || playbackCapacity > MaximumPlaybackTickets)
             throw new ArgumentOutOfRangeException(nameof(playbackCapacity));
         if (hlsCapacity < 1 || hlsCapacity > MaximumHlsTickets)
             throw new ArgumentOutOfRangeException(nameof(hlsCapacity));
+        if (hlsRootCapacity < 1 || hlsRootCapacity > MaximumHlsTicketsPerRoot)
+            throw new ArgumentOutOfRangeException(nameof(hlsRootCapacity));
+        this.hlsRootCapacity = Math.Min(hlsRootCapacity, hlsCapacity);
         this.playbackCapacity = playbackCapacity;
         this.hlsCapacity = hlsCapacity;
     }
@@ -57,10 +71,18 @@ public sealed class TicketStore
         PlaybackTicketPurpose purpose,
         int runtimeGeneration,
         TimeSpan? playbackLifetime = null,
-        string? deviceId = null)
+        string? deviceId = null,
+        bool sourceRedirectHandoffAllowed = false)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
-        var lifetime = ValidatePlaybackLifetime(playbackLifetime ?? MaximumLifetime);
+        var isProbe = purpose == PlaybackTicketPurpose.ExtractionProbe;
+        var lifetime = playbackLifetime ?? MaximumLifetime;
+        if (isProbe)
+        {
+            if (lifetime <= TimeSpan.Zero || lifetime > TimeSpan.FromMinutes(3))
+                throw new ArgumentOutOfRangeException(nameof(playbackLifetime));
+        }
+        else lifetime = ValidatePlaybackLifetime(lifetime);
         var now = clock.UtcNow;
         var payload = new TicketPayload(
             TicketScope.Playback,
@@ -73,11 +95,74 @@ public sealed class TicketStore
             purpose,
             runtimeGeneration,
             hlsDepth: 0,
+            sourceRedirectHandoffAllowed: purpose == PlaybackTicketPurpose.DirectClient &&
+                                          sourceRedirectHandoffAllowed,
             now,
-            now + PreviewLifetime,
-            now + MaximumLifetime,
+            now + (isProbe ? lifetime : PreviewLifetime),
+            now + (isProbe ? lifetime : MaximumLifetime),
             lifetime);
         return Add(payload, playbackCapacity);
+    }
+
+    internal void RegisterNativePlayback(string ticket, string? playSessionId)
+    {
+        lock (sync)
+        {
+            if (!entries.TryGetValue(ticket, out var payload)) return;
+            var key = NativeSessionKey(payload, playSessionId);
+            if (key.Length > 0) nativeSessions[key] = ticket;
+            var fallback = NativeSessionKey(payload, null);
+            if (fallback.Length > 0) nativeSessions[fallback] = ticket;
+        }
+    }
+
+    internal string GetOrIssueNativePlayback(
+        Guid itemId, string mediaSourceId, string? userId, string? deviceId,
+        string? playSessionId, SourceIdentity source, int runtimeGeneration,
+        TimeSpan lifetime, out bool requestScoped, bool sourceRedirectHandoffAllowed = false)
+    {
+        lock (sync)
+        {
+            var key = NativeSessionKey(itemId, mediaSourceId, source.SourceFingerprint,
+                HashUserId(userId), HashDeviceId(deviceId), sourceRedirectHandoffAllowed, playSessionId);
+            if (key.Length > 0 && nativeSessions.TryGetValue(key, out var current) &&
+                entries.TryGetValue(current, out var payload) &&
+                clock.UtcNow < payload.ExpiresAtUtc &&
+                payload.RuntimeGeneration == runtimeGeneration && payload.Source.HasSameFileVersion(source))
+            {
+                requestScoped = false;
+                return current;
+            }
+            var ticket = IssuePlayback(itemId, mediaSourceId, userId, source,
+                PlaybackTicketPurpose.DirectClient, runtimeGeneration, lifetime, deviceId,
+                sourceRedirectHandoffAllowed);
+            requestScoped = string.IsNullOrWhiteSpace(playSessionId) || key.Length == 0;
+            if (!requestScoped) nativeSessions[key] = ticket;
+            return ticket;
+        }
+    }
+
+    internal void ReleaseRequestTicket(string ticket)
+    {
+        lock (sync)
+            if (!hlsTicketsByParent.ContainsKey(ticket)) RemoveUnsafe(ticket);
+    }
+
+    private static string NativeSessionKey(TicketPayload payload, string? session) =>
+        NativeSessionKey(payload.ItemId, payload.MediaSourceId, payload.Source.SourceFingerprint,
+            payload.UserBindingHash, payload.DeviceBindingHash,
+            payload.SourceRedirectHandoffAllowed, session);
+
+    private static string NativeSessionKey(Guid itemId, string mediaSourceId, string fingerprint,
+        byte[] user, byte[] device, bool sourceRedirectHandoffAllowed, string? session)
+    {
+        if (user.Length == 0 || string.IsNullOrWhiteSpace(session) && device.Length == 0 || session?.Length > 256)
+            return string.Empty;
+        using var hash = SHA256.Create();
+        return Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(
+            itemId.ToString("N") + "\n" + mediaSourceId + "\n" + fingerprint + "\n" +
+            Convert.ToBase64String(user) + "\n" + Convert.ToBase64String(device) + "\n" +
+            (sourceRedirectHandoffAllowed ? "file" : "unknown") + "\n" + session)));
     }
 
     public string IssueHlsResource(
@@ -98,9 +183,11 @@ public sealed class TicketStore
             throw new ArgumentException("The HLS resource URI is too long.", nameof(upstreamUri));
         lock (sync)
         {
-            RemoveExpiredUnsafe();
+            SweepExpiredIfDueUnsafe();
             if (!entries.TryGetValue(rootTicket, out var root) || root.Scope != TicketScope.Playback ||
+                IsExpiredUnsafe(rootTicket, root, clock.UtcNow) ||
                 !entries.TryGetValue(currentTicket, out var current) || !ReferenceEquals(current, parent) ||
+                IsExpiredUnsafe(currentTicket, current, clock.UtcNow) ||
                 parent.Scope == TicketScope.Playback && !string.Equals(rootTicket, currentTicket, StringComparison.Ordinal) ||
                 parent.Scope == TicketScope.HlsResource &&
                 (!hlsTicketIndexes.TryGetValue(currentTicket, out var currentIndex) ||
@@ -115,9 +202,23 @@ public sealed class TicketStore
                 Uri.Compare(existing.UpstreamUri, upstreamUri, UriComponents.AbsoluteUri,
                     UriFormat.UriEscaped, StringComparison.Ordinal) == 0)
             {
-                return existingTicket;
+                if (!IsExpiredUnsafe(existingTicket, existing, clock.UtcNow)) return existingTicket;
+                RemoveUnsafe(existingTicket);
+                hlsTicketsByParent.TryGetValue(rootTicket, out indexed);
             }
 
+            if (indexed?.Count >= hlsRootCapacity || hlsCount >= hlsCapacity)
+            {
+                // Capacity pressure must reclaim expired entries even inside the sweep interval.
+                SweepExpiredIfDueUnsafe(force: true);
+                if (!entries.ContainsKey(rootTicket) || !entries.ContainsKey(currentTicket) ||
+                    IsExpiredUnsafe(rootTicket, root, clock.UtcNow) ||
+                    IsExpiredUnsafe(currentTicket, current, clock.UtcNow))
+                    throw new InvalidOperationException("The HLS ticket relationship is unavailable.");
+                hlsTicketsByParent.TryGetValue(rootTicket, out indexed);
+            }
+            if (indexed?.Count >= hlsRootCapacity)
+                throw new TicketCapacityException();
             var now = clock.UtcNow;
             var payload = new TicketPayload(
                 TicketScope.HlsResource,
@@ -130,11 +231,13 @@ public sealed class TicketStore
                 parent.Purpose,
                 parent.RuntimeGeneration,
                 parent.HlsDepth + 1,
+                sourceRedirectHandoffAllowed: false,
                 now,
                 parent.ExpiresAtUtc,
                 parent.MaximumExpiresAtUtc,
                 parent.PlaybackLifetime);
             var ticket = AddUnsafe(payload, hlsCapacity);
+            payload.ProbeCancellation = parent.ProbeCancellation;
             indexed ??= new Dictionary<string, string>(StringComparer.Ordinal);
             indexed[resourceKey] = ticket;
             hlsTicketsByParent[rootTicket] = indexed;
@@ -144,6 +247,53 @@ public sealed class TicketStore
         }
     }
 
+    internal void CommitHlsManifest(string rootTicket, string manifestTicket,
+        IEnumerable<string> resourceTickets, TimeSpan? retention)
+    {
+        lock (sync)
+        {
+            if (!entries.TryGetValue(rootTicket, out var root) || root.Scope != TicketScope.Playback ||
+                clock.UtcNow >= root.ExpiresAtUtc ||
+                manifestTicket != rootTicket && !IsHlsResourceOfRoot(rootTicket, manifestTicket))
+                throw new InvalidOperationException("The HLS manifest is unavailable.");
+            var resources = new HashSet<string>(resourceTickets, StringComparer.Ordinal);
+            foreach (var resource in resources)
+                if (!hlsTicketIndexes.TryGetValue(resource, out var index) || index.ParentTicket != rootTicket)
+                    throw new InvalidOperationException("The HLS resource relationship is unavailable.");
+            var addedReferences = resources.Count(resource =>
+                !hlsTicketIndexes[resource].References.ContainsKey(manifestTicket));
+            hlsReferenceCounts.TryGetValue(rootTicket, out var rootReferences);
+            if (hlsReferenceCount + addedReferences > MaximumHlsReferences ||
+                rootReferences + addedReferences > MaximumHlsReferencesPerRoot)
+                throw new TicketCapacityException();
+            if (hlsManifests.TryGetValue(manifestTicket, out var previous))
+            {
+                // Keep the longest observed window: a shrinking live playlist must not
+                // shorten the promised lifetime of resources in an older response.
+                retention = previous.Retention is null || retention is null ? null :
+                    previous.Retention > retention ? previous.Retention : retention;
+                foreach (var removed in previous.Resources.Except(resources))
+                    RetireReferenceUnsafe(removed, manifestTicket, retention);
+            }
+            foreach (var resource in resources)
+                hlsTicketIndexes[resource].References[manifestTicket] = null;
+            hlsReferenceCount += addedReferences;
+            hlsReferenceCounts[rootTicket] = rootReferences + addedReferences;
+            hlsManifests[manifestTicket] = new HlsManifestWindow(resources, retention);
+        }
+    }
+
+    private void RetireReferenceUnsafe(string resource, string manifest, TimeSpan? retention)
+    {
+        if (hlsTicketIndexes.TryGetValue(resource, out var index) && index.References.ContainsKey(manifest))
+            index.References[manifest] = retention.HasValue ? clock.UtcNow + retention.Value : null;
+    }
+
+    private bool IsExpiredUnsafe(string ticket, TicketPayload payload, DateTimeOffset now) =>
+        now >= payload.ExpiresAtUtc ||
+        hlsTicketIndexes.TryGetValue(ticket, out var index) && index.References.Count > 0 &&
+        index.References.Values.All(deadline => deadline.HasValue && now >= deadline.Value);
+
     public bool TryInspect(string ticket, out TicketPayload? payload)
     {
         payload = null;
@@ -151,13 +301,26 @@ public sealed class TicketStore
         lock (sync)
         {
             if (!entries.TryGetValue(ticket, out var found)) return false;
-            if (clock.UtcNow >= found.ExpiresAtUtc)
+            if (IsExpiredUnsafe(ticket, found, clock.UtcNow))
             {
                 RemoveUnsafe(ticket);
                 return false;
             }
             payload = found;
             return true;
+        }
+    }
+
+    internal bool MatchesTranscodeInput(string ticket, Guid itemId, string mediaSourceId,
+        string? userId, SourceIdentity source, int runtimeGeneration)
+    {
+        lock (sync)
+        {
+            return TryInspect(ticket, out var payload) && payload is not null &&
+                   payload.Scope == TicketScope.Playback && payload.Purpose == PlaybackTicketPurpose.ServerFfmpeg &&
+                   payload.ItemId == itemId && payload.MediaSourceId == mediaSourceId &&
+                   payload.RuntimeGeneration == runtimeGeneration && payload.Source.HasSameFileVersion(source) &&
+                   FixedTimeEquals(payload.UserBindingHash, HashUserId(userId));
         }
     }
 
@@ -169,7 +332,7 @@ public sealed class TicketStore
         {
             if (!entries.TryGetValue(ticket, out var found)) return false;
             var now = clock.UtcNow;
-            if (now >= found.ExpiresAtUtc)
+            if (IsExpiredUnsafe(ticket, found, now))
             {
                 RemoveUnsafe(ticket);
                 return false;
@@ -194,7 +357,7 @@ public sealed class TicketStore
         {
             return entries.TryGetValue(rootTicket, out var root) && root.Scope == TicketScope.Playback &&
                    entries.TryGetValue(childTicket, out var child) && child.Scope == TicketScope.HlsResource &&
-                   clock.UtcNow < root.ExpiresAtUtc && clock.UtcNow < child.ExpiresAtUtc &&
+                   clock.UtcNow < root.ExpiresAtUtc && !IsExpiredUnsafe(childTicket, child, clock.UtcNow) &&
                    hlsTicketIndexes.TryGetValue(childTicket, out var index) &&
                    string.Equals(index.ParentTicket, rootTicket, StringComparison.Ordinal);
         }
@@ -220,6 +383,8 @@ public sealed class TicketStore
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         lock (sync)
         {
+            // One batch sweep before rewriting, outside the per-URI path.
+            SweepExpiredIfDueUnsafe(force: true);
             if (entries.TryGetValue(rootTicket, out var root) && root.Scope == TicketScope.Playback &&
                 clock.UtcNow < root.ExpiresAtUtc)
                 return new HlsMutationLease(gate);
@@ -238,11 +403,9 @@ public sealed class TicketStore
     {
         lock (sync)
         {
-            var expired = entries.Where(entry => clock.UtcNow >= entry.Value.ExpiresAtUtc)
-                .Select(entry => entry.Key)
-                .ToArray();
-            foreach (var ticket in expired) RemoveUnsafe(ticket);
-            return expired.Length;
+            var previousCount = entries.Count;
+            SweepExpiredIfDueUnsafe(force: true);
+            return previousCount - entries.Count;
         }
     }
 
@@ -251,11 +414,16 @@ public sealed class TicketStore
         lock (sync)
         {
             entries.Clear();
+            nativeSessions.Clear();
             hlsTicketsByParent.Clear();
             hlsTicketIndexes.Clear();
+            hlsManifests.Clear();
+            hlsReferenceCounts.Clear();
+            hlsReferenceCount = 0;
             hlsMutationGates.Clear();
             playbackCount = 0;
             hlsCount = 0;
+            nextExpirationSweep = default;
         }
     }
 
@@ -271,7 +439,7 @@ public sealed class TicketStore
     {
         lock (sync)
         {
-            RemoveExpiredUnsafe();
+            SweepExpiredIfDueUnsafe(force: playbackCount >= scopeCapacity);
             return AddUnsafe(payload, scopeCapacity);
         }
     }
@@ -288,19 +456,39 @@ public sealed class TicketStore
         return ticket;
     }
 
-    private void RemoveExpiredUnsafe()
+    private void SweepExpiredIfDueUnsafe(bool force = false)
     {
         var now = clock.UtcNow;
-        foreach (var ticket in entries.Where(entry => now >= entry.Value.ExpiresAtUtc)
+        if (!force && now < nextExpirationSweep) return;
+        nextExpirationSweep = now + TimeSpan.FromSeconds(1);
+        ExpirationSweepCount++;
+        foreach (var ticket in entries.Where(entry => IsExpiredUnsafe(entry.Key, entry.Value, now))
                      .Select(entry => entry.Key).ToArray())
             RemoveUnsafe(ticket);
+        foreach (var index in hlsTicketIndexes.Values)
+        {
+            var expired = index.References.Where(pair => pair.Value.HasValue && now >= pair.Value.Value)
+                .Select(pair => pair.Key).ToArray();
+            foreach (var manifest in expired) index.References.Remove(manifest);
+            if (expired.Length == 0) continue;
+            hlsReferenceCount -= expired.Length;
+            hlsReferenceCounts[index.ParentTicket] -= expired.Length;
+        }
     }
 
     private void RemoveUnsafe(string ticket)
     {
         if (!entries.TryGetValue(ticket, out var payload) || !entries.Remove(ticket)) return;
+        if (hlsManifests.TryGetValue(ticket, out var window))
+        {
+            hlsManifests.Remove(ticket);
+            foreach (var resource in window.Resources)
+                RetireReferenceUnsafe(resource, ticket, window.Retention);
+        }
         if (payload.Scope == TicketScope.Playback)
         {
+            foreach (var key in nativeSessions.Where(pair => pair.Value == ticket).Select(pair => pair.Key).ToArray())
+                nativeSessions.Remove(key);
             playbackCount--;
             hlsMutationGates.Remove(ticket);
             if (hlsTicketsByParent.TryGetValue(ticket, out var children))
@@ -308,6 +496,7 @@ public sealed class TicketStore
                 foreach (var childTicket in children.Values.ToArray()) RemoveUnsafe(childTicket);
                 hlsTicketsByParent.Remove(ticket);
             }
+            hlsReferenceCounts.Remove(ticket);
         }
         else
         {
@@ -315,6 +504,14 @@ public sealed class TicketStore
             if (hlsTicketIndexes.TryGetValue(ticket, out var index))
             {
                 hlsTicketIndexes.Remove(ticket);
+                hlsReferenceCount -= index.References.Count;
+                if (hlsReferenceCounts.TryGetValue(index.ParentTicket, out var referenceCount))
+                {
+                    if (referenceCount == index.References.Count) hlsReferenceCounts.Remove(index.ParentTicket);
+                    else hlsReferenceCounts[index.ParentTicket] = referenceCount - index.References.Count;
+                }
+                foreach (var manifest in index.References.Keys)
+                    if (hlsManifests.TryGetValue(manifest, out var owner)) owner.Resources.Remove(ticket);
                 if (hlsTicketsByParent.TryGetValue(index.ParentTicket, out var children))
                 {
                     children.Remove(index.ResourceKey);
@@ -398,6 +595,20 @@ public sealed class TicketStore
         public string ParentTicket { get; }
 
         public string ResourceKey { get; }
+
+        public Dictionary<string, DateTimeOffset?> References { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class HlsManifestWindow
+    {
+        public HlsManifestWindow(HashSet<string> resources, TimeSpan? retention)
+        {
+            Resources = resources;
+            Retention = retention;
+        }
+
+        public HashSet<string> Resources { get; }
+        public TimeSpan? Retention { get; }
     }
 
     private sealed class HlsMutationLease : IDisposable

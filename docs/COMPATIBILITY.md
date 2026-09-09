@@ -1,46 +1,65 @@
 # Compatibility
 
-## Current baseline
+## Supported baseline
 
-- target framework: `netstandard2.1`
-- compile-time Emby SDK: `MediaBrowser.Server.Core 4.9.1.80`
-- playback ABI: `Emby.Server.MediaEncoding 4.9.5.x`
-- Harmony runtime: `Lib.Harmony 2.4.2`, `net6.0`
+| Component | Target and verification boundary |
+| --- | --- |
+| Plugin framework | `netstandard2.1` |
+| Compile-time SDK | `MediaBrowser.Server.Core 4.9.1.80` |
+| Playback ABI | Emby Server media-encoding assembly `4.9.5.x`; every required signature must match |
+| Offline host checks | Actual Emby `4.9.5.0` assemblies and bundled `5.1-emby` FFmpeg |
+| Patch runtime | Reuse one compatible loaded Harmony runtime; otherwise use the embedded `Lib.Harmony 2.4.2` fallback |
 
-The local Emby Server 4.9.5.0 assemblies were inspected by `tools/Emby.ApiProbe`. The implementation verifies these runtime signatures:
+Six methods cover PlaybackInfo GET/POST, standard static video, FFmpeg job preparation, command execution and managed-output cleanup. An unsupported version or incompatible signature leaves playback native. Extraction and maintenance are separate from this playback gate, but are not thereby certified on untested Emby versions. Exact integration contracts are in the [design](STRM_BRIDGE_DESIGN.md); release evidence and pending live checks are in [TESTING.md](TESTING.md#release-readiness).
 
-```text
-Task<object> MediaInfoService.Get(GetPlaybackInfo)
-Task<object> MediaInfoService.Post(GetPostedPlaybackInfo)
-Task<object> BaseProgressiveStreamingService.ProcessRequest(StreamRequest, bool)
-Task<TranscodingJob> BaseStreamingService.StartFfMpeg(StreamState, string, CancellationToken, bool)
-Task<bool> FfmpegRunner.Start(FfmpegCommand, CancellationToken)
-PlaybackInfoResponse.MediaSources
-MediaSourceInfo.DirectStreamUrl
-```
+## Media and client scope
 
-An ABI mismatch leaves playback native and logs one fixed compatibility event. Extraction, persistence and maintenance continue independently.
+Extraction supports eligible audio and video STRM in selected libraries. Actual Audio items are probed as audio even when their URLs have no extension; other items use Emby's public MIME classification. Audio playback retains native behavior.
 
-Configuration localization uses the public `BasePluginSimpleUI<T>` lifecycle, `EditableOptionsBase.CreateEditContainer()`, SDK localization attributes and embedded resources. It does not patch or bind to internal Generic UI HTTP service methods, so UI localization has no independent runtime ABI gate and does not affect playback-patch health or routing behavior.
+Video routing requires an exact item/media-source match and an unchanged local STRM source. It supports clients consuming `DirectStreamUrl`, standard video requests with `Static=true`, and eligible Emby server-side FFmpeg jobs. Clients that use the original source path directly may bypass these entry points. Local media, unselected libraries, unmatched versions, dynamic sources and sources requiring extra upstream headers remain native.
 
-## Playback clients
+Client routes use the existing Emby origin and URL Base. Server-side FFmpeg and extraction use Emby's reported loopback API origin. The configuration UI uses the public Generic UI lifecycle and embedded language resources; it does not modify Emby Web files.
 
-The plugin exposes ordinary HTTP GET/HEAD routes with Range support. It supports clients that consume `DirectStreamUrl` and clients that request Emby's standard static-video route with an exact media-source ID. Client-specific names and vendor identifiers are absent from routing decisions.
+## Source behavior
 
-The standard-route adapter activates only for `Static=true` requests whose exact media source maps to a `.strm` item in a participating library. When Emby starts server-side transcoding, a separate adapter revalidates the per-job item, exact media-source ID and unchanged STRM source, then changes that job's `StreamState` input to a gateway URL using the local API origin reported by the running Emby instance. Eligible non-zero remote transport streams receive a PCR-calibrated byte plan before the final HTTP segment command starts. PlaybackInfo source and probe paths stay native. Local files, unmatched media versions and libraries outside the configured scope remain on Emby's native path.
+### Client-generated seek thumbnails
 
-## Upstream behavior
+Some clients open extra media ranges to generate seek thumbnails/live previews. When a source limits concurrent reads or request rate, these requests can compete with playback and cause prolonged buffering, stalled seeking or rejected reads. If affected, try disabling seek thumbnails/live previews. This concerns previews generated from video data, not ordinary poster or artwork requests.
 
-Adaptive mode returns a validated final redirect for ordinary client direct play, reuses it only after an actual request confirms status and Range behavior, and temporarily selects relay for a direct-play context whose redirect is rejected. Server-side FFmpeg inputs and HLS remain relayed. RelayOnly retains full server relay for sources whose final address cannot be consumed by a client. RedirectOnly exposes a usable validated final URL for every eligible request.
+In an observed case, CDN captures contained HTTP 403 responses alongside successful range reads, and disabling thumbnails restored playback. This supports the workaround for that scenario, without establishing a universal connection limit or a shared cause for similar symptoms in other clients.
 
-Adaptive routing uses ticket purpose and observed HLS behavior rather than client, vendor, host or filename rules. Release validation uses the live 4.9.5.x matrix in [TESTING.md](TESTING.md).
+After redirect handoff, the plugin cannot observe downstream errors or schedule the reader's thumbnail and playback requests. `RelayOnly` exposes server-side reads and applies transport capacity protection, but has no thumbnail-versus-playback priority scheduler. Lower concurrency can produce 503 responses instead of restoring playback; switching modes is not a verified substitute for disabling previews.
 
-## Host verification
+### Redirects, caching, and one-use URLs
 
-Follow [TESTING.md](TESTING.md) after installation. The required first signal is:
+For known ordinary files, Adaptive DirectClient routing validates the first authoritative redirect and returns 302 without opening its target. The ticket-scoped first-hop cache defaults to 20 seconds, accepts 0–60 and is bounded by remaining ticket/route lifetimes. It is a configurable performance tradeoff: the plugin cannot infer one-use, Range-bound or shorter-lived signature semantics. Set it to 0 for those sources. Client cache-bypass directives force a fresh resolution.
 
-```text
-STRM_BRIDGE_PATCH_READY abi=4.9.5.0 targets=5
-```
+Adaptive may follow and read an unknown source to classify it before obtaining a fresh first hop for file delivery. Server-FFmpeg ordinary-file handoff validates the target before issuing a loopback-only 307, cached for at most 20 seconds and bounded by ticket/source-lease expiry. These paths require URLs that tolerate validation reads. Use `RelayOnly` when the final target cannot be reopened or media reads must pass through Emby, accepting server bandwidth use and capacity limits.
 
-`Native` mode is the operational fallback for an unsupported host and keeps PlaybackInfo, standard-video execution and FFmpeg input unchanged.
+After handoff, later redirects, DNS, CDN responses and retries belong to the reader. Plugin source backoff applies only to failures its own transport observes. A stable redirect reduces source resolution work; it does not enforce downstream connection limits.
+
+### HLS and Range
+
+Adaptive rewrites complete HLS manifests and routes referenced resources through scoped tickets. `RedirectOnly` skips manifest rewriting. Live windows can change ETag, length and resources; static-file representation checks are separate. Rewritten manifests return 200 with their own length and omit origin range/validator metadata.
+
+Manifest limits are 2 MiB, 20,000 lines, 10,000 URIs and depth 8. Resource/reference quotas also apply across sessions; growing EVENT playlists and large VOD lists can reach them. Capacity pressure returns a retryable 503. See the [design](STRM_BRIDGE_DESIGN.md) for retirement and quota contracts.
+
+Server reads validate single-range 206 responses, including suffix ranges. Valid full 200, conditional 304 and unsatisfied 416 responses retain their HTTP meaning. A 200 is never fabricated into a 206. Except in RedirectOnly, body responses that ignore identity encoding are rejected before classification; HEAD remains bodyless and preserves Content-Encoding.
+
+### Server-side fast positioning
+
+Fast positioning is enabled by default but applies only to eligible TS/M2TS jobs with packet, clock and random-access evidence, matching strong ETag/length and a controlled HTTP request profile. Missing validators, custom headers/User-Agent or insufficient evidence retain native positioning. The feature can be disabled without disabling gateway routing.
+
+Preparation has bounded time/bytes before Emby's FFmpeg startup window. If optimized startup returns false after process shutdown, the plugin can restore the original command and retry once within the original budget. Faulted tasks do not start a second process. Correctness must be checked against actual playback time/frames; successful startup alone is insufficient.
+
+## Network and other playback patches
+
+Gateway transport follows .NET's default system/environment proxy and bypass selection. Direct connections validate and pin resolved addresses; named private services require IP/CIDR approval. A selected proxy controls destination DNS and egress. Proxy failure terminates the request. See [security](SECURITY.md) for these distinct trust boundaries.
+
+<a id="other-playback-patches"></a>
+
+Harmony coexistence has two constraints: startup must select a single compatible runtime, and other plugins must not short-circuit the same standard video-stream method. Multiple active runtimes, or multiple inactive candidates without a unique active implementation, fail closed. A numeric prefix priority does not override Harmony ordering constraints. Health/Diagnostics reports current prefix metadata; `NativePrefixUncontended=true` establishes that no competing prefix was present at inspection time.
+
+Disable competing video or audio STRM direct-redirect features that patch that shared method, restart Emby, and verify the loaded patch and actual route. Metadata-only features may remain enabled.
+
+Extraction requires evidence that the current loopback probe input was opened. If Emby's probe returns or fails without opening it, STRM Bridge attempts an independent process using the configured ffprobe within the original budget. Repeated unavailable/unopened fallback or local result failures stop later remote probes for that run after three consecutive failures. Local completeness checks and snapshot recovery continue; the next run can try again. The plugin does not enter another extension's private probe scope.

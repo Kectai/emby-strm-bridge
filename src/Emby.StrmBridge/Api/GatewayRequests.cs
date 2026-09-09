@@ -3,7 +3,7 @@ using MediaBrowser.Model.Services;
 
 namespace Emby.StrmBridge.Api;
 
-[Route("/StrmBridge/Playback/v2/{Ticket}/{FileName}", "GET,HEAD", Summary = "Streams a ticketed STRM source")]
+[Route("/StrmBridge/Playback/v3/{Ticket}/{FileName}", "GET,HEAD", Summary = "Streams a ticketed STRM source")]
 [Unauthenticated]
 public sealed class GetStrmBridgePlayback
 {
@@ -12,7 +12,7 @@ public sealed class GetStrmBridgePlayback
     public string FileName { get; set; } = string.Empty;
 }
 
-[Route("/StrmBridge/Playback/v2/{ParentTicket}/hls/{Ticket}/{FileName}", "GET,HEAD", Summary = "Streams a ticketed HLS resource")]
+[Route("/StrmBridge/Playback/v3/{ParentTicket}/hls/{Ticket}/{FileName}", "GET,HEAD", Summary = "Streams a ticketed HLS resource")]
 [Unauthenticated]
 public sealed class GetStrmBridgeHlsResource
 {

@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace Emby.StrmBridge.Playback;
@@ -12,6 +13,31 @@ public static class HlsPlaylistRewriter
     private static readonly Regex UriAttribute = new(
         "URI=(?:\"(?<quoted>[^\"]+)\"|(?<plain>[^,\\s]+))",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    // Removed live segments remain readable for at least the longest playlist
+    // duration plus the longest segment duration (RFC 8216 section 6.2.2).
+    internal static TimeSpan? GetResourceRetention(string manifest)
+    {
+        var lines = manifest.Replace("\r", string.Empty).Split('\n');
+        if (lines.Any(line => line.Trim() is "#EXT-X-ENDLIST" or "#EXT-X-PLAYLIST-TYPE:VOD"))
+            return null; // Static media remains seekable for the root ticket lifetime.
+        double duration = 0, longestSegment = 0;
+        foreach (var raw in lines)
+        {
+            var line = raw.Trim();
+            var segment = line.StartsWith("#EXTINF:", StringComparison.Ordinal);
+            var target = line.StartsWith("#EXT-X-TARGETDURATION:", StringComparison.Ordinal);
+            if (!segment && !target) continue;
+            var value = line.Substring(line.IndexOf(':') + 1).Split(',')[0];
+            if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds) ||
+                double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds <= 0)
+                throw new InvalidOperationException("The HLS duration is invalid.");
+            longestSegment = Math.Max(longestSegment, seconds);
+            if (segment) duration = Math.Min(TicketStore.MaximumLifetime.TotalSeconds, duration + seconds);
+        }
+        return TimeSpan.FromSeconds(Math.Min(TicketStore.MaximumLifetime.TotalSeconds,
+            Math.Max(120, duration + longestSegment)));
+    }
 
     public static string Rewrite(string manifest, Uri manifestUri, Func<Uri, string> routeFactory)
     {

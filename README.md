@@ -4,186 +4,111 @@
 
 ## 中文
 
-`Emby.StrmBridge` 是一个面向本地 `.strm` 文件的 Emby Server 插件，每个文件的内容为一个 HTTP(S) URL。插件可以提取技术媒体信息，并通过同一 Emby Server 进程内的网关路由所选 STRM 媒体的播放请求。
+Emby Server 的 STRM 媒体信息与播放插件。为所选媒体库中的本地 `.strm` 文件提取音频、视频技术信息，并为视频 STRM 提供重定向、HLS 改写及流式中转。音频播放保留 Emby 原生行为。
 
-**本项目源于作者的个人使用需求。**项目主要用于改善个人 Emby STRM 媒体库的技术信息提取和播放兼容性。代码公开在 GitHub，主要用于留存项目，也希望能为有类似需求的用户提供参考或直接使用。实际效果可能随 Emby 版本、客户端和上游媒体服务而变化；项目将随作者自身需求不定期更新，目前没有固定的维护计划或功能路线图。
+本项目源于作者的个人使用需求，公开代码供有类似需求的用户参考和使用，随个人需求不定期更新，目前没有固定维护计划。
 
-### 播放模型
+当前版本为 **0.2.3**正式版。播放补丁适配 Emby Server **4.9.5.x**；安装前请查看[兼容性](docs/COMPATIBILITY.md)和[发布说明](RELEASE_NOTES.md)。
 
-Emby 先生成原生 PlaybackInfo 响应。对于 Emby Server 4.9.5.x，插件通过经过版本校验的 Harmony 补丁衔接静态播放生命周期中的四个位置：
+### 功能
 
-- PlaybackInfo 中匹配媒体源的 `DirectStreamUrl` 使用服务器相对网关路由，并保留原生 `Path` 与 `ProbePath`；
-- 客户端采用 Emby 标准静态视频路由时，插件按项目和媒体源 ID 验证目标 STRM，并在原生代取开始前交给同一个网关处理。
-- Emby 创建 FFmpeg 转码状态时，插件再次验证转码作业中的项目、媒体源 ID 和当前 STRM 来源；只有实际进入转码的远程 TS/M2TS 非零起播才使用两个有界 Range 样本生成定位校准，估算预滚不在 0.25–6 秒窗口时增加一个校正样本，然后把该作业输入改为 Emby 运行时回环网关地址并精确绑定；每个新拖动目标先执行一次有界 PCR 校正，超出安全预滚窗口时最多追加一次校正；同一来源和目标跨播放会话共享已验证计划；
-- FFmpeg 命令生成完成后，插件只为精确绑定且时间线可证明的 HTTP 分段作业设置校准后的字节偏移、顺序读取、相对预滚和绝对输出时间轴。处理器接受 Emby 原生 `segment_time_delta=-ss` 契约，也接受 `copyts + start_at_zero` 且 `segment_start_number × segment_time ≈ ss` 的完整转码契约；分片编号保持不变，首段时间容差按实际分片时长的一半调整且最多调整 3 秒，后续分片保持原生节奏，其余命令保持原样。
+- 提取容器、时长、码率及音视频和字幕流信息，保留既有外置流；可保存技术快照用于恢复。
+- 默认只处理技术信息缺失的项目；刷新完整项目需关闭“仅提取缺失”或显式强制提取。
+- 保留 Emby 的媒体版本、播放权限、客户端能力协商和转码决策，网关只接管精确匹配的所选视频 STRM。
+- 客户端网关地址沿用当前 Emby Origin；服务端 FFmpeg 使用由 Emby 提供的本地回环地址。
+- 对符合条件的远程 TS/M2TS 服务端处理提供有界快速定位，证据不足时保留原生定位。
+- 配置界面支持简体中文、繁体中文和英文。
 
-```text
-{当前-api-路径前缀}/StrmBridge/Playback/v2/{随机票据}/stream{扩展名}
-```
+### 播放模式
 
-该路由自动沿用客户端访问 Emby 时选择的 Origin，适用于本地访问、远程访问、HTTPS 反向代理和 Emby 路径前缀，无需在 STRM 文件中保存固定服务器地址。
+| 模式 | 行为 |
+| --- | --- |
+| `Adaptive`（默认） | 普通文件优先重定向；未知类型先分类；HLS 改写，需中转的资源通过 Emby 转发 |
+| `RedirectOnly` | 重定向交接，不改写 HLS 清单 |
+| `RelayOnly` | 由 Emby 流式中转，消耗服务器带宽 |
+| `Native` | 保持 Emby 原生播放行为 |
 
-服务端转码输入地址由 Emby 的本地 API 地址接口生成，不配置也不写死主机名或端口。媒体源数量、顺序、ID、名称、原生路径、技术流和播放能力保持不变；只有匹配 STRM 的客户端播放地址及单次 FFmpeg 作业输入进入网关。
+重定向交接后，媒体由客户端或 FFmpeg 直接读取，插件不能控制其后续并发、重试或 CDN 响应。`RelayOnly` 有传输容量保护，但没有缩略图与主播放的优先级调度。
 
-标准静态视频适配仅接受 GET/HEAD、`Static=true`、参与处理媒体库中的 `.strm` 项目以及精确 ID 匹配的静态媒体源。其余视频请求继续使用 Emby 原生处理。路由判断不包含播放器名称或厂商标识。
+### 开始使用
 
-播放模式：
+1. 按[安装文档](docs/INSTALL.md)校验压缩包、安装单个 `Emby.StrmBridge.dll` 并重启 Emby。
+2. 在插件设置中选择参与处理的媒体库，确认播放模式和跨主机重定向信任规则。媒体库留空表示不处理任何项目。
+3. 运行“提取缺失的 STRM 媒体信息”，然后验证实际播放和拖动。
 
-- `Adaptive`：普通客户端文件直放使用经过验证的 HTTP 302；不稳定来源在当前直放上下文中短期自动改用中继；服务端 FFmpeg 文件和 HLS 通过 Emby 中继。
-- `RedirectOnly`：解析已获信任的重定向链，以 HTTP 302 返回最终地址。
-- `RelayOnly`：通过 Emby 中继所选来源。
-- `Native`：保持 Emby PlaybackInfo、标准静态视频和 FFmpeg 输入行为不变。
+STRM 必须是本地普通文件，内容为一条 HTTP(S) URL。动态媒体源或依赖额外来源请求头的媒体源保留原生播放。不要同时启用其他插件中会接管同一视频入口的直链功能。
 
-默认模式为 `Adaptive`。客户端直放仍先访问票据路由完成授权和重定向验证。重定向地址完成一次实际 Range 复验后，同一用户和设备上下文中的后续 Range 会在 30 秒内直接取得地址，不再由插件逐次预读 CDN；媒体正文由客户端从最终来源读取。地址复验出现拒绝时，该上下文短期使用 Emby 中继。无法取得 Emby 设备标识时，优化自动收窄到单张播放票据。服务端处理保留实际请求的 User-Agent 和 Range 上下文。
+常用设置：
 
-传输层会为标准化请求上下文保存有界、仅内存、有效期 30 秒的重定向租约。每次 Range 复用都要求返回范围和长度一致的 `206 Content-Range`。客户端直放另以项目、媒体源、来源指纹、授权绑定、方法和请求上下文建立隔离的短期决策；不同用户或客户端不会共享。快速定位探测还会按来源保存一个短期候选地址，仅服务端 FFmpeg 正式媒体请求使用自己的 User-Agent 和 Range 复验该候选。范围不匹配时立即从 STRM 原始地址解析。首次重定向链或租约目标返回 401、403、404、410 时，会释放该响应并从 STRM 原始地址重新解析一次。
+| 设置 | 默认值 | 说明 |
+| --- | --- | --- |
+| 仅提取缺失的媒体信息 | 开启 | 完整项目即使 STRM 来源变化也跳过；需要更新时显式刷新 |
+| 保存恢复快照 | 开启 | 关闭后，成功探测的技术信息仍写入 Emby |
+| 直达重定向缓存时间 | 20 秒 | 范围 0–60；一次性、按 Range 绑定或有效期更短的签名地址设为 0 |
+| 启用有证据的快速定位 | 开启 | 只影响符合条件的 TS/M2TS 服务端定位，可独立关闭 |
 
-### 媒体信息
+**已知缩略图兼容问题：** 部分客户端生成进度条缩略图会增加媒体读取请求，在来源限制并发或请求频率时可能造成持续缓冲或拖动卡住。遇到此类问题，可先关闭客户端的缩略图／实时预览，详见[兼容说明](docs/COMPATIBILITY.md#client-generated-seek-thumbnails)。
 
-插件提供计划任务提取与恢复功能：
+### 构建与验证
 
-- **提取缺失的 STRM 媒体信息**
-- **清理 STRM Bridge 存量媒体信息**
-
-提取流程使用 Emby 的媒体探测 API，并保存不含 URL 的快照。刷新内部视频、音频和字幕信息时会保留已有外置流。关闭 **仅提取缺失的媒体信息** 后，会重新探测每个已选 STRM 并替换对应快照。
-
-### 配置
-
-至少选择一个参与处理的媒体库。留空表示提取和播放的处理范围均为空。
-
-配置页标题、字段名称和说明文字跟随当前 Emby Web 界面语言，并在切换语言后刷新；`Adaptive`、`RedirectOnly`、`RelayOnly` 和 `Native` 保持为稳定的模式标识。语言刷新只更新显示文字，不会修改已选择的媒体库、播放模式或其他配置值。说明文字统一支持选择和复制。
-
-跨主机重定向由管理员信任规则控制，支持：
-
-- 精确 DNS 主机名
-- 精确 IP 地址
-- CIDR 范围
-- `*.example.com` 形式、受 DNS 标签边界约束的子域规则
-
-检测到的重定向主机在保存后继续显示并标记当前信任状态。新增信任后会排队执行一次有界提取重试。插件日志和检测主机目录不保存完整 URL、路径、查询值、签名、请求头、票据、媒体标题或用户名。
-
-### 构建、测试和打包
+需要 `global.json` 指定的 .NET SDK，以及 Git、ripgrep、zip/unzip。
 
 ```sh
 ./scripts/verify.sh
 ./scripts/package.sh
 ```
 
-所有可变构建和测试状态均位于 `.local/` 下。发布压缩包生成到 `artifacts/`，包含一个自包含的 `Emby.StrmBridge.dll`、当前文档和许可证声明。Harmony 运行库以经过身份校验的资源嵌入插件 DLL，安装时无需复制第二个 DLL。
-
-### 管理员 API
-
-- `POST /StrmBridge/Maintenance/Extract`
-- `POST /StrmBridge/Maintenance/Restore`
-- `POST /StrmBridge/Maintenance/Cleanup`
-- `POST /StrmBridge/Maintenance/Clear`
-
-维护路由要求 Emby 管理员权限。播放路由使用高熵、仅内存的能力票据；客户端提供认证信息时，还会校验当前 Emby 用户。
+构建及测试状态位于 `.local/`，安装包与 SHA-256 校验文件位于 `artifacts/`。打包命令会执行完整验证，无需先重复运行验证命令。详细测试范围及实机验收见[TESTING.md](docs/TESTING.md)。
 
 ### 文档
 
-- [播放网关设计](docs/PLAYBACK_GATEWAY_DESIGN.md)
-- [远程传输流快速定位设计](docs/FAST_SEEK_DESIGN.md)
-- [架构](docs/ARCHITECTURE.md)
-- [安装](docs/INSTALL.md)
-- [安全](docs/SECURITY.md)
-- [兼容性](docs/COMPATIBILITY.md)
-- [测试](docs/TESTING.md)
+- [安装、配置与管理员接口](docs/INSTALL.md)
+- [兼容性与已知限制](docs/COMPATIBILITY.md)
+- [安全与隐私](docs/SECURITY.md)
+- [设计与实现](docs/STRM_BRIDGE_DESIGN.md)
+- [测试与验收](docs/TESTING.md)
+- [版本变更](CHANGELOG.md)
 
-### 许可证
-
-STRM Bridge 使用 MIT 许可证。内嵌 Harmony 运行库的许可证声明请参阅 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
----
+项目采用 [MIT License](LICENSE)，内嵌依赖声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## English
 
-`Emby.StrmBridge` is an Emby Server plugin for local `.strm` files whose content is one HTTP(S) URL. It extracts technical media information and routes selected STRM playback through an in-process gateway on the same Emby server.
+An Emby Server plugin for technical media information and video playback of local `.strm` items in selected libraries. It extracts audio/video metadata and provides redirects, HLS rewriting and streaming relay for video STRM. Audio playback remains native.
 
-**This project originates from the author's personal use requirements.** It primarily improves technical media-information extraction and playback compatibility for the author's personal Emby STRM library. The source is published on GitHub for project preservation and as a reference or directly usable option for people with similar needs. Results may vary with Emby versions, clients, and upstream media services. Updates follow the author's own needs, with no fixed maintenance schedule or feature roadmap.
+This project serves the author's personal needs and is shared for others with similar setups. Updates follow those needs; there is no fixed maintenance schedule.
 
-### Playback model
+The current version is **0.2.3**, a stable release. Playback patches target Emby Server **4.9.5.x**. Read the [compatibility notes](docs/COMPATIBILITY.md) and [release notes](RELEASE_NOTES.md) before installing.
 
-Emby builds the native PlaybackInfo response first. On Emby Server 4.9.5.x, version-gated Harmony patches integrate at four points in the static-playback lifecycle:
+### Features and modes
 
-- an exact matching source in PlaybackInfo receives a server-relative `DirectStreamUrl`, while its native `Path` and `ProbePath` remain unchanged;
-- when a client uses Emby's standard static-video route, the plugin validates the item and media-source ID before handing the request to the same gateway ahead of native upstream retrieval.
-- when Emby creates FFmpeg transcode state, the plugin revalidates the job's item, media-source ID, and current STRM source; an actual non-zero remote TS/M2TS transcode normally uses two bounded Range samples and adds a correction sample when the estimated pre-roll falls outside the preferred 0.25-to-6-second window, after which the plugin changes that job's input to the runtime loopback gateway and binds the calibration; each previously unseen later seek uses one bounded PCR correction and at most one bounded retry when the result falls outside the safe pre-roll window; validated source-and-target plans are shared across playback sessions;
-- after command construction, the plugin applies the calibrated byte offset, sequential input, relative pre-roll, and absolute output timeline only to a bound HTTP segment job with a provable timeline. It accepts either Emby's native `segment_time_delta=-ss` contract or an indexed transcode contract with `copyts`, `start_at_zero`, and `segment_start_number × segment_time ≈ ss`. Segment numbering stays unchanged; first-segment tolerance advances by half the actual segment duration, capped at three seconds, while later segments retain the native cadence. Every other command stays native.
+- Extract technical fields and internal streams while retaining existing external streams; optionally save recovery snapshots.
+- Skip complete items by default. Refreshing a complete item requires force or disabling missing-only extraction, even when its STRM source changes.
+- Preserve Emby's media-source selection, permissions, capability negotiation and transcoding decisions.
+- Use the client's current Emby origin for relative playback routes and Emby's local API address for server-side FFmpeg.
+- Apply bounded fast positioning to eligible remote TS/M2TS server jobs; retain native seeking when evidence is insufficient.
+- Localize configuration in English, Simplified Chinese and Traditional Chinese.
 
-```text
-{current-api-path-base}/StrmBridge/Playback/v2/{random-ticket}/stream{extension}
-```
+| Mode | Behavior |
+| --- | --- |
+| `Adaptive` (default) | Prefer redirects for files, classify unknown resources, rewrite HLS and relay where needed |
+| `RedirectOnly` | Redirect without HLS manifest rewriting |
+| `RelayOnly` | Stream through Emby, consuming server bandwidth |
+| `Native` | Keep native Emby playback |
 
-The route automatically uses the Emby Origin selected by the client. It supports local access, remote access, HTTPS reverse proxies, and an Emby path prefix without storing a fixed server address in STRM files.
+After redirect handoff, the reader's connections, retries and CDN responses are outside plugin control. Relay capacity protection is not a thumbnail-versus-playback priority scheduler.
 
-The server-side transcode input comes from Emby's local-API helper, with no configured or hard-coded hostname or port. Source count, order, IDs, names, native paths, technical streams, and playback capabilities stay unchanged; only the client playback address and the input of an exact matching FFmpeg job enter the gateway.
+### Setup
 
-The standard static-video adapter accepts only GET/HEAD requests with `Static=true`, a `.strm` item in a participating library, and an exact static-media-source ID match. All other video requests continue through Emby's native implementation. Routing decisions contain no player names or vendor identifiers.
+Follow [INSTALL.md](docs/INSTALL.md) to verify the package, install the single DLL and restart Emby. Select participating libraries and trusted redirect hosts, then run extraction and test playback. An empty library selection processes nothing.
 
-Playback modes:
+STRM files must be regular local files containing one HTTP(S) URL. Dynamic sources and sources requiring extra upstream headers retain native playback. Avoid competing plugins that short-circuit the same video entry point.
 
-- `Adaptive`: uses a validated HTTP 302 for ordinary client files, temporarily relays an unstable source for the matching direct-play context, and relays server-side FFmpeg files and HLS through Emby.
-- `RedirectOnly`: resolves an approved redirect chain and returns the final URL as HTTP 302.
-- `RelayOnly`: streams selected sources through Emby.
-- `Native`: keeps Emby's PlaybackInfo, standard static-video, and FFmpeg input behavior unchanged.
+Missing-only extraction, recovery snapshots and evidence-based fast positioning default to enabled. Disabling snapshots does not prevent successful technical updates to Emby. Direct redirect caching defaults to 20 seconds, accepts 0–60, and must be set to 0 for one-use, Range-bound or shorter-lived signed addresses. Fast positioning can be disabled independently.
 
-`Adaptive` is the default. Client direct play first visits the ticket route for authorization and redirect validation. After one actual Range reuse confirms a redirected address, later Range requests in the same user and device context receive that address directly for 30 seconds without a plugin-side CDN pre-read. The client reads the media body from the final source. A rejected reuse temporarily selects Emby relay for that context. When Emby provides no device identifier, the optimization narrows automatically to one playback ticket. Server-side processing retains the actual User-Agent and Range context.
+**Known thumbnail compatibility issue:** client-generated seek previews add media reads and may stall playback when a source limits concurrency or request rate. If affected, try disabling seek thumbnails/live previews. See [compatibility](docs/COMPATIBILITY.md#client-generated-seek-thumbnails).
 
-The transport keeps a bounded 30-second, memory-only redirect lease for each normalized request context. Range reuse requires a matching `206 Content-Range` and length. Direct play also derives an isolated short-lived decision from the item, media source, source fingerprint, authorization binding, method and request context; users and clients do not share it. Fast-seek probes keep a separate short source-scoped candidate that only the server-FFmpeg media request revalidates with its own User-Agent and Range. A fresh redirect chain or leased target ending in 401, 403, 404, or 410 releases that response and resolves once from the STRM source.
+### Development and documentation
 
-### Media information
+Use the .NET SDK specified by `global.json`, Git, ripgrep and zip/unzip. Run `./scripts/verify.sh` for checks or `./scripts/package.sh` to verify and package in one step. Mutable build/test state stays in `.local/`; ZIP and checksum files are produced in `artifacts/`.
 
-The plugin provides scheduled extraction and recovery:
-
-- **Extract missing STRM media information**
-- **Clear stored STRM Bridge media information**
-
-Extraction uses Emby's media probe APIs and saves a URL-free snapshot. Existing external streams remain present when internal video, audio, and subtitle information is refreshed. Turning off **Only extract missing media information** performs a fresh probe for every selected STRM and replaces the matching snapshot.
-
-### Configuration
-
-Select at least one participating media library. An empty selection defines an empty processing scope for extraction and playback.
-
-Configuration titles, field labels, and descriptions follow the current Emby Web language and refresh after a language change. `Adaptive`, `RedirectOnly`, `RelayOnly`, and `Native` remain stable mode identifiers. Localization updates display text only; it does not change the selected libraries, playback mode, or any other setting value. Description text is consistently selectable and copyable.
-
-Cross-host redirects use administrator trust rules. Supported entries are:
-
-- exact DNS hostname
-- exact IP address
-- CIDR range
-- label-bounded subdomain rule such as `*.example.com`
-
-Detected redirect hosts remain visible after saving and show their current trust state. Saving new trust queues a bounded extraction retry. Full URLs, paths, query values, signatures, headers, tickets, media titles, and user names stay outside plugin logs and the detected-host catalog.
-
-### Build, test, and package
-
-```sh
-./scripts/verify.sh
-./scripts/package.sh
-```
-
-Mutable build and test state stays below `.local/`. Release archives are written to `artifacts/` and contain one self-contained `Emby.StrmBridge.dll`, current documentation, and license notices. The Harmony runtime is an identity-checked embedded resource, so installation does not require copying a second DLL.
-
-### Administrator APIs
-
-- `POST /StrmBridge/Maintenance/Extract`
-- `POST /StrmBridge/Maintenance/Restore`
-- `POST /StrmBridge/Maintenance/Cleanup`
-- `POST /StrmBridge/Maintenance/Clear`
-
-Maintenance routes require an Emby administrator. Playback routes use high-entropy, memory-only capability tickets and also verify the current Emby user when the client supplies authentication.
-
-### Documentation
-
-- [Playback gateway design](docs/PLAYBACK_GATEWAY_DESIGN.md)
-- [Remote transport-stream fast seek design](docs/FAST_SEEK_DESIGN.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Installation](docs/INSTALL.md)
-- [Security](docs/SECURITY.md)
-- [Compatibility](docs/COMPATIBILITY.md)
-- [Testing](docs/TESTING.md)
-
-### License
-
-STRM Bridge is MIT licensed. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the bundled Harmony runtime notice.
+See [installation and administrator APIs](docs/INSTALL.md), [security](docs/SECURITY.md), [design](docs/STRM_BRIDGE_DESIGN.md), [testing](docs/TESTING.md) and [changelog](CHANGELOG.md). The project uses the [MIT License](LICENSE); bundled dependency notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

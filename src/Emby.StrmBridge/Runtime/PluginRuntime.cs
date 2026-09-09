@@ -17,6 +17,7 @@ public sealed class PluginRuntime : IDisposable
 {
     internal const int MaximumDetectedRedirectHosts = 32;
     private readonly object sync = new();
+    private readonly ReaderWriterLockSlim mediaCommitFence = new();
     private readonly object detectedRedirectHostsSync = new();
     private readonly List<string> detectedRedirectHosts = new();
     private CancellationTokenSource operationCancellation = new();
@@ -38,8 +39,6 @@ public sealed class PluginRuntime : IDisposable
 
     public TicketStore Tickets { get; private set; } = new(new SystemClock());
 
-    public RedirectResolver? Redirects { get; private set; }
-
     public GatewayTransport? Gateway { get; private set; }
 
     internal FastSeekCoordinator? FastSeek { get; private set; }
@@ -50,7 +49,7 @@ public sealed class PluginRuntime : IDisposable
 
     public string? DataDirectory { get; private set; }
 
-    public bool IsInitialized => SourcePolicy is not null && Redirects is not null && Gateway is not null;
+    public bool IsInitialized => SourcePolicy is not null && Gateway is not null;
 
     public int Generation
     {
@@ -61,12 +60,15 @@ public sealed class PluginRuntime : IDisposable
     {
         lock (sync)
         {
+            var prefixDiagnostics = playbackPatch?.GetProgressivePrefixDiagnostics() ??
+                                    ProgressivePrefixDiagnostics.Unavailable;
             return new PlaybackHealthSnapshot(
                 playbackPatchStatus,
                 hostAbi,
                 generation,
                 Tickets.Count,
-                Gateway?.ActiveRequests ?? 0);
+                Gateway?.ActiveRequests ?? 0,
+                prefixDiagnostics);
         }
     }
 
@@ -99,6 +101,7 @@ public sealed class PluginRuntime : IDisposable
     public void UpdateOptions(PluginConfiguration updatedOptions, bool invalidateSensitiveState)
     {
         if (updatedOptions is null) throw new ArgumentNullException(nameof(updatedOptions));
+        using var fence = AcquireMediaCommitFence(write: true);
         CancellationTokenSource? previous = null;
         lock (sync)
         {
@@ -113,7 +116,6 @@ public sealed class PluginRuntime : IDisposable
             previous = operationCancellation;
             operationCancellation = new CancellationTokenSource();
             Tickets.Clear();
-            Redirects?.Clear();
             Gateway?.Clear();
             FastSeek?.Clear();
             if (!options.Enabled) ClearDetectedRedirectHosts();
@@ -122,7 +124,7 @@ public sealed class PluginRuntime : IDisposable
         previous.Dispose();
     }
 
-    public void Initialize(string configurationDirectory, IClock? clock = null, IRedirectSourceClient? sourceClient = null)
+    public void Initialize(string configurationDirectory, IClock? clock = null)
     {
         lock (sync)
         {
@@ -139,11 +141,6 @@ public sealed class PluginRuntime : IDisposable
             var redirectPolicy = new RedirectPolicy(
                 () => GetOptionsSnapshot().AllowedRedirectHosts,
                 RecordDetectedRedirectHost);
-            Redirects = new RedirectResolver(
-                sourceClient ?? new HttpRedirectSourceClient(() =>
-                    TimeSpan.FromSeconds(GetOptionsSnapshot().ExtractionTimeoutSeconds)),
-                redirectPolicy,
-                Clock);
             Gateway = new GatewayTransport(redirectPolicy, Clock);
         }
     }
@@ -161,6 +158,7 @@ public sealed class PluginRuntime : IDisposable
                 Clock,
                 logger,
                 () => Generation);
+            gateway.RepresentationChanged = source => FastSeek?.InvalidateSource(source);
         }
     }
 
@@ -233,8 +231,42 @@ public sealed class PluginRuntime : IDisposable
         }
     }
 
+    internal bool TryCommitMediaInfo(int operationGeneration, Func<bool> predicate, Action action)
+    {
+        using var fence = AcquireMediaCommitFence(write: false);
+        if (!IsOperationCurrent(operationGeneration) || !predicate()) return false;
+        action();
+        return true;
+    }
+
+    private IDisposable AcquireMediaCommitFence(bool write)
+    {
+        if (write) mediaCommitFence.EnterWriteLock();
+        else mediaCommitFence.EnterReadLock();
+        return new MediaCommitLease(mediaCommitFence, write);
+    }
+
+    private sealed class MediaCommitLease : IDisposable
+    {
+        private readonly ReaderWriterLockSlim fence;
+        private readonly bool write;
+
+        public MediaCommitLease(ReaderWriterLockSlim fence, bool write)
+        {
+            this.fence = fence;
+            this.write = write;
+        }
+
+        public void Dispose()
+        {
+            if (write) fence.ExitWriteLock();
+            else fence.ExitReadLock();
+        }
+    }
+
     public void ClearSensitiveState()
     {
+        using var fence = AcquireMediaCommitFence(write: true);
         CancellationTokenSource previous;
         lock (sync)
         {
@@ -243,7 +275,6 @@ public sealed class PluginRuntime : IDisposable
             previous = operationCancellation;
             operationCancellation = new CancellationTokenSource();
             Tickets.Clear();
-            Redirects?.Clear();
             Gateway?.Clear();
             FastSeek?.Clear();
             ClearDetectedRedirectHosts();
@@ -258,18 +289,19 @@ public sealed class PluginRuntime : IDisposable
         ExtractionCoordinator? extraction;
         MaintenanceService? maintenance;
         HarmonyPatchHost? patch;
-        lock (sync)
-        {
-            if (disposed) return;
-            disposed = true;
-            generation++;
-            previous = operationCancellation;
-            extraction = Extraction;
-            maintenance = Maintenance;
-            Maintenance = null;
-            patch = playbackPatch;
-            playbackPatch = null;
-        }
+        using (AcquireMediaCommitFence(write: true))
+            lock (sync)
+            {
+                if (disposed) return;
+                disposed = true;
+                generation++;
+                previous = operationCancellation;
+                extraction = Extraction;
+                maintenance = Maintenance;
+                Maintenance = null;
+                patch = playbackPatch;
+                playbackPatch = null;
+            }
         previous.Cancel();
         maintenance?.Dispose();
         patch?.Dispose();
@@ -277,7 +309,6 @@ public sealed class PluginRuntime : IDisposable
         previous.Dispose();
         Tickets.Clear();
         FastSeek?.Clear();
-        Redirects?.Dispose();
         Gateway?.Dispose();
         ClearDetectedRedirectHosts();
         Gateway = null;
@@ -306,13 +337,21 @@ public readonly struct PlaybackHealthSnapshot
         string hostAbi,
         int runtimeGeneration,
         int ticketCount,
-        int activeRelayCount)
+        int activeRelayCount,
+        ProgressivePrefixDiagnostics prefixDiagnostics)
     {
         PatchStatus = patchStatus;
         HostAbi = hostAbi;
         RuntimeGeneration = runtimeGeneration;
         TicketCount = ticketCount;
         ActiveRelayCount = activeRelayCount;
+        PrefixDiagnosticsAvailable = prefixDiagnostics.IsAvailable;
+        ExternalPrefixCount = prefixDiagnostics.ExternalPrefixCount;
+        NativePrefixInstalled = prefixDiagnostics.NativePrefixInstalled;
+        NativePrefixPriority = prefixDiagnostics.NativePrefixPriority;
+        HighestExternalPrefixPriority = prefixDiagnostics.HighestExternalPrefixPriority;
+        NativePrefixUncontended = prefixDiagnostics.NativePrefixUncontended;
+        NativePrefixPriorityStrictlyHigher = prefixDiagnostics.NativePrefixPriorityStrictlyHigher;
     }
 
     public PlaybackPatchStatus PatchStatus { get; }
@@ -324,4 +363,18 @@ public readonly struct PlaybackHealthSnapshot
     public int TicketCount { get; }
 
     public int ActiveRelayCount { get; }
+
+    public bool PrefixDiagnosticsAvailable { get; }
+
+    public int ExternalPrefixCount { get; }
+
+    public bool NativePrefixInstalled { get; }
+
+    public int? NativePrefixPriority { get; }
+
+    public int? HighestExternalPrefixPriority { get; }
+
+    public bool NativePrefixUncontended { get; }
+
+    public bool NativePrefixPriorityStrictlyHigher { get; }
 }

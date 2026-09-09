@@ -32,12 +32,14 @@ public sealed class PluginConfigurationTests
         {
             nameof(PluginConfiguration.Enabled),
             nameof(PluginConfiguration.PlaybackMode),
+            nameof(PluginConfiguration.EnableFastSeek),
             nameof(PluginConfiguration.ExtractAfterLibraryScan),
             nameof(PluginConfiguration.OnlyMissingMediaInfo),
             nameof(PluginConfiguration.EnablePersistence),
             nameof(PluginConfiguration.MaximumExtractionConcurrency),
             nameof(PluginConfiguration.ExtractionTimeoutSeconds),
             nameof(PluginConfiguration.GatewayTimeoutSeconds),
+            nameof(PluginConfiguration.DirectRedirectCacheSeconds),
             nameof(PluginConfiguration.RedirectHopLimit),
             nameof(PluginConfiguration.RelayConcurrency),
             nameof(PluginConfiguration.IncludedLibraries),
@@ -76,6 +78,8 @@ public sealed class PluginConfigurationTests
     {
         var fresh = new PluginConfiguration();
         Assert.AreEqual(PlaybackRoutingMode.Adaptive, fresh.PlaybackMode);
+        Assert.IsTrue(fresh.EnableFastSeek);
+        Assert.AreEqual(20, fresh.DirectRedirectCacheSeconds);
         Assert.IsTrue(fresh.Normalize());
         Assert.IsFalse(fresh.Normalize());
         Assert.AreEqual(PluginConfiguration.CurrentConfigurationVersion, fresh.ConfigurationVersion);
@@ -85,6 +89,7 @@ public sealed class PluginConfigurationTests
             ConfigurationVersion = 0,
             PlaybackMode = (PlaybackRoutingMode)99,
             GatewayTimeoutSeconds = int.MaxValue,
+            DirectRedirectCacheSeconds = int.MaxValue,
             RedirectHopLimit = int.MaxValue,
             RelayConcurrency = int.MaxValue,
         };
@@ -92,6 +97,7 @@ public sealed class PluginConfigurationTests
         Assert.AreEqual(PluginConfiguration.CurrentConfigurationVersion, invalid.ConfigurationVersion);
         Assert.AreEqual(PlaybackRoutingMode.Adaptive, invalid.PlaybackMode);
         Assert.AreEqual(120, invalid.GatewayTimeoutSeconds);
+        Assert.AreEqual(20, invalid.DirectRedirectCacheSeconds);
         Assert.AreEqual(5, invalid.RedirectHopLimit);
         Assert.AreEqual(4, invalid.RelayConcurrency);
     }
@@ -153,17 +159,23 @@ public sealed class PluginConfigurationTests
         Assert.ThrowsExactly<ValidationException>(() =>
             new PluginConfiguration { ExtractionTimeoutSeconds = 5 }.ValidateOrThrow());
         Assert.ThrowsExactly<ValidationException>(() =>
+            new PluginConfiguration { DirectRedirectCacheSeconds = -1 }.ValidateOrThrow());
+        Assert.ThrowsExactly<ValidationException>(() =>
+            new PluginConfiguration { DirectRedirectCacheSeconds = 61 }.ValidateOrThrow());
+        Assert.ThrowsExactly<ValidationException>(() =>
             new PluginConfiguration { IncludedLibraryIds = new[] { "not-a-guid" } }.ValidateOrThrow());
 
         var options = new PluginConfiguration
         {
             MaximumExtractionConcurrency = int.MaxValue,
             ExtractionTimeoutSeconds = int.MaxValue,
+            DirectRedirectCacheSeconds = int.MaxValue,
             IncludedLibraryIds = new[] { " " + Guid.Empty + " ", Guid.Empty.ToString() },
         };
         Assert.IsTrue(options.Normalize());
         Assert.AreEqual(1, options.MaximumExtractionConcurrency);
         Assert.AreEqual(120, options.ExtractionTimeoutSeconds);
+        Assert.AreEqual(20, options.DirectRedirectCacheSeconds);
         Assert.AreEqual(1, options.IncludedLibraryIds.Length);
         Assert.AreEqual(Guid.Empty.ToString("N"), options.IncludedLibraryIds[0]);
         Assert.AreEqual(Guid.Empty.ToString("N"), options.IncludedLibraries);
@@ -178,6 +190,19 @@ public sealed class PluginConfigurationTests
         CollectionAssert.AreEqual(
             new[] { first.ToString("N"), second.ToString("N") },
             selected.IncludedLibraryIds);
+    }
+
+    [TestMethod]
+    public void DirectRedirectCache_AcceptsBoundariesAndSurvivesSnapshot()
+    {
+        new PluginConfiguration { DirectRedirectCacheSeconds = 0 }.ValidateOrThrow();
+        new PluginConfiguration { DirectRedirectCacheSeconds = 60 }.ValidateOrThrow();
+
+        var options = new PluginConfiguration { DirectRedirectCacheSeconds = 37 };
+        var snapshot = options.Snapshot();
+
+        Assert.AreEqual(37, snapshot.DirectRedirectCacheSeconds);
+        Assert.AreEqual(37, options.DirectRedirectCacheSeconds);
     }
 
     [TestMethod]
@@ -283,6 +308,7 @@ public sealed class PluginConfigurationTests
     {
         var options = new PluginConfiguration
         {
+            DirectRedirectCacheSeconds = 37,
             IncludedLibraryIds = new[] { Guid.Empty.ToString("N") },
             IncludedLibraries = Guid.Empty.ToString("N"),
             AvailableLibraries = new[]
@@ -310,6 +336,7 @@ public sealed class PluginConfigurationTests
         Assert.IsFalse(xml.Contains(
             nameof(PluginConfiguration.DetectedRedirectHostsToTrust),
             StringComparison.Ordinal));
+        StringAssert.Contains(xml, "<DirectRedirectCacheSeconds>37</DirectRedirectCacheSeconds>");
         StringAssert.Contains(xml, "detected.invalid");
     }
 

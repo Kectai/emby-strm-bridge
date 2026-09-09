@@ -23,13 +23,20 @@ public static class PluginStrings
     public static string Enabled => Get(nameof(Enabled));
     public static string PlaybackMode => Get(nameof(PlaybackMode));
     public static string PlaybackModeDescription => GetSelectableDescription(nameof(PlaybackModeDescription));
+    public static string EnableFastSeek => Get(nameof(EnableFastSeek));
+    public static string EnableFastSeekDescription => GetSelectableDescription(nameof(EnableFastSeekDescription));
     public static string ExtractAfterLibraryScan => Get(nameof(ExtractAfterLibraryScan));
     public static string OnlyMissingMediaInfo => Get(nameof(OnlyMissingMediaInfo));
     public static string OnlyMissingMediaInfoDescription => GetSelectableDescription(nameof(OnlyMissingMediaInfoDescription));
     public static string EnablePersistence => Get(nameof(EnablePersistence));
+    public static string EnablePersistenceDescription =>
+        GetSelectableDescription(nameof(EnablePersistenceDescription));
     public static string MaximumExtractionConcurrency => Get(nameof(MaximumExtractionConcurrency));
     public static string ExtractionTimeoutSeconds => Get(nameof(ExtractionTimeoutSeconds));
     public static string GatewayTimeoutSeconds => Get(nameof(GatewayTimeoutSeconds));
+    public static string DirectRedirectCacheSeconds => Get(nameof(DirectRedirectCacheSeconds));
+    public static string DirectRedirectCacheSecondsDescription =>
+        GetSelectableDescription(nameof(DirectRedirectCacheSecondsDescription));
     public static string RedirectHopLimit => Get(nameof(RedirectHopLimit));
     public static string RelayConcurrency => Get(nameof(RelayConcurrency));
     public static string IncludedLibraryIds => Get(nameof(IncludedLibraryIds));
@@ -46,6 +53,7 @@ public static class PluginStrings
     public static string ConcurrencyValidation => Get(nameof(ConcurrencyValidation));
     public static string TimeoutValidation => Get(nameof(TimeoutValidation));
     public static string GatewayValidation => Get(nameof(GatewayValidation));
+    public static string DirectRedirectCacheValidation => Get(nameof(DirectRedirectCacheValidation));
     public static string LibraryValidation => Get(nameof(LibraryValidation));
     public static string RedirectHostValidation => Get(nameof(RedirectHostValidation));
     public static string RedirectHostCapacityValidation => Get(nameof(RedirectHostCapacityValidation));

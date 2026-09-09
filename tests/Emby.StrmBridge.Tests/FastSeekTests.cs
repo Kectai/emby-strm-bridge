@@ -5,6 +5,8 @@ using MediaBrowser.Model.Logging;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Runtime.CompilerServices;
+using HarmonyLib;
 
 namespace Emby.StrmBridge.Tests;
 
@@ -24,8 +26,10 @@ public sealed class TransportStreamClockParserTests
         Assert.AreEqual(packetStride == 192 ? 4 : 0, analysis.Format.SyncOffset);
         Assert.AreEqual(256, analysis.SelectClockPid());
         Assert.IsTrue(analysis.TryGetFirstPcr(256, out var pcr));
+        Assert.IsTrue(analysis.TryGetFirstRandomAccess(256, out var randomAccess));
         Assert.AreEqual(4 * 27_000_000L, pcr.Clock27Mhz);
         Assert.AreEqual(0, pcr.PacketOffset);
+        Assert.AreEqual(0, randomAccess.PacketOffset);
     }
 
     [TestMethod]
@@ -53,11 +57,79 @@ public sealed class TransportStreamClockParserTests
             TransportStreamClockParser.SecondsBetween(beforeWrap, 27_000_000L),
             0.000001d);
     }
+
+    [TestMethod]
+    public void Parser_RecognizesCodecRandomAccessUnits()
+    {
+        Assert.IsTrue(TransportStreamClockParser.ContainsCodecRandomAccess(
+            new byte[] { 0, 0, 1, 0x65, 0, 0 }, 0x1b));
+        Assert.IsTrue(TransportStreamClockParser.ContainsCodecRandomAccess(
+            new byte[] { 0, 0, 0, 1, 0x20, 1 }, 0x24));
+        Assert.IsTrue(TransportStreamClockParser.ContainsCodecRandomAccess(
+            new byte[] { 0, 0, 1, 0, 0, 0x08 }, 0x02));
+        Assert.IsFalse(TransportStreamClockParser.ContainsCodecRandomAccess(
+            new byte[] { 0, 0, 1, 0x41, 0, 0 }, 0x1b));
+    }
+
+    [TestMethod]
+    public void Parser_RecognizesCodecRandomAccessAcrossPacketBoundaries()
+    {
+        Assert.IsTrue(TransportStreamClockParser.ContainsCodecRandomAccessAcrossBoundary(
+            new byte[] { 0xaa, 0, 0 },
+            new byte[] { 1, 0x65, 0, 0 },
+            0x1b));
+        Assert.IsTrue(TransportStreamClockParser.ContainsCodecRandomAccessAcrossBoundary(
+            new byte[] { 0, 0, 0, 1 },
+            new byte[] { 0x20, 1 },
+            0x24));
+        Assert.IsFalse(TransportStreamClockParser.ContainsCodecRandomAccessAcrossBoundary(
+            new byte[] { 0, 0 },
+            new byte[] { 1, 0x41, 0, 0 },
+            0x1b));
+    }
 }
 
 [TestClass]
 public sealed class FastSeekCoordinatorTests
 {
+    [TestMethod]
+    [DataRow(4d)]
+    [DataRow(6d)]
+    public async Task Coordinator_ConvergesAcrossMultipleMeasuredVbrCorrections(double power)
+    {
+        var client = new SyntheticFastSeekProbeClient(x => Math.Pow(x, power) * 100);
+        var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
+        var source = TestSources.Create();
+        var target = TimeSpan.FromSeconds(90).Ticks;
+        var duration = TimeSpan.FromSeconds(100).Ticks;
+        const string input = "http://127.0.0.1/StrmBridge/Playback/v3/test/stream.ts";
+        Assert.IsTrue(await coordinator.PrepareAsync(source, "source", target, duration, 0,
+            new PluginConfiguration(), CancellationToken.None));
+        Assert.IsTrue(client.Offsets.Count >= 4, "The sample must need more than one correction.");
+        Assert.IsTrue(client.Offsets.Count <= 2 + FastSeekCoordinator.MaximumCorrections);
+        Assert.AreEqual(client.Offsets.Count, client.Offsets.Distinct().Count());
+        Assert.IsTrue(client.RequestedBytes.Sum() <= FastSeekCoordinator.MaximumPreparationBytes);
+        Assert.IsTrue(coordinator.TryBindInput(source, "source", target, duration, 0, input, new PluginConfiguration()));
+        Assert.IsTrue(coordinator.TryGetBoundPlan(input, 0, target, CancellationToken.None, out var plan));
+        var actualAnchorSeconds = Math.Pow(plan!.ByteOffset / (100d * 1024 * 1024), power) * 100;
+        Assert.AreEqual(90d, actualAnchorSeconds + plan.RelativeSeek.TotalSeconds, 0.1);
+        var count = client.Offsets.Count;
+        Assert.IsTrue(await coordinator.PrepareAsync(source, "source", target, duration, 0,
+            new PluginConfiguration(), CancellationToken.None));
+        Assert.AreEqual(count, client.Offsets.Count);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_ExtremeVbrStillRespectsCorrectionAndByteBudgets()
+    {
+        var client = new SyntheticFastSeekProbeClient(x => Math.Pow(x, 10) * 100);
+        var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
+        await coordinator.PrepareAsync(TestSources.Create(), "source", TimeSpan.FromSeconds(90).Ticks,
+            TimeSpan.FromSeconds(100).Ticks, 0, new PluginConfiguration(), CancellationToken.None);
+        Assert.IsTrue(client.Offsets.Count <= 2 + FastSeekCoordinator.MaximumCorrections);
+        Assert.IsTrue(client.RequestedBytes.Sum() <= FastSeekCoordinator.MaximumPreparationBytes);
+    }
+
     [TestMethod]
     public async Task Coordinator_UsesTwoSamplesWhenTheEstimatedPreRollIsAlreadyBounded()
     {
@@ -82,24 +154,115 @@ public sealed class FastSeekCoordinatorTests
             target.Ticks,
             TimeSpan.FromSeconds(100).Ticks,
             runtimeGeneration: 7,
-            "http://127.0.0.1:8096/StrmBridge/Playback/v2/ticket/stream.m2ts",
+            "http://127.0.0.1:8096/StrmBridge/Playback/v3/ticket/stream.m2ts",
             new PluginConfiguration()));
         Assert.IsTrue(coordinator.TryGetBoundPlan(
-            "http://127.0.0.1:8096/StrmBridge/Playback/v2/ticket/stream.m2ts",
+            "http://127.0.0.1:8096/StrmBridge/Playback/v3/ticket/stream.m2ts",
             runtimeGeneration: 7,
             target.Ticks,
             CancellationToken.None,
             out var plan));
         Assert.AreEqual(192, plan!.PacketStride);
         Assert.AreEqual(2, plan.ProbeCount);
-        Assert.AreEqual(256, plan.PcrPid);
         Assert.AreEqual(4000d, plan.RelativeSeek.TotalMilliseconds, 5d);
         Assert.IsTrue(plan.ByteOffset > 0);
         Assert.AreEqual(0, plan.ByteOffset % 192);
     }
 
     [TestMethod]
-    public async Task Coordinator_ReusesBoundCalibrationForAChangedSeekTarget()
+    public async Task Coordinator_ScalesTheTargetWindowForAHighBitrateTransportStream()
+    {
+        var client = new HighBitrateFastSeekProbeClient();
+        var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
+        var source = TestSources.Create();
+        var target = TimeSpan.FromSeconds(50);
+        var duration = TimeSpan.FromSeconds(100);
+        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v3/high-bitrate/stream.m2ts";
+
+        Assert.IsTrue(await coordinator.PrepareAsync(
+            source,
+            "source-one",
+            target.Ticks,
+            duration.Ticks,
+            runtimeGeneration: 7,
+            new PluginConfiguration(),
+            CancellationToken.None));
+        Assert.HasCount(2, client.RequestedBytes);
+        Assert.AreEqual(FastSeekCoordinator.InitialProbeBytes, client.RequestedBytes[0]);
+        Assert.IsGreaterThan(512 * 1024, client.RequestedBytes[1]);
+        Assert.IsLessThanOrEqualTo(FastSeekCoordinator.MaximumProbeBytes, client.RequestedBytes[1]);
+        Assert.IsLessThanOrEqualTo(
+            FastSeekCoordinator.MaximumPreparationBytes,
+            client.RequestedBytes.Sum());
+        Assert.IsTrue(coordinator.TryBindInput(
+            source, "source-one", target.Ticks, duration.Ticks, 7, inputUrl,
+            new PluginConfiguration()));
+        Assert.IsTrue(coordinator.TryGetBoundPlan(
+            inputUrl, 7, target.Ticks, CancellationToken.None, out var plan));
+        Assert.IsGreaterThan(2d, plan!.RelativeSeek.TotalSeconds);
+        Assert.IsLessThan(4d, plan.RelativeSeek.TotalSeconds);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_NegativelyCachesDeterministicPreparationFailure()
+    {
+        var clock = new ManualClock();
+        var invalid = new SyntheticFastSeekProbeClient(invalidData: true);
+        var coordinator = new FastSeekCoordinator(invalid, clock, CreateLogger());
+        var source = TestSources.Create();
+        var target = TimeSpan.FromSeconds(50);
+        var duration = TimeSpan.FromSeconds(100);
+
+        Assert.IsFalse(await coordinator.PrepareAsync(
+            source, "source-one", target.Ticks, duration.Ticks, 7,
+            new PluginConfiguration(), CancellationToken.None));
+        var probesAfterFirstFailure = invalid.Offsets.Count;
+        Assert.IsGreaterThan(0, probesAfterFirstFailure);
+
+        Assert.IsFalse(await coordinator.PrepareAsync(
+            source, "source-one", target.Ticks, duration.Ticks, 7,
+            new PluginConfiguration(), CancellationToken.None));
+        Assert.AreEqual(probesAfterFirstFailure, invalid.Offsets.Count);
+
+        Assert.IsFalse(await coordinator.PrepareAsync(
+            source, "source-one", target.Add(TimeSpan.FromSeconds(1)).Ticks, duration.Ticks, 7,
+            new PluginConfiguration(), CancellationToken.None));
+        Assert.IsGreaterThan(probesAfterFirstFailure, invalid.Offsets.Count);
+        var probesAfterDifferentTarget = invalid.Offsets.Count;
+
+        clock.Advance(FastSeekCoordinator.FailureLifetime + TimeSpan.FromMilliseconds(1));
+        Assert.IsFalse(await coordinator.PrepareAsync(
+            source, "source-one", target.Ticks, duration.Ticks, 7,
+            new PluginConfiguration(), CancellationToken.None));
+        Assert.IsGreaterThan(probesAfterDifferentTarget, invalid.Offsets.Count);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_NegativelyCachesAHighBitrateRandomAccessMiss()
+    {
+        var client = new HighBitrateFastSeekProbeClient(includeRandomAccess: false);
+        var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
+        var source = TestSources.Create();
+        var target = TimeSpan.FromSeconds(50);
+        var duration = TimeSpan.FromSeconds(100);
+
+        Assert.IsFalse(await coordinator.PrepareAsync(
+            source, "source-one", target.Ticks, duration.Ticks, 7,
+            new PluginConfiguration(), CancellationToken.None));
+        var requestsAfterFirstFailure = client.RequestedBytes.Count;
+        Assert.IsGreaterThan(1, requestsAfterFirstFailure);
+        Assert.IsLessThanOrEqualTo(
+            FastSeekCoordinator.MaximumPreparationBytes,
+            client.RequestedBytes.Sum());
+
+        Assert.IsFalse(await coordinator.PrepareAsync(
+            source, "source-one", target.Ticks, duration.Ticks, 7,
+            new PluginConfiguration(), CancellationToken.None));
+        Assert.AreEqual(requestsAfterFirstFailure, client.RequestedBytes.Count);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_BoundLookupNeverPreparesAChangedSeekTarget()
     {
         var client = new SyntheticFastSeekProbeClient();
         var coordinator = new FastSeekCoordinator(
@@ -109,7 +272,7 @@ public sealed class FastSeekCoordinatorTests
         var source = TestSources.Create();
         var initialTarget = TimeSpan.FromSeconds(70);
         var changedTarget = TimeSpan.FromSeconds(40);
-        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v2/ticket/stream.m2ts";
+        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v3/ticket/stream.m2ts";
 
         Assert.IsTrue(await coordinator.PrepareAsync(
             source,
@@ -127,26 +290,14 @@ public sealed class FastSeekCoordinatorTests
             runtimeGeneration: 7,
             inputUrl,
             new PluginConfiguration()));
-        Assert.IsTrue(coordinator.TryGetBoundPlan(
+        Assert.IsFalse(coordinator.TryGetBoundPlan(
             inputUrl,
             runtimeGeneration: 7,
             changedTarget.Ticks,
             CancellationToken.None,
             out var changed));
-        Assert.AreEqual(3, client.Offsets.Count);
-        Assert.IsTrue(coordinator.TryGetBoundPlan(
-            inputUrl,
-            runtimeGeneration: 7,
-            changedTarget.Ticks,
-            CancellationToken.None,
-            out var cached));
-        Assert.AreSame(changed, cached);
-        Assert.AreEqual(3, client.Offsets.Count);
-        Assert.AreEqual(changedTarget.Ticks, changed!.TargetTimeTicks);
-        Assert.AreEqual(1, changed.ProbeCount);
-        Assert.AreEqual(4000d, changed.RelativeSeek.TotalMilliseconds, 5d);
-        Assert.IsTrue(changed.ByteOffset > 0);
-        Assert.AreEqual(0, changed.ByteOffset % 192);
+        Assert.IsNull(changed);
+        Assert.AreEqual(2, client.Offsets.Count);
     }
 
     [TestMethod]
@@ -158,14 +309,13 @@ public sealed class FastSeekCoordinatorTests
                 : 40d + (normalizedOffset - 0.5d) * 120d);
         var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
         var source = TestSources.Create();
-        var initialTarget = TimeSpan.FromSeconds(70);
-        var changedTarget = TimeSpan.FromSeconds(30);
-        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v2/ticket/stream.m2ts";
+        var target = TimeSpan.FromSeconds(70);
+        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v3/ticket/stream.m2ts";
 
         Assert.IsTrue(await coordinator.PrepareAsync(
             source,
             "source-one",
-            initialTarget.Ticks,
+            target.Ticks,
             TimeSpan.FromSeconds(100).Ticks,
             runtimeGeneration: 7,
             new PluginConfiguration(),
@@ -173,7 +323,7 @@ public sealed class FastSeekCoordinatorTests
         Assert.IsTrue(coordinator.TryBindInput(
             source,
             "source-one",
-            initialTarget.Ticks,
+            target.Ticks,
             TimeSpan.FromSeconds(100).Ticks,
             runtimeGeneration: 7,
             inputUrl,
@@ -181,13 +331,13 @@ public sealed class FastSeekCoordinatorTests
         Assert.IsTrue(coordinator.TryGetBoundPlan(
             inputUrl,
             runtimeGeneration: 7,
-            changedTarget.Ticks,
+            target.Ticks,
             CancellationToken.None,
             out var changed));
 
-        Assert.AreEqual(4, client.Offsets.Count);
-        Assert.IsGreaterThan(6000d, changed!.RelativeSeek.TotalMilliseconds);
-        Assert.IsLessThan(8000d, changed.RelativeSeek.TotalMilliseconds);
+        Assert.AreEqual(3, client.Offsets.Count);
+        Assert.IsGreaterThan(1000d, changed!.RelativeSeek.TotalMilliseconds);
+        Assert.IsLessThan(6000d, changed.RelativeSeek.TotalMilliseconds);
     }
 
     [TestMethod]
@@ -201,14 +351,13 @@ public sealed class FastSeekCoordinatorTests
                     : 26d + (normalizedOffset - 0.42d) * (74d / 0.58d));
         var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
         var source = TestSources.Create();
-        var initialTarget = TimeSpan.FromSeconds(90);
-        var changedTarget = TimeSpan.FromSeconds(30);
-        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v2/retry/stream.m2ts";
+        var target = TimeSpan.FromSeconds(90);
+        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v3/retry/stream.m2ts";
 
         Assert.IsTrue(await coordinator.PrepareAsync(
             source,
             "source-one",
-            initialTarget.Ticks,
+            target.Ticks,
             TimeSpan.FromSeconds(100).Ticks,
             runtimeGeneration: 7,
             new PluginConfiguration(),
@@ -216,7 +365,7 @@ public sealed class FastSeekCoordinatorTests
         Assert.IsTrue(coordinator.TryBindInput(
             source,
             "source-one",
-            initialTarget.Ticks,
+            target.Ticks,
             TimeSpan.FromSeconds(100).Ticks,
             runtimeGeneration: 7,
             inputUrl,
@@ -225,14 +374,14 @@ public sealed class FastSeekCoordinatorTests
         Assert.IsTrue(coordinator.TryGetBoundPlan(
             inputUrl,
             runtimeGeneration: 7,
-            changedTarget.Ticks,
+            target.Ticks,
             CancellationToken.None,
             out var changed));
 
-        Assert.AreEqual(5, client.Offsets.Count);
-        Assert.AreEqual(2, changed!.ProbeCount);
-        Assert.IsGreaterThan(2000d, changed.RelativeSeek.TotalMilliseconds);
-        Assert.IsLessThan(5000d, changed.RelativeSeek.TotalMilliseconds);
+        Assert.AreEqual(3, client.Offsets.Count);
+        Assert.AreEqual(3, changed!.ProbeCount);
+        Assert.IsGreaterThan(1000d, changed.RelativeSeek.TotalMilliseconds);
+        Assert.IsLessThan(6000d, changed.RelativeSeek.TotalMilliseconds);
     }
 
     [TestMethod]
@@ -241,34 +390,41 @@ public sealed class FastSeekCoordinatorTests
         var client = new SyntheticFastSeekProbeClient();
         var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
         var source = TestSources.Create();
-        var initialTarget = TimeSpan.FromSeconds(70);
-        var changedTarget = TimeSpan.FromSeconds(40);
-        const string firstInput = "http://127.0.0.1:8096/StrmBridge/Playback/v2/first/stream.m2ts";
-        const string secondInput = "http://127.0.0.1:8096/StrmBridge/Playback/v2/second/stream.m2ts";
+        var target = TimeSpan.FromSeconds(40);
+        const string firstInput = "http://127.0.0.1:8096/StrmBridge/Playback/v3/first/stream.m2ts";
+        const string secondInput = "http://127.0.0.1:8096/StrmBridge/Playback/v3/second/stream.m2ts";
 
         Assert.IsTrue(await coordinator.PrepareAsync(
             source,
             "source-one",
-            initialTarget.Ticks,
+            target.Ticks,
             TimeSpan.FromSeconds(100).Ticks,
             runtimeGeneration: 7,
             new PluginConfiguration(),
             CancellationToken.None));
         Assert.IsTrue(coordinator.TryBindInput(
-            source, "source-one", initialTarget.Ticks, TimeSpan.FromSeconds(100).Ticks, 7, firstInput,
+            source, "source-one", target.Ticks, TimeSpan.FromSeconds(100).Ticks, 7, firstInput,
             new PluginConfiguration()));
         Assert.IsTrue(coordinator.TryGetBoundPlan(
-            firstInput, 7, changedTarget.Ticks, CancellationToken.None, out var first));
-        Assert.AreEqual(3, client.Offsets.Count);
+            firstInput, 7, target.Ticks, CancellationToken.None, out var first));
+        Assert.AreEqual(2, client.Offsets.Count);
 
+        Assert.IsTrue(await coordinator.PrepareAsync(
+            source,
+            "source-one",
+            target.Ticks,
+            TimeSpan.FromSeconds(100).Ticks,
+            runtimeGeneration: 7,
+            new PluginConfiguration(),
+            CancellationToken.None));
         Assert.IsTrue(coordinator.TryBindInput(
-            source, "source-one", initialTarget.Ticks, TimeSpan.FromSeconds(100).Ticks, 7, secondInput,
+            source, "source-one", target.Ticks, TimeSpan.FromSeconds(100).Ticks, 7, secondInput,
             new PluginConfiguration()));
         Assert.IsTrue(coordinator.TryGetBoundPlan(
-            secondInput, 7, changedTarget.Ticks, CancellationToken.None, out var second));
+            secondInput, 7, target.Ticks, CancellationToken.None, out var second));
 
         Assert.AreSame(first, second);
-        Assert.AreEqual(3, client.Offsets.Count);
+        Assert.AreEqual(2, client.Offsets.Count);
     }
 
     [TestMethod]
@@ -303,6 +459,49 @@ public sealed class FastSeekCoordinatorTests
         Assert.IsFalse(await first);
         Assert.IsTrue(await second);
         Assert.AreEqual(2, client.ProbeCount);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_LastCancelledWaiterCancelsAndDetachesPendingPreparation()
+    {
+        var client = new FirstReadCancellationProbeClient();
+        var coordinator = new FastSeekCoordinator(client, new ManualClock(), CreateLogger());
+        var source = TestSources.Create();
+        var target = TimeSpan.FromSeconds(50);
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            var abandoned = coordinator.PrepareAsync(
+                source,
+                "source-one",
+                target.Ticks,
+                TimeSpan.FromSeconds(100).Ticks,
+                7,
+                new PluginConfiguration(),
+                cancellation.Token);
+            await client.FirstReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            cancellation.Cancel();
+
+            Assert.IsFalse(await abandoned.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.IsTrue(await coordinator.PrepareAsync(
+                    source,
+                    "source-one",
+                    target.Ticks,
+                    TimeSpan.FromSeconds(100).Ticks,
+                    7,
+                    new PluginConfiguration(),
+                    CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(2)),
+                "A new caller must not attach to the abandoned pending entry.");
+            await client.FirstReadCancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.AreEqual(3, client.ProbeCount);
+        }
+        finally
+        {
+            cancellation.Cancel();
+            coordinator.Clear();
+        }
     }
 
     [TestMethod]
@@ -526,6 +725,22 @@ public sealed class FfmpegCommandProcessorTests
     }
 
     [TestMethod]
+    public async Task Processor_DisabledFastSeekLeavesAnExistingBoundCommandNative()
+    {
+        using var fixture = await CreateFixtureAsync();
+        var options = fixture.Runtime.GetOptionsSnapshot();
+        options.EnableFastSeek = false;
+        fixture.Runtime.UpdateOptions(options, invalidateSensitiveState: false);
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+
+        Assert.IsFalse(fixture.Processor.TryApply(command));
+
+        Assert.IsNull(command.Input0.InputProtocol.offset);
+        Assert.AreEqual(fixture.Target, command.Input0.Options.ss);
+        Assert.IsNull(command.Output0.Options.ss);
+    }
+
+    [TestMethod]
     public async Task Processor_KeepsUnknownOrNonSegmentCommandsNative()
     {
         using var fixture = await CreateFixtureAsync();
@@ -540,38 +755,68 @@ public sealed class FfmpegCommandProcessorTests
     }
 
     [TestMethod]
-    public async Task Processor_ReusesCalibrationWhenTheHlsSegmentTargetChanges()
+    public async Task Processor_KeepsAnUnpreparedHlsTargetNative()
     {
         using var fixture = await CreateFixtureAsync();
         var changedTarget = TimeSpan.FromSeconds(30);
         var command = TestFfmpegCommand.Create(fixture.InputUrl, changedTarget);
 
-        Assert.IsTrue(fixture.Processor.TryApply(command));
+        Assert.IsFalse(fixture.Processor.TryApply(command));
 
-        Assert.IsTrue(command.Input0.InputProtocol.offset > 0);
-        Assert.AreEqual(false, command.Input0.InputProtocol.seekable);
-        Assert.IsNull(command.Input0.Options.ss);
-        Assert.AreEqual(4000d, command.Output0.Options.ss!.Value.TotalMilliseconds, 5d);
-        Assert.AreEqual(changedTarget, command.Output0.Options.output_ts_offset);
-        Assert.AreEqual(
-            -changedTarget + FfmpegCommandProcessor.MaximumFirstSegmentAdvance,
-            command.Output0.Muxer.segment_time_delta);
+        Assert.IsNull(command.Input0.InputProtocol.offset);
+        Assert.IsNull(command.Input0.InputProtocol.seekable);
+        Assert.AreEqual(changedTarget, command.Input0.Options.ss);
+        Assert.IsNull(command.Output0.Options.ss);
+        Assert.IsNull(command.Output0.Options.output_ts_offset);
     }
 
     [TestMethod]
-    public async Task Processor_CancelledFfmpegStartStopsOnlyItsTargetWaiter()
+    [DataRow(false, false)]
+    [DataRow(false, true)]
+    [DataRow(true, false)]
+    [DataRow(true, true)]
+    public async Task Processor_ChecksTheMappedVideoForDirectAndFilteredCommands(bool filtered, bool changed)
+    {
+        var probe = new MultiVideoFastSeekProbeClient(192);
+        var selection = FastSeekVideoSelectionTests.Selection(1);
+        using var fixture = await CreateFixtureAsync(probe, selection);
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        var video = new TestMappedInput { Stream = new TestMappedStream { Index = changed ? 0 : 3 } };
+        if (filtered)
+            command.Connections = new object[] { new { StreamSource = video } };
+        else
+            command.Output0.Video0 = new { InputStream = video };
+        Assert.AreEqual(!changed, fixture.Processor.TryApply(command));
+        Assert.AreEqual(!changed, fixture.Processor.TryApply(TestFfmpegCommandWithSameMap()));
+        Assert.AreEqual(2, probe.ReadCount);
+        if (changed)
+        {
+            Assert.IsNull(command.Input0.InputProtocol.offset);
+            Assert.AreEqual(fixture.Target, command.Input0.Options.ss);
+        }
+
+        TestFfmpegCommand TestFfmpegCommandWithSameMap()
+        {
+            var retry = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+            retry.Connections = command.Connections;
+            retry.Output0.Video0 = command.Output0.Video0;
+            return retry;
+        }
+    }
+
+    [TestMethod]
+    public async Task Processor_CommandHookDoesNotStartTargetPreparation()
     {
         using var workspace = new TestWorkspace();
         using var runtime = new PluginRuntime();
         var logger = FastSeekCoordinatorTests.CreateLogger();
         var probeClient = new GateAfterInitialCalibrationProbeClient();
-        runtime.Initialize(workspace.Path, new ManualClock(), new StubRedirectClient((_, _, _, _) =>
-            Task.FromResult(new RedirectSourceResponse(404, null, null))));
+        runtime.Initialize(workspace.Path, new ManualClock());
         runtime.InitializeFastSeek(logger, probeClient);
         var source = TestSources.Create();
         var duration = TimeSpan.FromSeconds(100);
         var initialTarget = TimeSpan.FromSeconds(50);
-        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v2/cancel/stream.m2ts";
+        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v3/no-io/stream.m2ts";
         Assert.IsTrue(await runtime.FastSeek!.PrepareAsync(
             source,
             "source-one",
@@ -591,20 +836,14 @@ public sealed class FfmpegCommandProcessorTests
         var processor = new FfmpegCommandProcessor(runtime, logger);
         var changedTarget = TimeSpan.FromSeconds(30);
         var command = TestFfmpegCommand.Create(inputUrl, changedTarget);
-        using var cancellation = new CancellationTokenSource();
-        var applying = Task.Run(() => processor.TryApply(command, cancellation.Token));
-        await probeClient.TargetProbeStarted.Task;
-
-        cancellation.Cancel();
-
-        Assert.IsFalse(await applying.WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.IsFalse(processor.TryApply(command, CancellationToken.None));
         Assert.AreEqual(changedTarget, command.Input0.Options.ss);
         Assert.IsNull(command.Input0.InputProtocol.offset);
-        probeClient.ReleaseTargetProbe.TrySetResult(true);
+        Assert.IsFalse(probeClient.TargetProbeStarted.Task.IsCompleted);
     }
 
     [TestMethod]
-    public async Task Processor_AppliesConsecutiveSeekTargetsWithoutSharingMutableCommandState()
+    public async Task Processor_DoesNotReuseAPlanForDifferentTargets()
     {
         using var fixture = await CreateFixtureAsync();
         var firstTarget = TimeSpan.FromSeconds(30);
@@ -612,18 +851,13 @@ public sealed class FfmpegCommandProcessorTests
         var first = TestFfmpegCommand.Create(fixture.InputUrl, firstTarget);
         var second = TestFfmpegCommand.Create(fixture.InputUrl, secondTarget);
 
-        Assert.IsTrue(fixture.Processor.TryApply(first));
-        Assert.IsTrue(fixture.Processor.TryApply(second));
+        Assert.IsFalse(fixture.Processor.TryApply(first));
+        Assert.IsFalse(fixture.Processor.TryApply(second));
 
-        Assert.AreEqual(firstTarget, first.Output0.Options.output_ts_offset);
-        Assert.AreEqual(
-            -firstTarget + FfmpegCommandProcessor.MaximumFirstSegmentAdvance,
-            first.Output0.Muxer.segment_time_delta);
-        Assert.AreEqual(secondTarget, second.Output0.Options.output_ts_offset);
-        Assert.AreEqual(
-            -secondTarget + FfmpegCommandProcessor.MaximumFirstSegmentAdvance,
-            second.Output0.Muxer.segment_time_delta);
-        Assert.AreNotEqual(first.Input0.InputProtocol.offset, second.Input0.InputProtocol.offset);
+        Assert.AreEqual(firstTarget, first.Input0.Options.ss);
+        Assert.AreEqual(secondTarget, second.Input0.Options.ss);
+        Assert.IsNull(first.Input0.InputProtocol.offset);
+        Assert.IsNull(second.Input0.InputProtocol.offset);
     }
 
     [TestMethod]
@@ -658,8 +892,8 @@ public sealed class FfmpegCommandProcessorTests
     public async Task Processor_AppliesAnIndexedTranscodeTimelineWithoutANativeDelta()
     {
         using var fixture = await CreateFixtureAsync();
-        var target = TimeSpan.FromSeconds(48);
-        var segmentTime = TimeSpan.FromSeconds(3);
+        var target = fixture.Target;
+        var segmentTime = TimeSpan.FromSeconds(2);
         var command = TestFfmpegCommand.CreateIndexed(fixture.InputUrl, target, segmentTime);
 
         Assert.IsTrue(fixture.Processor.TryApply(command));
@@ -789,14 +1023,201 @@ public sealed class FfmpegCommandProcessorTests
         Assert.IsNull(command.Output0.Muxer.segment_time_delta);
     }
 
-    private static async Task<CommandFixture> CreateFixtureAsync()
+    [TestMethod]
+    [DataRow("user_agent")]
+    [DataRow("headers")]
+    [DataRow("cookies")]
+    [DataRow("referer")]
+    [DataRow("method")]
+    public async Task Processor_PreservesExistingRequestProfiles(string property)
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        typeof(TestHttpProtocol).GetProperty(property)!.SetValue(command.Input0.InputProtocol, "custom-value");
+        Assert.IsFalse(fixture.Processor.TryApply(command));
+        Assert.AreEqual(fixture.Target, command.Input0.Options.ss);
+        Assert.IsNull(command.Input0.InputProtocol.offset);
+        Assert.AreEqual("custom-value", typeof(TestHttpProtocol).GetProperty(property)!.GetValue(command.Input0.InputProtocol));
+    }
+
+    [TestMethod]
+    public async Task Processor_BindsStrongRepresentationToActiveTicketBeyondPlanExpiry()
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        Assert.IsTrue(fixture.Processor.TryApply(command));
+        Assert.AreEqual(GatewayTransport.ProbeUserAgent, command.Input0.InputProtocol.user_agent);
+        StringAssert.Contains(command.Input0.InputProtocol.headers!, "If-Match: \"synthetic\"\r\n");
+        StringAssert.Contains(command.Input0.InputProtocol.headers!, "Accept-Encoding: identity\r\n");
+        var value = fixture.InputUrl.Split('/')[^2];
+        Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(value, out var ticket));
+        ((ManualClock)fixture.Runtime.Clock).Advance(FastSeekCoordinator.PlanLifetime + TimeSpan.FromSeconds(1));
+        Assert.IsFalse(fixture.Runtime.FastSeek!.TryGetBoundPlan(fixture.InputUrl, fixture.Runtime.Generation,
+            fixture.Target.Ticks, CancellationToken.None, out _));
+        Assert.IsTrue(fixture.Runtime.FastSeek.TryGetInputRepresentation(ticket!, fixture.Runtime.Generation, out var expected));
+        Assert.AreEqual("\"synthetic\"", expected!.StrongETag);
+    }
+
+    [TestMethod]
+    public async Task Processor_FailedOptimizedStartRestoresAllFieldsAndRetriesNativeOnce()
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        Assert.IsTrue(fixture.Processor.TryApply(command, CancellationToken.None, out var mutation));
+        var nativeStarts = 0;
+        var failed = Task.FromResult(false);
+        Assert.IsTrue(await mutation!.ObserveStartAsync(failed, retryToken =>
+        {
+            nativeStarts++;
+            Assert.AreEqual(fixture.Target, command.Input0.Options.ss);
+            Assert.IsNull(command.Input0.InputProtocol.offset);
+            Assert.IsNull(command.Input0.InputProtocol.seekable);
+            Assert.IsNull(command.Input0.InputProtocol.user_agent);
+            Assert.IsNull(command.Input0.InputProtocol.headers);
+            Assert.IsNull(command.Output0.Options.ss);
+            Assert.IsNull(command.Output0.Options.output_ts_offset);
+            Assert.AreEqual(-fixture.Target, command.Output0.Muxer.segment_time_delta);
+            Assert.IsFalse(fixture.Processor.TryApply(command));
+            Assert.IsTrue(fixture.Runtime.Tickets.TryInspect(fixture.InputUrl.Split('/')[^2], out var ticket));
+            Assert.IsFalse(fixture.Runtime.FastSeek!.TryGetInputRepresentation(ticket!, fixture.Runtime.Generation, out _));
+            return Task.FromResult(true);
+        }, CancellationToken.None));
+        Assert.AreEqual(1, nativeStarts);
+    }
+
+    [TestMethod]
+    public async Task Processor_ThrownStartLeavesCleanupAndRunningCommandToTheHost()
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        Assert.IsTrue(fixture.Processor.TryApply(command, CancellationToken.None, out var mutation));
+        var starts = 0;
+        await Assert.ThrowsAsync<IOException>(() => mutation!.ObserveStartAsync(
+            Task.FromException<bool>(new IOException()), retryToken =>
+            {
+                starts++;
+                return Task.FromResult(true);
+            }, CancellationToken.None));
+        Assert.AreEqual(0, starts);
+        Assert.IsTrue(command.Input0.InputProtocol.offset > 0);
+        Assert.IsNull(command.Input0.Options.ss);
+        Assert.AreEqual(GatewayTransport.ProbeUserAgent, command.Input0.InputProtocol.user_agent);
+        Assert.IsNotNull(command.Input0.InputProtocol.headers);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Processor_DoesNotRetryCancelledOrRevokedJobs(bool generationChanged)
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        using var cancellation = new CancellationTokenSource();
+        Assert.IsTrue(fixture.Processor.TryApply(command, cancellation.Token, out var mutation));
+        if (generationChanged) fixture.Runtime.ClearSensitiveState();
+        else cancellation.Cancel();
+        var starts = 0;
+        Assert.IsFalse(await mutation!.ObserveStartAsync(Task.FromResult(false), retryToken =>
+        {
+            starts++;
+            return Task.FromResult(true);
+        }, cancellation.Token));
+        Assert.AreEqual(0, starts);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Processor_DoesNotStartNativeWhenCancellationOrRevocationOccursDuringRestore(bool generationChanged)
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        using var cancellation = new CancellationTokenSource();
+        Assert.IsTrue(fixture.Processor.TryApply(command, cancellation.Token, out var mutation));
+        command.Input0.InputProtocol.OnOffsetReset = () =>
+        {
+            if (generationChanged) fixture.Runtime.ClearSensitiveState();
+            else cancellation.Cancel();
+        };
+        var starts = 0;
+        Assert.IsFalse(await mutation!.ObserveStartAsync(Task.FromResult(false), retryToken =>
+        {
+            starts++;
+            return Task.FromResult(true);
+        }, cancellation.Token));
+        Assert.AreEqual(0, starts);
+    }
+
+    [TestMethod]
+    public async Task Processor_CommittedNativeRetryReceivesRuntimeCancellation()
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        Assert.IsTrue(fixture.Processor.TryApply(command, CancellationToken.None, out var mutation));
+        var started = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var released = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var result = mutation!.ObserveStartAsync(Task.FromResult(false), token =>
+        {
+            started.SetResult(token);
+            return released.Task;
+        }, CancellationToken.None);
+        var nativeToken = await started.Task;
+        Assert.IsFalse(nativeToken.IsCancellationRequested);
+        fixture.Runtime.ClearSensitiveState();
+        Assert.IsTrue(nativeToken.IsCancellationRequested);
+        released.SetResult(false);
+        Assert.IsFalse(await result);
+    }
+
+    [TestMethod]
+    public async Task HarmonyCommandHook_RetriesOneNativeStartWithoutReapplyingThePlan()
+    {
+        using var fixture = await CreateFixtureAsync();
+        var command = TestFfmpegCommand.Create(fixture.InputUrl, fixture.Target);
+        var runner = new TestFfmpegRunner();
+        var harmony = new Harmony("StrmBridge.Tests.FfmpegFallback." + Guid.NewGuid().ToString("N"));
+        FfmpegCommandPatchBridge.Attach(fixture.Processor);
+        try
+        {
+            harmony.Patch(typeof(TestFfmpegRunner).GetMethod(nameof(TestFfmpegRunner.Start))!,
+                prefix: new HarmonyMethod(typeof(FfmpegCommandPatchBridge).GetMethod(nameof(FfmpegCommandPatchBridge.Prefix))!),
+                postfix: new HarmonyMethod(typeof(FfmpegCommandPatchBridge).GetMethod(nameof(FfmpegCommandPatchBridge.Postfix))!));
+            Assert.IsFalse(await runner.Start(command, CancellationToken.None));
+            Assert.AreEqual(2, runner.Starts);
+            Assert.IsTrue(runner.ObservedOptimizedFirst);
+            Assert.IsTrue(runner.ObservedNativeSecond);
+        }
+        finally
+        {
+            harmony.UnpatchAll(harmony.Id);
+            FfmpegCommandPatchBridge.Detach(fixture.Processor);
+        }
+    }
+
+    private sealed class TestFfmpegRunner
+    {
+        public int Starts { get; private set; }
+        public bool ObservedOptimizedFirst { get; private set; }
+        public bool ObservedNativeSecond { get; private set; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public Task<bool> Start(TestFfmpegCommand command, CancellationToken cancellationToken)
+        {
+            Starts++;
+            if (Starts == 1) ObservedOptimizedFirst = command.Input0.InputProtocol.offset > 0 && command.Input0.Options.ss is null;
+            if (Starts == 2) ObservedNativeSecond = command.Input0.InputProtocol.offset is null && command.Input0.Options.ss.HasValue;
+            return Task.FromResult(false);
+        }
+    }
+
+    private static async Task<CommandFixture> CreateFixtureAsync(
+        IFastSeekProbeClient? probe = null, FastSeekVideoSelection? selection = null)
     {
         var workspace = new TestWorkspace();
         var runtime = new PluginRuntime();
         var logger = FastSeekCoordinatorTests.CreateLogger();
-        runtime.Initialize(workspace.Path, new ManualClock(), new StubRedirectClient((_, _, _, _) =>
-            Task.FromResult(new RedirectSourceResponse(404, null, null))));
-        runtime.InitializeFastSeek(logger, new SyntheticFastSeekProbeClient());
+        runtime.Initialize(workspace.Path, new ManualClock());
+        runtime.InitializeFastSeek(logger, probe ?? new SyntheticFastSeekProbeClient());
         var source = TestSources.Create();
         var target = TimeSpan.FromSeconds(50);
         await runtime.FastSeek!.PrepareAsync(
@@ -806,8 +1227,11 @@ public sealed class FfmpegCommandProcessorTests
             TimeSpan.FromSeconds(100).Ticks,
             runtime.Generation,
             new PluginConfiguration(),
-            CancellationToken.None);
-        const string inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v2/ticket/stream.m2ts";
+            CancellationToken.None,
+            selection);
+        var ticket = runtime.Tickets.IssuePlayback(Guid.NewGuid(), "source-one", null, source,
+            Emby.StrmBridge.Domain.PlaybackTicketPurpose.ServerFfmpeg, runtime.Generation);
+        var inputUrl = "http://127.0.0.1:8096/StrmBridge/Playback/v3/" + ticket + "/stream.m2ts";
         Assert.IsTrue(runtime.FastSeek.TryBindInput(
             source,
             "source-one",
@@ -815,7 +1239,9 @@ public sealed class FfmpegCommandProcessorTests
             TimeSpan.FromSeconds(100).Ticks,
             runtime.Generation,
             inputUrl,
-            new PluginConfiguration()));
+            new PluginConfiguration(),
+            selection,
+            ticket));
         return new CommandFixture(
             workspace,
             runtime,
@@ -841,7 +1267,7 @@ public sealed class FfmpegCommandProcessorTests
         }
 
         private TestWorkspace Workspace { get; }
-        private PluginRuntime Runtime { get; }
+        public PluginRuntime Runtime { get; }
         public FfmpegCommandProcessor Processor { get; }
         public string InputUrl { get; }
         public TimeSpan Target { get; }
@@ -855,6 +1281,7 @@ public sealed class FfmpegCommandProcessorTests
 
     private sealed class TestFfmpegCommand
     {
+        public object[] Connections { get; set; } = Array.Empty<object>();
         public TestGlobalOptions Options { get; set; } = new();
         public TestInput Input0 { get; set; } = new();
         public TestOutput Output0 { get; set; } = new();
@@ -907,14 +1334,48 @@ public sealed class FfmpegCommandProcessorTests
 
     private sealed class TestOutput
     {
+        public object? Video0 { get; set; }
         public TestOutputOptions Options { get; set; } = new();
         public TestSegmentMuxer Muxer { get; set; } = new();
     }
 
+    private class TestMappedInputBase
+    {
+        public object? Stream { get; set; }
+        public int InputIndex => 0;
+        public string MediaKind => "Video";
+    }
+
+    private sealed class TestMappedInput : TestMappedInputBase
+    {
+        public new TestMappedStream Stream { get; set; } = new();
+    }
+
+    private sealed class TestMappedStream
+    {
+        public int Index { get; set; }
+    }
+
     private sealed class TestHttpProtocol
     {
+        public string? user_agent { get; set; }
+        public string? headers { get; set; }
+        public string? cookies { get; set; }
+        public string? referer { get; set; }
+        public string? method { get; set; }
+        public byte[]? post_data { get; set; }
         public string Key { get; set; } = "http";
-        public long? offset { get; set; }
+        private long? initialOffset;
+        public Action? OnOffsetReset { get; set; }
+        public long? offset
+        {
+            get => initialOffset;
+            set
+            {
+                if (value is null && initialOffset.HasValue) OnOffsetReset?.Invoke();
+                initialOffset = value;
+            }
+        }
         public bool? seekable { get; set; }
     }
 
@@ -988,6 +1449,7 @@ internal sealed class SyntheticFastSeekProbeClient : IFastSeekProbeClient
     }
 
     public List<long> Offsets { get; } = new();
+    public List<int> RequestedBytes { get; } = new();
 
     public Task<FastSeekProbeResult> ReadAsync(
         Emby.StrmBridge.Domain.SourceIdentity source,
@@ -998,6 +1460,7 @@ internal sealed class SyntheticFastSeekProbeClient : IFastSeekProbeClient
     {
         cancellationToken.ThrowIfCancellationRequested();
         Offsets.Add(offset);
+        RequestedBytes.Add(maximumBytes);
         var length = (int)Math.Min(maximumBytes, TotalLength - offset);
         var bytes = invalidData
             ? new byte[length]
@@ -1008,7 +1471,49 @@ internal sealed class SyntheticFastSeekProbeClient : IFastSeekProbeClient
                 256,
                 packetOffset => (long)Math.Round(
                     secondsAtNormalizedOffset(packetOffset / (double)TotalLength) * 27_000_000d));
-        return Task.FromResult(new FastSeekProbeResult(offset, TotalLength, bytes));
+        return Task.FromResult(new FastSeekProbeResult(offset, TotalLength, bytes, new FastSeekRepresentation("\"synthetic\"", TotalLength)));
+    }
+}
+
+internal sealed class HighBitrateFastSeekProbeClient : IFastSeekProbeClient
+{
+    private const int PacketStride = 192;
+    private const int SyncOffset = 4;
+    private const long TotalLength = 600L * 1024 * 1024;
+    private const long ByteRate = 6L * 1024 * 1024;
+    private static readonly long RandomAccessOffset =
+        (long)(TotalLength * 0.46d) + 6L * 1024 * 1024;
+    private readonly bool includeRandomAccess;
+
+    public HighBitrateFastSeekProbeClient(bool includeRandomAccess = true) =>
+        this.includeRandomAccess = includeRandomAccess;
+
+    public List<int> RequestedBytes { get; } = new();
+
+    public Task<FastSeekProbeResult> ReadAsync(
+        Emby.StrmBridge.Domain.SourceIdentity source,
+        long offset,
+        int maximumBytes,
+        PluginConfiguration options,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        RequestedBytes.Add(maximumBytes);
+        var length = (int)Math.Min(maximumBytes, TotalLength - offset);
+        var packetCount = length / PacketStride;
+        var bytes = TransportStreamTestData.Create(
+            PacketStride,
+            offset,
+            packetCount,
+            256,
+            packetOffset => (long)Math.Round(
+                packetOffset / (double)ByteRate * TransportStreamClockParser.ClockFrequency));
+        for (var packet = 0; packet < packetCount; packet++)
+            bytes[packet * PacketStride + SyncOffset + 5] &= 0xbf;
+        var anchorPacket = (RandomAccessOffset - offset) / PacketStride;
+        if (includeRandomAccess && anchorPacket >= 0 && anchorPacket < packetCount)
+            bytes[(int)anchorPacket * PacketStride + SyncOffset + 5] |= 0x40;
+        return Task.FromResult(new FastSeekProbeResult(offset, TotalLength, bytes, new FastSeekRepresentation("\"synthetic\"", TotalLength)));
     }
 }
 
@@ -1049,6 +1554,43 @@ internal sealed class GatedFastSeekProbeClient : IFastSeekProbeClient
         Interlocked.Increment(ref probeCount);
         Started.TrySetResult(true);
         await Release.Task.WaitAsync(cancellationToken);
+        return await inner.ReadAsync(source, offset, maximumBytes, options, cancellationToken);
+    }
+}
+
+internal sealed class FirstReadCancellationProbeClient : IFastSeekProbeClient
+{
+    private readonly SyntheticFastSeekProbeClient inner = new();
+    private int probeCount;
+
+    public TaskCompletionSource<bool> FirstReadStarted { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource<bool> FirstReadCancellationObserved { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public int ProbeCount => Volatile.Read(ref probeCount);
+
+    public async Task<FastSeekProbeResult> ReadAsync(
+        Emby.StrmBridge.Domain.SourceIdentity source,
+        long offset,
+        int maximumBytes,
+        PluginConfiguration options,
+        CancellationToken cancellationToken)
+    {
+        if (Interlocked.Increment(ref probeCount) == 1)
+        {
+            FirstReadStarted.TrySetResult(true);
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            finally
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    FirstReadCancellationObserved.TrySetResult(true);
+            }
+        }
         return await inner.ReadAsync(source, offset, maximumBytes, options, cancellationToken);
     }
 }
@@ -1118,16 +1660,17 @@ internal static class TransportStreamTestData
         var pcrBase = normalized / 300;
         var extension = normalized % 300;
         packet[0] = 0x47;
-        packet[1] = (byte)(pid >> 8 & 0x1f);
+        packet[1] = (byte)((pid >> 8 & 0x1f) | 0x40);
         packet[2] = (byte)pid;
-        packet[3] = 0x20;
+        packet[3] = 0x30;
         packet[4] = 7;
-        packet[5] = 0x10;
+        packet[5] = 0x50;
         packet[6] = (byte)(pcrBase >> 25);
         packet[7] = (byte)(pcrBase >> 17);
         packet[8] = (byte)(pcrBase >> 9);
         packet[9] = (byte)(pcrBase >> 1);
         packet[10] = (byte)((pcrBase & 1) << 7 | extension >> 8 & 1);
         packet[11] = (byte)extension;
+        new byte[] { 0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0 }.CopyTo(packet.Slice(12));
     }
 }

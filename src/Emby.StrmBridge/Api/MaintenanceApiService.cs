@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using System.Threading.Tasks;
 using Emby.StrmBridge.Localization;
 using MediaBrowser.Controller.Net;
@@ -72,7 +73,8 @@ public sealed class MaintenanceApiService : IService, IRequiresRequest
         var health = runtime.GetPlaybackHealth();
         return new
         {
-            PluginVersion = typeof(Plugin).Assembly.GetName().Version?.ToString(3) ?? "unknown",
+            PluginVersion = GetPluginVersion(),
+            BuildId = GetBuildId(),
             Enabled = options.Enabled,
             PlaybackMode = options.PlaybackMode.ToString(),
             SelectedLibraryCount = options.IncludedLibraryIds.Length,
@@ -80,6 +82,13 @@ public sealed class MaintenanceApiService : IService, IRequiresRequest
             DetectedHostCount = runtime.GetDetectedRedirectHosts().Length,
             PatchStatus = health.PatchStatus.ToString(),
             health.HostAbi,
+            health.PrefixDiagnosticsAvailable,
+            health.ExternalPrefixCount,
+            health.NativePrefixInstalled,
+            health.NativePrefixPriority,
+            health.HighestExternalPrefixPriority,
+            health.NativePrefixUncontended,
+            health.NativePrefixPriorityStrictlyHigher,
             health.RuntimeGeneration,
             health.TicketCount,
             health.ActiveRelayCount,
@@ -93,15 +102,33 @@ public sealed class MaintenanceApiService : IService, IRequiresRequest
         var health = runtime.GetPlaybackHealth();
         return new
         {
+            PluginVersion = GetPluginVersion(),
+            BuildId = GetBuildId(),
             Enabled = options.Enabled,
             PlaybackMode = options.PlaybackMode.ToString(),
             PatchStatus = health.PatchStatus.ToString(),
             health.HostAbi,
+            health.PrefixDiagnosticsAvailable,
+            health.ExternalPrefixCount,
+            health.NativePrefixInstalled,
+            health.NativePrefixPriority,
+            health.HighestExternalPrefixPriority,
+            health.NativePrefixUncontended,
+            health.NativePrefixPriorityStrictlyHigher,
             health.RuntimeGeneration,
             health.TicketCount,
             health.ActiveRelayCount,
         };
     }
+
+    private static string GetPluginVersion() =>
+        typeof(Plugin).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion ??
+        typeof(Plugin).Assembly.GetName().Version?.ToString(3) ??
+        "unknown";
+
+    private static string GetBuildId() =>
+        typeof(Plugin).Assembly.ManifestModule.ModuleVersionId.ToString("N").Substring(0, 12);
 
     private Extraction.ExtractionCoordinator GetCoordinator() =>
         Plugin.Runtime?.Extraction ?? throw new InvalidOperationException(PluginStrings.TaskInitializationError);

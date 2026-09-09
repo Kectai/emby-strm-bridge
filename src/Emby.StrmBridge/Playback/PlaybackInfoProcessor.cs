@@ -130,7 +130,9 @@ public sealed class PlaybackInfoProcessor
             response.MediaSources is null || response.MediaSources.Length == 0)
             return 0;
 
-        if (!IsIncludedLibraryItem(requestedItem, options.IncludedLibraryIds)) return 0;
+        if (!PlaybackItemPolicy.IsVideo(requestedItem) ||
+            !IsIncludedLibraryItem(requestedItem, options.IncludedLibraryIds))
+            return 0;
 
         var result = response.MediaSources.ToArray();
         var issuedTickets = new List<string>();
@@ -142,7 +144,9 @@ public sealed class PlaybackInfoProcessor
                 var original = result[index];
                 if (original is null) continue;
                 var sourceItem = ResolveSourceItem(original, requestedItem);
-                if (!IsIncludedItem(sourceItem, options.IncludedLibraryIds)) continue;
+                if (!PlaybackItemPolicy.IsVideo(sourceItem) ||
+                    !IsIncludedItem(sourceItem, options.IncludedLibraryIds))
+                    continue;
 
                 SourceIdentity source;
                 try { source = runtime.SourcePolicy.Read(sourceItem!.Path); }
@@ -163,12 +167,14 @@ public sealed class PlaybackInfoProcessor
                             PlaybackTicketPurpose.DirectClient,
                             operation.Generation,
                             TicketStore.ComputePlaybackLifetime(original.RunTimeTicks ?? sourceItem.RunTimeTicks),
-                            deviceId)))
+                            deviceId,
+                            SourceBehaviorClassifier.IsKnownFileContainer(original.Container))))
                 {
                     foreach (var issued in issuedTickets) runtime.Tickets.Revoke(issued);
                     return 0;
                 }
                 issuedTickets.Add(ticket!);
+                runtime.Tickets.RegisterNativePlayback(ticket!, response.PlaySessionId);
                 var playbackRoute = GatewayRouteBuilder.CreatePlaybackRoute(
                     apiPathBase, ticket!, original.Container);
                 var clone = new MediaSourceInfo(original)

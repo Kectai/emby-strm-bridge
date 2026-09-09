@@ -1,6 +1,5 @@
 using System;
 using System.Threading;
-using Emby.StrmBridge.Playback;
 using MediaBrowser.Model.Logging;
 
 namespace Emby.StrmBridge.Runtime;
@@ -29,7 +28,6 @@ public sealed class MaintenanceService : IDisposable
         {
             if (Volatile.Read(ref stopping) != 0) return;
             runtime.Tickets.RemoveExpired();
-            runtime.Redirects?.RemoveExpired();
             runtime.Gateway?.RemoveExpiredRedirectLeases();
             runtime.FastSeek?.RemoveExpired();
             runtime.MediaInfoStore?.RemoveTemporaryFiles();

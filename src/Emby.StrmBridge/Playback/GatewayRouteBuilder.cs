@@ -11,7 +11,7 @@ internal static class GatewayRouteBuilder
 
     public static string CreatePlaybackRoute(string apiPathBase, string ticket, string? container)
     {
-        return NormalizeApiPathBase(apiPathBase) + "/StrmBridge/Playback/v2/" + ticket + "/" +
+        return NormalizeApiPathBase(apiPathBase) + "/StrmBridge/Playback/v3/" + ticket + "/" +
                CreatePlaybackFileName(container);
     }
 
@@ -43,7 +43,7 @@ internal static class GatewayRouteBuilder
     public static string CreateHlsRoute(string apiPathBase, string parentTicket, string ticket, Uri source)
     {
         var extension = NormalizeExtension(System.IO.Path.GetExtension(source.AbsolutePath).TrimStart('.'));
-        return NormalizeApiPathBase(apiPathBase) + "/StrmBridge/Playback/v2/" + parentTicket +
+        return NormalizeApiPathBase(apiPathBase) + "/StrmBridge/Playback/v3/" + parentTicket +
                "/hls/" + ticket + "/resource" + extension;
     }
 

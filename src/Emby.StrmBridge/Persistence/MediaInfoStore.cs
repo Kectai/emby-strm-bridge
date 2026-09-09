@@ -31,7 +31,11 @@ public sealed class MediaInfoStore
         {
             var primaryIsValid = TryRead(path, out _);
             var backupIsValid = TryRead(path + ".bak", out _);
-            if (File.Exists(path) && !primaryIsValid && !backupIsValid)
+            // Legacy schema 2 is readable evidence for safe replacement, but never restoration.
+            var replaceableLegacy = !primaryIsValid &&
+                                    TryRead(path, out var legacy, allowLegacyReplacement: true) &&
+                                    legacy!.SchemaVersion == 2;
+            if (File.Exists(path) && !primaryIsValid && !backupIsValid && !replaceableLegacy)
                 throw new InvalidDataException("The existing snapshot and its backup are unreadable.");
             var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
@@ -59,8 +63,8 @@ public sealed class MediaInfoStore
         var path = GetPath(source.StorageKey);
         lock (GetLock(source.StorageKey))
         {
-            if (TryRead(path, out snapshot) && snapshot!.Matches(source)) return true;
-            if (TryRead(path + ".bak", out snapshot) && snapshot!.Matches(source)) return true;
+            if (TryRead(path, out snapshot) && SafelyMatches(snapshot!, source)) return true;
+            if (TryRead(path + ".bak", out snapshot) && SafelyMatches(snapshot!, source)) return true;
             snapshot = null;
             return false;
         }
@@ -142,7 +146,7 @@ public sealed class MediaInfoStore
         return Path.Combine(directoryPath, storageKey + ".json");
     }
 
-    private bool TryRead(string path, out MediaInfoSnapshot? snapshot)
+    private bool TryRead(string path, out MediaInfoSnapshot? snapshot, bool allowLegacyReplacement = false)
     {
         try
         {
@@ -152,7 +156,7 @@ public sealed class MediaInfoStore
                 snapshot = null;
                 return false;
             }
-            snapshot = serializer.Deserialize(File.ReadAllBytes(path));
+            snapshot = serializer.Deserialize(File.ReadAllBytes(path), allowLegacyReplacement);
             return snapshot is not null;
         }
         catch (Exception exception) when (
@@ -166,6 +170,17 @@ public sealed class MediaInfoStore
 
     private object GetLock(string storageKey) =>
         locks[(int)((uint)StringComparer.Ordinal.GetHashCode(storageKey) % LockStripeCount)];
+
+    private static bool SafelyMatches(MediaInfoSnapshot snapshot, SourceIdentity source)
+    {
+        try { return snapshot.Matches(source); }
+        catch (Exception exception) when (
+            exception is ArgumentException || exception is InvalidOperationException ||
+            exception is NullReferenceException)
+        {
+            return false;
+        }
+    }
 
     private static bool IsStorageKey(string? storageKey) =>
         storageKey?.Length == 64 && storageKey.All(character =>

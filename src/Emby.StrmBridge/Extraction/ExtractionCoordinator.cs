@@ -4,13 +4,16 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using Emby.StrmBridge.Configuration;
 using Emby.StrmBridge.Domain;
 using Emby.StrmBridge.Localization;
+using Emby.StrmBridge.Playback;
 using Emby.StrmBridge.Policy;
 using Emby.StrmBridge.Runtime;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Notifications;
@@ -20,6 +23,7 @@ using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Logging;
 using MediaBrowser.Model.MediaInfo;
+using MediaBrowser.Model.Net;
 using MediaBrowser.Model.Notifications;
 
 namespace Emby.StrmBridge.Extraction;
@@ -38,7 +42,10 @@ public sealed class ExtractionCoordinator
     private readonly IActivityManager? activityManager;
     private readonly ILogger logger;
     private readonly Func<PluginConfiguration> optionsProvider;
+    private readonly Func<string> localApiUrlProvider;
+    private readonly IExtractionProbeFallback? probeFallback;
     private readonly SemaphoreSlim runGate = new(1, 1);
+    private readonly SemaphoreSlim fallbackProbeGate = new(1, 1);
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> activeItems = new();
     private readonly object backgroundSync = new();
     private Task? backgroundTask;
@@ -53,7 +60,8 @@ public sealed class ExtractionCoordinator
         IItemRepository itemRepository,
         ILogManager logManager,
         INotificationManager notificationManager,
-        IActivityManager activityManager)
+        IActivityManager activityManager,
+        IServerApplicationHost applicationHost)
         : this(
             runtime,
             libraryManager,
@@ -62,7 +70,11 @@ public sealed class ExtractionCoordinator
             logManager,
             runtime.GetOptionsSnapshot,
             notificationManager,
-            activityManager)
+            activityManager,
+            () => applicationHost.GetLocalApiUrl(IPAddress.Loopback),
+            IndependentFfprobeMediaInfoProbe.TryCreate(
+                applicationHost,
+                logManager.GetLogger(Plugin.Instance?.Name ?? "STRM Bridge")))
     {
     }
 
@@ -74,7 +86,9 @@ public sealed class ExtractionCoordinator
         ILogManager logManager,
         Func<PluginConfiguration> optionsProvider,
         INotificationManager? notificationManager = null,
-        IActivityManager? activityManager = null)
+        IActivityManager? activityManager = null,
+        Func<string>? localApiUrlProvider = null,
+        IExtractionProbeFallback? probeFallback = null)
     {
         this.runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         this.libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
@@ -83,6 +97,9 @@ public sealed class ExtractionCoordinator
         this.notificationManager = notificationManager;
         this.activityManager = activityManager;
         this.optionsProvider = optionsProvider ?? throw new ArgumentNullException(nameof(optionsProvider));
+        this.localApiUrlProvider = localApiUrlProvider ??
+            (() => throw new InvalidOperationException("The local probe gateway is unavailable."));
+        this.probeFallback = probeFallback;
         logger = (logManager ?? throw new ArgumentNullException(nameof(logManager)))
             .GetLogger(Plugin.Instance?.Name ?? "STRM Bridge");
     }
@@ -192,7 +209,8 @@ public sealed class ExtractionCoordinator
             }
 
             var sourceFlights = new ProbeFlightCache(MaximumSharedProbeResults);
-            var redirectDiscovery = new RedirectDiscoveryBudget();
+            var probeRunCircuit = new ProbeRunCircuit();
+            var recordedSourceFailures = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             var completed = 0;
             var nextIndex = -1;
             var workers = Enumerable.Range(0, options.MaximumExtractionConcurrency).Select(async _ =>
@@ -210,7 +228,8 @@ public sealed class ExtractionCoordinator
                                 force,
                                 operation.Generation,
                                 sourceFlights,
-                                redirectDiscovery,
+                                probeRunCircuit,
+                                recordedSourceFailures,
                                 token)
                             .ConfigureAwait(false);
                         result.Add(outcome);
@@ -311,8 +330,20 @@ public sealed class ExtractionCoordinator
             foreach (var item in GetCandidates(Array.Empty<string>(), token, includeAllLibraries: true))
             {
                 token.ThrowIfCancellationRequested();
-                try { keep.Add(runtime.SourcePolicy!.Read(item.Path).StorageKey); }
-                catch (SourcePolicyException) { }
+                try
+                {
+                    // Snapshot ownership is path-based. Cleanup must not require the STRM
+                    // contents to be readable or valid, because a temporary source-file
+                    // problem does not make its recovery data orphaned.
+                    keep.Add(runtime.SourcePolicy!.GetStorageKey(item.Path));
+                }
+                catch (SourcePolicyException)
+                {
+                    // An incomplete keep-set is unsafe: one unrepresentable candidate could
+                    // otherwise cause valid snapshots and retry state to be deleted.
+                    logger.Warn("STRM_BRIDGE_CLEANUP_SKIPPED reason=storage_key_unavailable");
+                    return 0;
+                }
             }
             runtime.ExtractionState!.RemoveMissing(keep);
             return runtime.MediaInfoStore!.RemoveOrphans(keep.Contains);
@@ -398,17 +429,21 @@ public sealed class ExtractionCoordinator
         bool force,
         int operationGeneration,
         ProbeFlightCache sourceFlights,
-        RedirectDiscoveryBudget redirectDiscovery,
+        ProbeRunCircuit probeRunCircuit,
+        ConcurrentDictionary<string, byte> recordedSourceFailures,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!IsCurrentlyAllowed(item, requirePlayback: false)) return ExtractionOutcome.Skipped;
         SourceIdentity source;
         try { source = runtime.SourcePolicy!.Read(item.Path); }
-        catch (SourcePolicyException)
+        catch (SourcePolicyException exception)
         {
-            logger.Debug("STRM_BRIDGE_SOURCE_REJECTED item=" + ShortId(item.Id));
-            return ExtractionOutcome.Skipped;
+            // A selected STRM item whose local record cannot be parsed is still missing work.
+            // Report it as a failure so an all-green task result cannot hide invalid URLs.
+            logger.Debug("STRM_BRIDGE_SOURCE_REJECTED item=" + ShortId(item.Id) +
+                         " reason=" + exception.Reason.ToString().ToLowerInvariant());
+            return ExtractionOutcome.Failed;
         }
         if (!StaticMediaSourcePolicy.Matches(mediaSourceManager, item, source))
         {
@@ -416,7 +451,19 @@ public sealed class ExtractionCoordinator
             return ExtractionOutcome.Skipped;
         }
 
-        var missing = IsMissing(item);
+        bool missing;
+        try
+        {
+            missing = IsMissing(item, GetRequiredStreamType(item, source.SourceUri));
+        }
+        catch (Exception exception) when (IsRecoverableItemFailure(exception))
+        {
+            // A transient Emby repository failure is local to this item. It must not abort
+            // the remaining library pass or be attributed to the remote media source.
+            logger.Debug("STRM_BRIDGE_EXTRACTION_FAILED item=" + ShortId(item.Id) +
+                         " reason=local_stream_read");
+            return ExtractionOutcome.Failed;
+        }
         var lastSuccessfulFingerprint = runtime.ExtractionState!.GetLastSuccessfulFingerprint(source.StorageKey);
         var shouldAttempt = force || !options.OnlyMissingMediaInfo || runtime.ExtractionState.ShouldAttempt(
             source.StorageKey,
@@ -424,89 +471,123 @@ public sealed class ExtractionCoordinator
             runtime.Clock.UtcNow);
         if (!force && options.OnlyMissingMediaInfo && !missing)
         {
-            if (lastSuccessfulFingerprint is null)
-            {
-                if (options.EnablePersistence && runtime.MediaInfoStore!.TryLoad(source, out _))
-                {
-                    BaselineCompleteItem(item, source, operationGeneration);
-                    return ExtractionOutcome.Skipped;
-                }
-                if (BaselineCompleteItem(item, source, operationGeneration))
-                    return ExtractionOutcome.Skipped;
-            }
-            if (string.Equals(lastSuccessfulFingerprint, source.SourceFingerprint, StringComparison.Ordinal))
-                return ExtractionOutcome.Skipped;
-        }
-
-        if (!shouldAttempt)
-        {
-            var pendingHosts = runtime.GetDetectedRedirectHosts(options.AllowedRedirectHosts);
-            if (pendingHosts.Length > 0 || !redirectDiscovery.TryAcquire())
-                return ExtractionOutcome.Skipped;
+            // Existing complete information is authoritative in missing-only mode, including
+            // after the STRM source changes. Refreshing it requires Force or
+            // OnlyMissingMediaInfo=false. Recording the current baseline is best effort: a
+            // full state store must never turn a complete item into a remote probe.
+            if (!string.Equals(lastSuccessfulFingerprint, source.SourceFingerprint, StringComparison.Ordinal))
+                BaselineCompleteItem(item, source, operationGeneration);
+            return ExtractionOutcome.Skipped;
         }
 
         if (!force && options.OnlyMissingMediaInfo && options.EnablePersistence &&
             runtime.MediaInfoStore!.TryLoad(source, out var stored))
         {
-            try
+            var restoredSource = stored!.ToMediaSource("strmbridge-restored");
+            if (IsComplete(restoredSource, GetRequiredStreamType(item, source.SourceUri)))
             {
-                if (TryApply(
-                        item,
-                        source,
-                        stored!.ToMediaSource("strmbridge-restored"),
-                        operationGeneration,
-                        saveSnapshot: null))
+                try
                 {
-                    logger.Debug("STRM_BRIDGE_MEDIAINFO_RESTORED item=" + ShortId(item.Id));
-                    return ExtractionOutcome.Restored;
+                    if (TryApply(
+                            item,
+                            source,
+                            restoredSource,
+                            operationGeneration,
+                            saveSnapshot: null))
+                    {
+                        logger.Debug("STRM_BRIDGE_MEDIAINFO_RESTORED item=" + ShortId(item.Id));
+                        return ExtractionOutcome.Restored;
+                    }
+                    return ExtractionOutcome.Skipped;
                 }
-                return ExtractionOutcome.Skipped;
-            }
-            catch (Exception exception) when (!(exception is OperationCanceledException && cancellationToken.IsCancellationRequested))
-            {
-                RecordFailureIfCurrent(source, operationGeneration);
-                logger.Debug("STRM_BRIDGE_RESTORE_FAILED item=" + ShortId(item.Id));
-                return ExtractionOutcome.Failed;
+                catch (Exception) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+                catch (Exception)
+                {
+                    logger.Debug("STRM_BRIDGE_RESTORE_FAILED item=" + ShortId(item.Id));
+                    return ExtractionOutcome.Failed;
+                }
             }
         }
+
+        // Retry state limits only a new remote probe. Local completeness checks and matching
+        // snapshot restoration above remain available throughout the delay.
+        if (!shouldAttempt) return ExtractionOutcome.Skipped;
 
         try
         {
             var probe = await ProbeSharedAsync(
+                    item.Id,
                     source,
+                    GetRequiredStreamType(item, source.SourceUri),
                     options.ExtractionTimeoutSeconds,
                     sourceFlights,
+                    probeRunCircuit,
+                    operationGeneration,
                     cancellationToken)
                 .ConfigureAwait(false);
+            if (probe is null) return ExtractionOutcome.Skipped;
             cancellationToken.ThrowIfCancellationRequested();
-            var snapshot = MediaInfoSnapshot.FromMediaSource(
-                source,
-                probe.MediaSource,
-                runtime.Clock.UtcNow);
-            if (!TryApply(
-                    item,
+            try
+            {
+                var snapshot = MediaInfoSnapshot.FromMediaSource(
                     source,
                     probe.MediaSource,
-                    operationGeneration,
-                    snapshot))
-                return ExtractionOutcome.Skipped;
+                    runtime.Clock.UtcNow);
+                if (!TryApply(
+                        item,
+                        source,
+                        probe.MediaSource,
+                        operationGeneration,
+                        snapshot))
+                    return ExtractionOutcome.Skipped;
+            }
+            catch (Exception) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
+            catch (Exception)
+            {
+                // The remote probe completed successfully. A local commit failure must not
+                // create source retry backoff, otherwise a transient repository problem can
+                // suppress later probes for an otherwise healthy source.
+                logger.Debug("STRM_BRIDGE_EXTRACTION_FAILED item=" + ShortId(item.Id) +
+                             " reason=local_apply");
+                return ExtractionOutcome.Failed;
+            }
             logger.Debug("STRM_BRIDGE_MEDIAINFO_EXTRACTED item=" + ShortId(item.Id));
             return ExtractionOutcome.Extracted;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
         {
-            throw;
+            throw new OperationCanceledException(cancellationToken);
         }
         catch (RedirectRejectedException exception) when (
             exception.Reason == RedirectRejectionReason.UntrustedTargetHost)
         {
-            RecordFailureIfCurrent(source, operationGeneration);
+            RecordFailureIfCurrent(source, operationGeneration, recordedSourceFailures);
             logger.Debug("STRM_BRIDGE_EXTRACTION_AWAITING_TRUST item=" + ShortId(item.Id));
             return ExtractionOutcome.AwaitingApproval;
         }
+        catch (ProbeInputNotOpenedException exception)
+        {
+            logger.Warn(exception.CircuitOpened
+                ? "STRM_BRIDGE_EXTRACTION_PROBE_CIRCUIT_OPEN"
+                : "STRM_BRIDGE_EXTRACTION_PROBE_INPUT_NOT_OPENED item=" + ShortId(item.Id));
+            return ExtractionOutcome.Failed;
+        }
+        catch (ProbeLocalFailureException exception)
+        {
+            logger.Warn(exception.CircuitOpened
+                ? "STRM_BRIDGE_EXTRACTION_PROBE_CIRCUIT_OPEN reason=fallback_local_failure"
+                : "STRM_BRIDGE_EXTRACTION_PROBE_LOCAL_FAILURE item=" + ShortId(item.Id));
+            return ExtractionOutcome.Failed;
+        }
         catch (Exception exception)
         {
-            RecordFailureIfCurrent(source, operationGeneration);
+            RecordFailureIfCurrent(source, operationGeneration, recordedSourceFailures);
             logger.Debug("STRM_BRIDGE_EXTRACTION_FAILED item=" + ShortId(item.Id) +
                          " reason=" + GetFailureReason(exception));
             return ExtractionOutcome.Failed;
@@ -515,80 +596,201 @@ public sealed class ExtractionCoordinator
 
     private static string GetFailureReason(Exception exception)
     {
-        if (exception is Emby.StrmBridge.Playback.RedirectSourceUnavailableException)
-            return "source_unavailable";
         if (exception is RedirectRejectedException rejected)
             return "redirect_" + rejected.Reason.ToString().ToLowerInvariant();
         if (exception is InvalidDataException) return "probe_incomplete";
+        if (exception is ProbeInputNotOpenedException) return "probe_input_not_opened";
         if (exception is System.Net.Http.HttpRequestException) return "probe_http";
         if (exception is TaskCanceledException) return "timeout";
         return "probe_or_save";
     }
 
     private async Task<ProbeResult> ProbeAsync(
+        Guid itemId,
         SourceIdentity source,
+        MediaStreamType requiredStreamType,
         int timeoutSeconds,
+        ProbeRunCircuit probeRunCircuit,
+        int operationGeneration,
         CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
         activeItems.TryAdd(timeout, 0);
+        string? probeTicket = null;
+        TicketPayload? payload = null;
         try
         {
-            var lease = await runtime.Redirects!.ResolveForProbeAsync(source, ProbeUserAgent, timeout.Token)
-                .ConfigureAwait(false);
-            var target = lease.GetLocation();
-            var mediaSource = new MediaSourceInfo
+            var isAudio = requiredStreamType == MediaStreamType.Audio;
+            probeTicket = runtime.Tickets.IssuePlayback(
+                itemId, source.StorageKey, null, source, PlaybackTicketPurpose.ExtractionProbe,
+                operationGeneration, TimeSpan.FromSeconds(timeoutSeconds));
+            if (!runtime.Tickets.TryInspect(probeTicket, out payload) || payload is null)
+                throw new ProbeInputNotOpenedException(probeRunCircuit.RecordInputNotOpened());
+            payload.ProbeCancellation = timeout.Token;
+            Volatile.Write(ref payload.ProbeInputObservedCallback, probeRunCircuit.RecordInputOpened);
+            var target = GatewayRouteBuilder.CreateInternalPlaybackRoute(
+                localApiUrlProvider(), string.Empty, probeTicket,
+                Path.GetExtension(source.SourceUri.AbsolutePath).TrimStart('.')) ??
+                throw new InvalidOperationException("The local probe gateway is unavailable.");
+            var mediaSource = CreateProbeMediaSource(source, target);
+            if (probeRunCircuit.PreferFallbackProbe && probeFallback?.IsAvailable == true)
             {
-                Id = "strmbridge-probe-" + source.StorageKey.Substring(0, 16),
-                Path = target,
-                ProbePath = target,
-                Protocol = MediaProtocol.Http,
-                ProbeProtocol = MediaProtocol.Http,
-                IsRemote = true,
-                RequiredHttpHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                await RunFallbackProbeAsync(mediaSource, isAudio, timeout.Token).ConfigureAwait(false);
+                probeRunCircuit.RecordFallbackSuccess();
+            }
+            else
+            {
+                Exception? hostProbeFailure = null;
+                try
                 {
-                    ["User-Agent"] = ProbeUserAgent,
-                },
-            };
-            await mediaSourceManager.AddMediaInfoWithProbeSafe(
-                    mediaSource,
-                    isAudio: false,
-                    addProbeDelay: false,
-                    timeout.Token)
-                .ConfigureAwait(false);
+                    var probeTask = mediaSourceManager.AddMediaInfoWithProbeSafe(
+                        mediaSource,
+                        isAudio,
+                        addProbeDelay: false,
+                        timeout.Token);
+                    await AwaitWithCancellation(probeTask, timeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+                {
+                    hostProbeFailure = exception;
+                }
+                timeout.Token.ThrowIfCancellationRequested();
+                if (payload is not null && Volatile.Read(ref payload.ProbeLocalFailureObserved) != 0)
+                    throw new ProbeLocalFailureException(hostProbeFailure ??
+                        new InvalidOperationException("The local media-probe path failed."));
+                var hostInputOpened = payload is not null &&
+                                      Volatile.Read(ref payload.ProbeRequestObserved) != 0;
+                var hostProbeComplete = IsComplete(mediaSource, requiredStreamType);
+                if ((!hostInputOpened || !hostProbeComplete && hostProbeFailure is null) &&
+                    probeFallback?.IsAvailable == true)
+                {
+                    // A host probe can open the input successfully yet return only partial
+                    // transport-stream metadata when its default analysis window is too
+                    // small. Retry that item through the bounded independent probe, but only
+                    // switch the rest of the run to fallback when the host never opened the
+                    // input (the interception/compatibility case).
+                    if (!hostInputOpened && probeRunCircuit.PreferFallback())
+                        logger.Warn("STRM_BRIDGE_EXTRACTION_PROBE_FALLBACK_ACTIVE");
+                    mediaSource = CreateProbeMediaSource(source, target);
+                    Interlocked.Exchange(ref payload!.ProbeRequestObserved, 0);
+                    await RunFallbackProbeAsync(mediaSource, isAudio, timeout.Token).ConfigureAwait(false);
+                    probeRunCircuit.RecordFallbackSuccess();
+                }
+                else if (hostProbeFailure is not null)
+                {
+                    throw hostProbeFailure;
+                }
+            }
             timeout.Token.ThrowIfCancellationRequested();
-            if (mediaSource.MediaStreams is null ||
-                !mediaSource.MediaStreams.Any(stream => stream.Type == MediaStreamType.Video) ||
-                !mediaSource.RunTimeTicks.HasValue)
+            if (payload is not null && Volatile.Read(ref payload.ProbeLocalFailureObserved) != 0)
+                throw new ProbeLocalFailureException();
+            var probeInputOpened = payload is not null && Volatile.Read(ref payload.ProbeRequestObserved) != 0;
+            if (!probeInputOpened)
+                throw new ProbeInputNotOpenedException(probeRunCircuit.RecordInputNotOpened());
+            if (!IsComplete(mediaSource, requiredStreamType))
                 throw new InvalidDataException("The media probe returned incomplete technical information.");
             return new ProbeResult(mediaSource);
         }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+        catch (Exception exception) when (
+            payload is not null && Volatile.Read(ref payload.ProbeLocalFailureObserved) != 0)
+        {
+            throw new ProbeLocalFailureException(exception);
+        }
+        catch (IndependentProbeResultException exception)
+        {
+            throw new ProbeLocalFailureException(
+                probeRunCircuit.RecordFallbackLocalFailure(),
+                exception);
+        }
+        catch (TicketCapacityException exception)
+        {
+            throw new ProbeInputNotOpenedException(probeRunCircuit.RecordInputNotOpened(), exception);
+        }
+        catch (Exception) when (payload is not null &&
+                                Volatile.Read(ref payload.ProbeRejectionReason) >= 0)
+        {
+            throw new RedirectRejectedException((RedirectRejectionReason)Volatile.Read(ref payload.ProbeRejectionReason));
+        }
+        catch (Exception exception) when (
+            payload is not null &&
+            Volatile.Read(ref payload.ProbeRequestObserved) == 0 &&
+            !(exception is ProbeInputNotOpenedException))
+        {
+            throw new ProbeInputNotOpenedException(probeRunCircuit.RecordInputNotOpened(), exception);
+        }
         finally
         {
-            activeItems.TryRemove(timeout, out _);
+            try { timeout.Cancel(); }
+            finally
+            {
+                if (probeTicket is not null) runtime.Tickets.Revoke(probeTicket);
+                activeItems.TryRemove(timeout, out _);
+            }
         }
     }
 
-    private async Task<ProbeResult> ProbeSharedAsync(
-        SourceIdentity source,
-        int timeoutSeconds,
-        ProbeFlightCache sourceFlights,
+    private static MediaSourceInfo CreateProbeMediaSource(SourceIdentity source, string target) => new()
+    {
+        Id = "strmbridge-probe-" + source.StorageKey.Substring(0, 16),
+        Path = target,
+        ProbePath = target,
+        Protocol = MediaProtocol.Http,
+        ProbeProtocol = MediaProtocol.Http,
+        IsRemote = true,
+        RequiredHttpHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["User-Agent"] = ProbeUserAgent,
+        },
+    };
+
+    private async Task RunFallbackProbeAsync(
+        MediaSourceInfo mediaSource,
+        bool isAudio,
         CancellationToken cancellationToken)
     {
-        var cached = sourceFlights.TryGetOrAdd(
-            source.SourceFingerprint,
+        await fallbackProbeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await probeFallback!.ProbeAsync(mediaSource, isAudio, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            fallbackProbeGate.Release();
+        }
+    }
+
+    private async Task<ProbeResult?> ProbeSharedAsync(
+        Guid itemId,
+        SourceIdentity source,
+        MediaStreamType requiredStreamType,
+        int timeoutSeconds,
+        ProbeFlightCache sourceFlights,
+        ProbeRunCircuit probeRunCircuit,
+        int operationGeneration,
+        CancellationToken cancellationToken)
+    {
+        var flightKey = source.SourceFingerprint + ":" + requiredStreamType;
+        var flight = sourceFlights.TryGetOrAdd(
+            flightKey,
             () => new Lazy<Task<ProbeResult>>(
-                () => ProbeAsync(source, timeoutSeconds, cancellationToken),
+                () => ProbeAsync(
+                    itemId, source, requiredStreamType, timeoutSeconds, probeRunCircuit, operationGeneration, cancellationToken),
                 LazyThreadSafetyMode.ExecutionAndPublication),
-            out var flight);
+            () => !probeRunCircuit.IsOpen,
+            out var retained);
+        if (flight is null) return null;
         try
         {
             return await flight.Value.ConfigureAwait(false);
         }
         catch
         {
-            if (cached) sourceFlights.Remove(source.SourceFingerprint, flight);
+            if (retained) sourceFlights.Remove(flightKey, flight);
             throw;
         }
     }
@@ -601,7 +803,7 @@ public sealed class ExtractionCoordinator
         MediaInfoSnapshot? saveSnapshot)
     {
         PluginConfiguration? currentOptions = null;
-        return runtime.TryCommit(
+        return runtime.TryCommitMediaInfo(
             operationGeneration,
             () =>
             {
@@ -616,12 +818,20 @@ public sealed class ExtractionCoordinator
                 ApplyTechnicalFields(item, mediaSource);
                 if (saveSnapshot is not null && currentOptions!.EnablePersistence)
                 {
-                    try { runtime.MediaInfoStore!.Save(source, saveSnapshot); }
-                    catch (Exception exception) when (
-                        exception is IOException || exception is UnauthorizedAccessException ||
-                        exception is InvalidDataException || exception is System.Runtime.Serialization.SerializationException)
+                    if (!saveSnapshot.Matches(source))
                     {
                         logger.Debug("STRM_BRIDGE_SNAPSHOT_SAVE_FAILED item=" + ShortId(item.Id));
+                    }
+                    else
+                    {
+                        try { runtime.MediaInfoStore!.Save(source, saveSnapshot); }
+                        catch (Exception exception) when (
+                            exception is IOException || exception is UnauthorizedAccessException ||
+                            exception is InvalidDataException || exception is ArgumentException ||
+                            exception is System.Runtime.Serialization.SerializationException)
+                        {
+                            logger.Debug("STRM_BRIDGE_SNAPSHOT_SAVE_FAILED item=" + ShortId(item.Id));
+                        }
                     }
                 }
                 try
@@ -647,14 +857,11 @@ public sealed class ExtractionCoordinator
         {
             if (!string.IsNullOrWhiteSpace(source.Container)) item.Container = source.Container;
             if (source.RunTimeTicks.HasValue) item.RunTimeTicks = source.RunTimeTicks;
-            if (source.Size.HasValue && source.Size.Value > 0) item.Size = source.Size.Value;
-            if (source.Bitrate.HasValue && source.Bitrate.Value > 0) item.TotalBitrate = source.Bitrate.Value;
+            item.Size = Math.Max(0L, source.Size.GetValueOrDefault());
+            item.TotalBitrate = Math.Max(0, source.Bitrate.GetValueOrDefault());
             if (source.MediaStreams is { Count: > 0 })
             {
-                var internalStreams = source.MediaStreams
-                    .Where(stream => !stream.IsExternal && MediaInfoSnapshot.IsSupportedStreamType(stream.Type))
-                    .Take(MediaInfoSnapshot.MaximumMediaStreams)
-                    .ToList();
+                var internalStreams = MediaInfoSnapshot.SelectInternalStreams(source.MediaStreams);
                 var external = (previous.MediaStreams ?? new List<MediaStream>())
                     .Where(stream => stream.IsExternal)
                     .ToList();
@@ -682,13 +889,13 @@ public sealed class ExtractionCoordinator
                         remappedSubtitleIndex = replacementIndex;
                 }
                 item.MediaStreams = internalStreams.Concat(external).ToList();
-                if (!source.DefaultAudioStreamIndex.HasValue && remappedAudioIndex.HasValue)
-                    item.AudioStreamIndex = remappedAudioIndex;
-                if (!source.DefaultSubtitleStreamIndex.HasValue && remappedSubtitleIndex.HasValue)
-                    item.SubtitleStreamIndex = remappedSubtitleIndex;
+                item.AudioStreamIndex = SelectDefaultIndex(
+                    internalStreams, external, MediaStreamType.Audio, source.DefaultAudioStreamIndex,
+                    remappedAudioIndex ?? previous.AudioStreamIndex);
+                item.SubtitleStreamIndex = SelectDefaultIndex(
+                    internalStreams, external, MediaStreamType.Subtitle, source.DefaultSubtitleStreamIndex,
+                    remappedSubtitleIndex ?? previous.SubtitleStreamIndex);
             }
-            if (source.DefaultAudioStreamIndex.HasValue) item.AudioStreamIndex = source.DefaultAudioStreamIndex;
-            if (source.DefaultSubtitleStreamIndex.HasValue) item.SubtitleStreamIndex = source.DefaultSubtitleStreamIndex;
             PersistTechnicalFields(item);
         }
         catch
@@ -698,6 +905,18 @@ public sealed class ExtractionCoordinator
             TryRestoreTechnicalFields(item, previous);
             throw;
         }
+    }
+
+    private static int? SelectDefaultIndex(
+        IEnumerable<MediaStream> internalStreams, IEnumerable<MediaStream> external,
+        MediaStreamType type, int? newDefault, int? previousExternalDefault)
+    {
+        if (newDefault.HasValue && internalStreams.Any(stream => stream.Type == type && stream.Index == newDefault))
+            return newDefault;
+        return previousExternalDefault.HasValue && external.Any(stream =>
+            stream.Type == type && stream.Index == previousExternalDefault)
+            ? previousExternalDefault
+            : null;
     }
 
     private static int FindAvailableStreamIndex(HashSet<int> usedIndices)
@@ -739,8 +958,76 @@ public sealed class ExtractionCoordinator
         }
     }
 
-    private List<MediaStream> GetStoredMediaStreams(BaseItem item) =>
-        (mediaSourceManager.GetMediaStreams(item) ?? item.MediaStreams ?? new List<MediaStream>()).ToList();
+    private List<MediaStream> GetStoredMediaStreams(BaseItem item)
+    {
+        var hydrated = item.MediaStreams ?? new List<MediaStream>();
+        var repository = mediaSourceManager.GetMediaStreams(item);
+        if (repository is null || repository.Count == 0) return hydrated.ToList();
+
+        var merged = repository.ToList();
+        foreach (var stream in hydrated)
+        {
+            if (!merged.Any(existing => IsSameStoredStream(existing, stream))) merged.Add(stream);
+        }
+        return merged;
+    }
+
+    private static bool IsSameStoredStream(MediaStream existing, MediaStream candidate)
+    {
+        if (ReferenceEquals(existing, candidate)) return true;
+        if (existing.IsExternal != candidate.IsExternal || existing.Type != candidate.Type) return false;
+        if (existing.IsExternal) return IsSameExternalStream(existing, candidate);
+
+        // Prefer the repository version when both sides describe the same typed internal
+        // slot. Retain conflicting types and ambiguous unindexed streams rather than losing
+        // them from a rollback snapshot.
+        return existing.Index >= 0 && candidate.Index >= 0 && existing.Index == candidate.Index;
+    }
+
+    private static bool IsSameExternalStream(MediaStream existing, MediaStream candidate)
+    {
+        if (ReferenceEquals(existing, candidate)) return true;
+        if (!existing.IsExternal || !candidate.IsExternal || existing.Type != candidate.Type) return false;
+        var existingHasPath = !string.IsNullOrWhiteSpace(existing.Path);
+        var candidateHasPath = !string.IsNullOrWhiteSpace(candidate.Path);
+        var bothHavePaths = existingHasPath && candidateHasPath;
+        if (bothHavePaths && ExternalPathEquals(existing.Path!, candidate.Path!)) return true;
+        var existingHasDeliveryUrl = !string.IsNullOrWhiteSpace(existing.DeliveryUrl);
+        var candidateHasDeliveryUrl = !string.IsNullOrWhiteSpace(candidate.DeliveryUrl);
+        var bothHaveDeliveryUrls = existingHasDeliveryUrl && candidateHasDeliveryUrl;
+        if (bothHaveDeliveryUrls && string.Equals(
+                existing.DeliveryUrl, candidate.DeliveryUrl, StringComparison.Ordinal))
+            return true;
+        if (existingHasPath || candidateHasPath || existingHasDeliveryUrl || candidateHasDeliveryUrl) return false;
+        return existing.Index >= 0 && candidate.Index >= 0 && existing.Index == candidate.Index;
+    }
+
+    private static bool ExternalPathEquals(string first, string second)
+    {
+        if (Uri.TryCreate(first, UriKind.Absolute, out var firstUri) && !firstUri.IsFile ||
+            Uri.TryCreate(second, UriKind.Absolute, out var secondUri) && !secondUri.IsFile)
+            return string.Equals(first, second, StringComparison.Ordinal);
+        try
+        {
+            if (Path.IsPathRooted(first) && Path.IsPathRooted(second))
+            {
+                return string.Equals(
+                    Path.GetFullPath(first),
+                    Path.GetFullPath(second),
+                    Path.DirectorySeparatorChar == '\\'
+                        ? StringComparison.OrdinalIgnoreCase
+                        : StringComparison.Ordinal);
+            }
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException || exception is NotSupportedException ||
+            exception is PathTooLongException || exception is IOException ||
+            exception is System.Security.SecurityException)
+        {
+            return false;
+        }
+        return string.Equals(first, second, StringComparison.Ordinal);
+    }
 
     private void PersistTechnicalFields(BaseItem item)
     {
@@ -794,25 +1081,40 @@ public sealed class ExtractionCoordinator
     private bool BaselineCompleteItem(BaseItem item, SourceIdentity source, int operationGeneration)
     {
         var recorded = false;
-        var committed = runtime.TryCommit(
-            operationGeneration,
-            () => IsCurrentlyAllowed(item, requirePlayback: false),
-            () =>
-            {
-                var currentSource = runtime.SourcePolicy!.Read(item.Path);
-                if (source.HasSameFileVersion(currentSource))
+        try
+        {
+            var committed = runtime.TryCommitMediaInfo(
+                operationGeneration,
+                () => IsCurrentlyAllowed(item, requirePlayback: false),
+                () =>
                 {
-                    recorded = runtime.ExtractionState!.TryRecordBaseline(
-                        source.StorageKey,
-                        source.SourceFingerprint);
-                }
-            });
-        return committed && recorded;
+                    var currentSource = runtime.SourcePolicy!.Read(item.Path);
+                    if (source.HasSameFileVersion(currentSource))
+                    {
+                        recorded = runtime.ExtractionState!.TryRecordBaseline(
+                            source.StorageKey,
+                            source.SourceFingerprint);
+                    }
+                });
+            return committed && recorded;
+        }
+        catch (SourcePolicyException)
+        {
+            return false;
+        }
     }
 
-    private void RecordFailureIfCurrent(SourceIdentity source, int operationGeneration)
+    private void RecordFailureIfCurrent(
+        SourceIdentity source,
+        int operationGeneration,
+        ConcurrentDictionary<string, byte> recordedSourceFailures)
     {
-        runtime.TryCommit(
+        // One shared probe failure can fan out to duplicate BaseItems. Persistent retry state
+        // advances at most once per local path and source version during a run; distinct paths
+        // that share identical STRM contents still receive independent attribution.
+        var failureKey = source.StorageKey + source.SourceFingerprint;
+        if (!recordedSourceFailures.TryAdd(failureKey, 0)) return;
+        runtime.TryCommitMediaInfo(
             operationGeneration,
             () => true,
             () => runtime.ExtractionState!.RecordFailure(
@@ -836,8 +1138,9 @@ public sealed class ExtractionCoordinator
         {
             Recursive = true,
             IsFolder = false,
-            MediaTypes = new[] { MediaType.Video },
+            MediaTypes = new[] { MediaType.Video, MediaType.Audio },
             HasPath = true,
+            EnforceExtraType = false,
         };
         return libraryManager.GetItemList(query, cancellationToken)
             .Where(item => !string.IsNullOrWhiteSpace(item.Path) &&
@@ -848,14 +1151,42 @@ public sealed class ExtractionCoordinator
             .ToArray();
     }
 
-    private bool IsMissing(BaseItem item)
+    private bool IsMissing(BaseItem item, MediaStreamType requiredStreamType)
     {
-        var streams = mediaSourceManager.GetMediaStreams(item);
-        return streams.All(stream => stream.Type != MediaStreamType.Video) ||
-               !item.RunTimeTicks.HasValue || item.RunTimeTicks.Value < TimeSpan.FromSeconds(1).Ticks ||
-               string.IsNullOrWhiteSpace(item.Container) ||
-               string.Equals(item.Container, "strm", StringComparison.OrdinalIgnoreCase);
+        // A hydrated required stream is already authoritative for the same completeness
+        // rule used after a repository read. Avoid making a complete item depend on a second
+        // database call that can be temporarily unavailable.
+        var hasRequiredStream = HasInternalStream(item.MediaStreams, requiredStreamType);
+        if (!hasRequiredStream)
+            hasRequiredStream = HasInternalStream(mediaSourceManager.GetMediaStreams(item), requiredStreamType);
+        return !TechnicalMediaInfo.IsComplete(item.Container, item.RunTimeTicks, hasRequiredStream);
     }
+
+    private static bool IsRecoverableItemFailure(Exception exception) =>
+        exception is not OutOfMemoryException &&
+        exception is not StackOverflowException &&
+        exception is not AccessViolationException &&
+        exception is not AppDomainUnloadedException;
+
+    private static bool HasInternalStream(
+        IEnumerable<MediaStream>? streams,
+        MediaStreamType requiredStreamType) =>
+        streams?.Any(stream => stream.Type == requiredStreamType && !stream.IsExternal) == true;
+
+    private static bool IsComplete(MediaSourceInfo source, MediaStreamType requiredStreamType) =>
+        TechnicalMediaInfo.IsComplete(
+            source.Container,
+            source.RunTimeTicks,
+            HasInternalStream(source.MediaStreams, requiredStreamType));
+
+    private static MediaStreamType GetRequiredStreamType(BaseItem item, Uri sourceUri) =>
+        string.Equals(item.MediaType, MediaType.Audio, StringComparison.OrdinalIgnoreCase) || IsAudioSource(sourceUri)
+            ? MediaStreamType.Audio
+            : MediaStreamType.Video;
+
+    private static bool IsAudioSource(Uri sourceUri) =>
+        MimeTypes.GetMimeType(sourceUri.AbsolutePath)
+            .StartsWith("audio/", StringComparison.OrdinalIgnoreCase);
 
     private bool IsCurrentlyAllowed(BaseItem item, bool requirePlayback) =>
         IsAllowed(item, optionsProvider().Snapshot(), requirePlayback);
@@ -1057,6 +1388,27 @@ public sealed class ExtractionCoordinator
             TaskScheduler.Default);
     }
 
+    private static async Task AwaitWithCancellation(Task task, CancellationToken cancellationToken)
+    {
+        if (task.IsCompleted)
+        {
+            await task.ConfigureAwait(false);
+            return;
+        }
+
+        var cancellation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (cancellationToken.Register(() => cancellation.TrySetResult(true)))
+        {
+            if (task != await Task.WhenAny(task, cancellation.Task).ConfigureAwait(false))
+            {
+                ObserveFault(task);
+                cancellationToken.ThrowIfCancellationRequested();
+                throw new OperationCanceledException(cancellationToken);
+            }
+        }
+        await task.ConfigureAwait(false);
+    }
+
     public void CancelAndDrain()
     {
         CancelActive();
@@ -1121,18 +1473,33 @@ public sealed class ExtractionCoordinator
 
         public ProbeFlightCache(int capacity) => this.capacity = capacity;
 
-        public bool TryGetOrAdd(
+        public Lazy<Task<ProbeResult>>? TryGetOrAdd(
             string key,
             Func<Lazy<Task<ProbeResult>>> factory,
-            out Lazy<Task<ProbeResult>> flight)
+            Func<bool> allowCreate,
+            out bool retained)
         {
             lock (sync)
             {
-                if (flights.TryGetValue(key, out flight!)) return true;
-                flight = factory();
-                if (flights.Count >= capacity) return false;
+                if (flights.TryGetValue(key, out var existing))
+                {
+                    retained = true;
+                    return existing;
+                }
+                if (!allowCreate())
+                {
+                    retained = false;
+                    return null;
+                }
+                var flight = factory();
+                if (flights.Count >= capacity)
+                {
+                    retained = false;
+                    return flight;
+                }
                 flights.Add(key, flight);
-                return true;
+                retained = true;
+                return flight;
             }
         }
 
@@ -1153,11 +1520,113 @@ public sealed class ExtractionCoordinator
         public MediaSourceInfo MediaSource { get; }
     }
 
-    private sealed class RedirectDiscoveryBudget
+    private sealed class ProbeInputNotOpenedException : Exception
     {
-        private int acquired;
+        public ProbeInputNotOpenedException(bool circuitOpened) => CircuitOpened = circuitOpened;
 
-        public bool TryAcquire() => Interlocked.CompareExchange(ref acquired, 1, 0) == 0;
+        public ProbeInputNotOpenedException(bool circuitOpened, Exception innerException)
+            : base("The media probe did not open its loopback input.", innerException) =>
+            CircuitOpened = circuitOpened;
+
+        public bool CircuitOpened { get; }
+    }
+
+    private sealed class ProbeLocalFailureException : Exception
+    {
+        public ProbeLocalFailureException()
+            : this(false) { }
+
+        public ProbeLocalFailureException(Exception innerException)
+            : this(false, innerException) { }
+
+        public ProbeLocalFailureException(bool circuitOpened)
+            : base("The local media-probe path failed.") => CircuitOpened = circuitOpened;
+
+        public ProbeLocalFailureException(bool circuitOpened, Exception innerException)
+            : base("The local media-probe path failed.", innerException) => CircuitOpened = circuitOpened;
+
+        public bool CircuitOpened { get; }
+    }
+
+}
+
+internal sealed class ProbeRunCircuit
+{
+    private const int ConsecutiveFailureThreshold = 3;
+    private readonly object sync = new();
+    private readonly Action? beforeCircuitOpen;
+    private int consecutiveInputNotOpened;
+    private int consecutiveFallbackLocalFailures;
+    private bool open;
+    private bool fallbackLocalFailureOpen;
+    private bool preferFallbackProbe;
+
+    public ProbeRunCircuit(Action? beforeCircuitOpen = null) =>
+        this.beforeCircuitOpen = beforeCircuitOpen;
+
+    public bool IsOpen
+    {
+        get { lock (sync) return open || fallbackLocalFailureOpen; }
+    }
+
+    public bool PreferFallbackProbe
+    {
+        get { lock (sync) return preferFallbackProbe; }
+    }
+
+    /// <returns><see langword="true"/> only for the first activation in this run.</returns>
+    public bool PreferFallback()
+    {
+        lock (sync)
+        {
+            if (preferFallbackProbe) return false;
+            preferFallbackProbe = true;
+            return true;
+        }
+    }
+
+    public bool RecordInputNotOpened()
+    {
+        lock (sync)
+        {
+            if (open) return true;
+            consecutiveInputNotOpened++;
+            if (consecutiveInputNotOpened < ConsecutiveFailureThreshold) return false;
+            beforeCircuitOpen?.Invoke();
+            open = true;
+            return true;
+        }
+    }
+
+    public void RecordInputOpened()
+    {
+        lock (sync)
+        {
+            consecutiveInputNotOpened = 0;
+            open = false;
+        }
+    }
+
+    public bool RecordFallbackLocalFailure()
+    {
+        lock (sync)
+        {
+            if (fallbackLocalFailureOpen) return true;
+            consecutiveFallbackLocalFailures++;
+            if (consecutiveFallbackLocalFailures < ConsecutiveFailureThreshold) return false;
+            beforeCircuitOpen?.Invoke();
+            fallbackLocalFailureOpen = true;
+            return true;
+        }
+    }
+
+    public void RecordFallbackSuccess()
+    {
+        lock (sync)
+        {
+            consecutiveFallbackLocalFailures = 0;
+            fallbackLocalFailureOpen = false;
+        }
     }
 }
 

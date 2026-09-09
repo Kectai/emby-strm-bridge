@@ -4,28 +4,33 @@
   <resheader name="version"><value>2.0</value></resheader>
   <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
   <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
-  <data name="PluginDescription" xml:space="preserve"><value>提取 STRM 媒体信息，并通过当前 Emby 服务器路由播放。</value></data>
+  <data name="PluginDescription" xml:space="preserve"><value>提取音频和视频 STRM 项目的技术媒体信息，并通过当前 Emby 服务器路由视频播放。</value></data>
   <data name="EditorTitle" xml:space="preserve"><value>STRM 桥接</value></data>
-  <data name="EditorDescription" xml:space="preserve"><value>提取技术媒体信息，并通过进程内网关路由已选 STRM 媒体库的播放请求。</value></data>
+  <data name="EditorDescription" xml:space="preserve"><value>提取所选音频和视频 STRM 项目的技术媒体信息；进程内播放网关只接管视频 STRM。</value></data>
   <data name="Enabled" xml:space="preserve"><value>启用插件</value></data>
   <data name="PlaybackMode" xml:space="preserve"><value>播放路由模式</value></data>
-  <data name="PlaybackModeDescription" xml:space="preserve"><value>仅对参与处理媒体库中的 STRM 生效。Adaptive（推荐）：自动选择直连或中继。普通文件直放时，播放器直接访问经校验的源地址，媒体数据不经过 Emby；地址复验异常时，该播放上下文会短期改用 Emby 中继。转码和 HLS 由 Emby 中继，远程 TS/M2TS 在服务端处理时支持快速定位。RedirectOnly：始终返回可用且经校验的源地址，由请求方直接访问。RelayOnly：始终由 Emby 中继媒体数据，适合播放器无法直接访问源地址的场景。Native：完全使用 Emby 原生播放流程。</value></data>
+  <data name="PlaybackModeDescription" xml:space="preserve"><value>仅对参与处理媒体库中的视频 STRM 项目生效。Adaptive（推荐）：普通文件直放由播放器访问经校验的源地址；服务端转码或转封装使用作业专属回环地址，并尽快交接最终来源；HLS 清单由插件改写，不能安全直连的资源由 Emby 中继；远程 TS/M2TS 服务端处理支持有证据的快速定位。RedirectOnly：请求方直接访问经校验的最终来源，不使用 HLS 清单中继改写。RelayOnly：全部媒体数据由 Emby 中继。Native：完全使用 Emby 原生播放流程。</value></data>
+  <data name="EnableFastSeek" xml:space="preserve"><value>启用有证据的快速定位</value></data>
+  <data name="EnableFastSeekDescription" xml:space="preserve"><value>默认开启。关闭后仍保留正常网关路由、直达、中继和 HLS 行为，只禁用远程 TS/M2TS 服务端处理的有证据快速定位。该开关用于按能力隔离定位问题；路由不会依据客户端名称。</value></data>
   <data name="ExtractAfterLibraryScan" xml:space="preserve"><value>媒体库扫描后提取</value></data>
   <data name="OnlyMissingMediaInfo" xml:space="preserve"><value>仅提取缺失的媒体信息</value></data>
-  <data name="OnlyMissingMediaInfoDescription" xml:space="preserve"><value>启用时跳过未变化且完整的技术信息，并可用匹配快照恢复缺失数据。关闭时重新探测所有已选 STRM，并覆盖原快照。</value></data>
-  <data name="EnablePersistence" xml:space="preserve"><value>持久化媒体信息</value></data>
+  <data name="OnlyMissingMediaInfoDescription" xml:space="preserve"><value>启用时，音频来源已有内部音频流、视频来源已有内部视频流，并且时长与容器有效时跳过。关闭此选项或显式强制可重新探测。</value></data>
+  <data name="EnablePersistence" xml:space="preserve"><value>保存恢复快照</value></data>
+  <data name="EnablePersistenceDescription" xml:space="preserve"><value>仅控制插件自己的恢复快照。关闭后不再保存新的恢复快照；成功探测得到的技术字段仍会写入 Emby。</value></data>
   <data name="MaximumExtractionConcurrency" xml:space="preserve"><value>最大提取并发数</value></data>
   <data name="ExtractionTimeoutSeconds" xml:space="preserve"><value>单项超时（秒）</value></data>
   <data name="GatewayTimeoutSeconds" xml:space="preserve"><value>网关上游超时（秒）</value></data>
+  <data name="DirectRedirectCacheSeconds" xml:space="preserve"><value>直达重定向缓存时间（秒）</value></data>
+  <data name="DirectRedirectCacheSecondsDescription" xml:space="preserve"><value>默认 20 秒。设为 0 时，每次请求都会向来源获取新的 Location。设为 1–60 时，只在当前播放票据范围内复用经校验的重定向目标；插件不会请求该目标的媒体数据，并向客户端声明相同期限的私有缓存。一次性签名地址请设为 0。</value></data>
   <data name="RedirectHopLimit" xml:space="preserve"><value>最大重定向跳数</value></data>
   <data name="RelayConcurrency" xml:space="preserve"><value>最大中继并发数</value></data>
   <data name="IncludedLibraryIds" xml:space="preserve"><value>参与处理的媒体库</value></data>
-  <data name="IncludedLibraryIdsDescription" xml:space="preserve"><value>可多选一个或多个 Emby 媒体库；留空表示不处理任何媒体库。</value></data>
+  <data name="IncludedLibraryIdsDescription" xml:space="preserve"><value>可多选一个或多个包含 STRM 项目的 Emby 媒体库。提取支持音频和视频，播放路由只接管视频；留空表示不处理任何媒体库。</value></data>
   <data name="DetectedRedirectHosts" xml:space="preserve"><value>检测到的重定向主机</value></data>
-  <data name="DetectedRedirectHostsDescription" xml:space="preserve"><value>提示：仅选择你信任的待确认主机并保存；已信任的检测结果会继续显示并标记，新增信任保存后会自动重试等待处理的媒体。也可在下方手动输入精确主机、IP 范围，或使用 *.example.com 显式信任其全部子域名。检测记录仅保存主机名，不会保留完整 URL、路径或查询参数。</value></data>
+  <data name="DetectedRedirectHostsDescription" xml:space="preserve"><value>仅选择你信任的待确认主机并保存。检测结果以规范化主机名或 IP 保存，重启后继续显示并标记当前信任状态；不保留协议、端口、路径、查询、片段或凭据。新增信任保存后会自动重试等待处理的媒体。也可在下方输入精确主机、IP 范围或 *.example.com 子域规则。</value></data>
   <data name="TrustedHostSuffix" xml:space="preserve"><value>（已信任）</value></data>
   <data name="AllowedRedirectHosts" xml:space="preserve"><value>信任的上游主机</value></data>
-  <data name="AllowedRedirectHostsDescription" xml:space="preserve"><value>可填写精确主机名、IP、CIDR，或 *.example.com 子域规则。已选 STRM 来源的同主机跳转自动获得信任；每个跨主机重定向均在连接前检查。</value></data>
+  <data name="AllowedRedirectHostsDescription" xml:space="preserve"><value>可填写精确主机名、IP、CIDR，或 *.example.com 子域规则。同主机跳转自动信任，跨主机跳转在连接前检查。直连域名解析到私网或特殊用途地址时，还需显式信任对应 IP/CIDR；走系统代理时由代理解析目标域名。被拒绝的地址会出现在检测列表中，直接填写的 IP 来源仍受支持。</value></data>
   <data name="AwaitingApprovalNotificationTitle" xml:space="preserve"><value>STRM Bridge 等待确认</value></data>
   <data name="AwaitingApprovalNotificationDescription" xml:space="preserve"><value>检测到 {0} 个尚未信任的重定向主机，部分媒体正在等待处理。请打开 STRM Bridge 设置进行确认。</value></data>
   <data name="RetryCompletedNotificationTitle" xml:space="preserve"><value>STRM Bridge 自动重试完成</value></data>
@@ -33,13 +38,14 @@
   <data name="ConcurrencyValidation" xml:space="preserve"><value>并发数必须为 1 或 2。</value></data>
   <data name="TimeoutValidation" xml:space="preserve"><value>提取和网关超时必须位于界面显示的范围内。</value></data>
   <data name="GatewayValidation" xml:space="preserve"><value>重定向跳数和中继并发数需要位于界面显示的范围内。</value></data>
+  <data name="DirectRedirectCacheValidation" xml:space="preserve"><value>直达重定向缓存时间必须为 0 至 60 秒。</value></data>
   <data name="LibraryValidation" xml:space="preserve"><value>每个媒体库 ID 都必须是 GUID。</value></data>
   <data name="RedirectHostValidation" xml:space="preserve"><value>每一项必须是精确 DNS 主机名、IP 地址、CIDR 范围，或 *.example.com 形式的显式子域规则；不允许协议、路径、端口及其他通配形式。</value></data>
   <data name="RedirectHostCapacityValidation" xml:space="preserve"><value>最多只能配置 256 条重定向主机规则。</value></data>
   <data name="ScheduledTaskName" xml:space="preserve"><value>提取缺失的 STRM 媒体信息</value></data>
-  <data name="ScheduledTaskDescription" xml:space="preserve"><value>安全探测受支持本地 STRM 文件缺失的技术媒体信息。</value></data>
-  <data name="ClearStoredMediaInfoTaskName" xml:space="preserve"><value>清理 STRM Bridge 存量媒体信息</value></data>
-  <data name="ClearStoredMediaInfoTaskDescription" xml:space="preserve"><value>手动清理 STRM Bridge 快照、提取状态及已选媒体库中的内部技术媒体信息；保留外置流和媒体文件。</value></data>
+  <data name="ScheduledTaskDescription" xml:space="preserve"><value>安全探测受支持本地音频和视频 STRM 文件缺失的技术媒体信息。</value></data>
+  <data name="ClearStoredMediaInfoTaskName" xml:space="preserve"><value>清理 STRM Bridge 媒体信息</value></data>
+  <data name="ClearStoredMediaInfoTaskDescription" xml:space="preserve"><value>手动清理 STRM Bridge 快照、提取状态及已选媒体库中 STRM 项目的内部技术媒体信息；保留外置流和媒体文件。</value></data>
   <data name="ScheduledTaskCategory" xml:space="preserve"><value>媒体库</value></data>
   <data name="TaskInitializationError" xml:space="preserve"><value>STRM Bridge 尚未完成初始化。</value></data>
   <data name="InvalidItemIdError" xml:space="preserve"><value>媒体项目 ID 必须是 GUID。</value></data>

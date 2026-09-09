@@ -55,6 +55,25 @@ public sealed class PersistenceSecurityTests
     }
 
     [TestMethod]
+    public void ExtractionState_IncreasesRepeatedFailureBackoffToOneDay()
+    {
+        using var workspace = new TestWorkspace();
+        var store = new ExtractionStateStore(Path.Combine(workspace.Path, "state", "extraction-state.json"));
+        var key = new string('a', 64);
+        var fingerprint = new string('b', 64);
+        var attempt = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var expectedDelays = new[] { 30, 120, 480, 1920, 7680, 30720, 86400, 86400 };
+
+        foreach (var delaySeconds in expectedDelays)
+        {
+            store.RecordFailure(key, fingerprint, attempt);
+            Assert.IsFalse(store.ShouldAttempt(key, fingerprint, attempt.AddSeconds(delaySeconds - 1)));
+            Assert.IsTrue(store.ShouldAttempt(key, fingerprint, attempt.AddSeconds(delaySeconds)));
+            attempt = attempt.AddSeconds(delaySeconds);
+        }
+    }
+
+    [TestMethod]
     public void ExtractionState_ClearFailuresRemovesBackoffAndPreservesSuccess()
     {
         using var workspace = new TestWorkspace();
@@ -74,6 +93,27 @@ public sealed class PersistenceSecurityTests
         var reloaded = new ExtractionStateStore(path);
         Assert.IsTrue(reloaded.ShouldAttempt(key, failure, now));
         Assert.AreEqual(success, reloaded.GetLastSuccessfulFingerprint(key));
+    }
+
+    [TestMethod]
+    public void ExtractionState_OldVideoOnlySchemaDoesNotKeepAudioFailuresBackedOff()
+    {
+        using var workspace = new TestWorkspace();
+        var path = Path.Combine(workspace.Path, "state", "extraction-state.json");
+        var key = new string('a', 64);
+        var fingerprint = new string('b', 64);
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var store = new ExtractionStateStore(path);
+        store.RecordFailure(key, fingerprint, now);
+        store.Flush();
+        var oldSchema = File.ReadAllText(path, Encoding.UTF8)
+            .Replace("\"SchemaVersion\":3", "\"SchemaVersion\":2", StringComparison.Ordinal);
+        File.WriteAllText(path, oldSchema, Encoding.UTF8);
+
+        var reloaded = new ExtractionStateStore(path);
+
+        Assert.IsTrue(reloaded.ShouldAttempt(key, fingerprint, now));
+        Assert.IsNull(reloaded.GetLastSuccessfulFingerprint(key));
     }
 
     [TestMethod]
@@ -142,6 +182,33 @@ public sealed class PersistenceSecurityTests
     }
 
     [TestMethod]
+    public void ExtractionState_RejectsExtremeFailureStateAndRecoversValidBackup()
+    {
+        using var workspace = new TestWorkspace();
+        var path = Path.Combine(workspace.Path, "state", "extraction-state.json");
+        var key = new string('a', 64);
+        var fingerprint = new string('b', 64);
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var store = new ExtractionStateStore(path);
+        store.RecordSuccess(key, fingerprint);
+        store.Flush();
+        store.RecordFailure(key, fingerprint, now);
+        store.Flush();
+        var invalid = File.ReadAllText(path, Encoding.UTF8);
+        invalid = ReplaceJsonNumber(invalid, "\"ConsecutiveFailures\":", int.MaxValue.ToString());
+        invalid = ReplaceJsonNumber(invalid, "\"RetryAtUtcTicks\":", long.MaxValue.ToString());
+        File.WriteAllText(path, invalid, Encoding.UTF8);
+
+        var recovered = new ExtractionStateStore(path);
+
+        Assert.AreEqual(fingerprint, recovered.GetLastSuccessfulFingerprint(key));
+        Assert.IsTrue(recovered.ShouldAttempt(key, fingerprint, now),
+            "The invalid primary must not install a practically permanent retry delay.");
+        recovered.RecordFailure(key, fingerprint, now);
+        Assert.IsFalse(recovered.ShouldAttempt(key, fingerprint, now));
+    }
+
+    [TestMethod]
     public void SnapshotStore_RemovesOrphanBackupWithoutPrimary()
     {
         using var workspace = new TestWorkspace();
@@ -167,8 +234,82 @@ public sealed class PersistenceSecurityTests
         Assert.IsFalse(store.TryRecordBaseline(secondKey, new string('d', 64)));
         store.RecordSuccess(secondKey, new string('d', 64));
 
-        Assert.IsNull(store.GetLastSuccessfulFingerprint(firstKey));
-        Assert.IsFalse(store.TryRecordBaseline(firstKey, new string('e', 64)));
+        Assert.AreEqual(new string('c', 64), store.GetLastSuccessfulFingerprint(firstKey));
+        Assert.IsNull(store.GetLastSuccessfulFingerprint(secondKey));
+        Assert.IsFalse(store.TryRecordBaseline(secondKey, new string('e', 64)));
+    }
+
+    [TestMethod]
+    public void ExtractionState_FullCapacityDoesNotEvictActiveFailureForNewSource()
+    {
+        using var workspace = new TestWorkspace();
+        var path = Path.Combine(workspace.Path, "state", "extraction-state.json");
+        var store = new ExtractionStateStore(path, maximumEntries: 1);
+        var firstKey = new string('a', 64);
+        var secondKey = new string('b', 64);
+        var firstFingerprint = new string('c', 64);
+        var secondFingerprint = new string('d', 64);
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        store.RecordFailure(firstKey, firstFingerprint, now);
+
+        store.RecordFailure(secondKey, secondFingerprint, now);
+
+        Assert.IsFalse(store.ShouldAttempt(firstKey, firstFingerprint, now),
+            "A new failure must not rotate out an existing active retry delay.");
+        Assert.IsTrue(store.ShouldAttempt(secondKey, secondFingerprint, now),
+            "An untracked overflow source remains eligible rather than being reported as persisted.");
+    }
+
+    [TestMethod]
+    public void ExtractionState_RemoveMissingClearsCapacityFlagAndAdmitsActiveOverflowBaseline()
+    {
+        using var workspace = new TestWorkspace();
+        var path = Path.Combine(workspace.Path, "state", "extraction-state.json");
+        var store = new ExtractionStateStore(path, maximumEntries: 2);
+        var firstKey = new string('a', 64);
+        var removedKey = new string('b', 64);
+        var overflowKey = new string('c', 64);
+        var firstFingerprint = new string('d', 64);
+        var removedFingerprint = new string('e', 64);
+        var overflowFingerprint = new string('f', 64);
+        Assert.IsTrue(store.TryRecordBaseline(firstKey, firstFingerprint));
+        Assert.IsTrue(store.TryRecordBaseline(removedKey, removedFingerprint));
+        Assert.IsFalse(store.TryRecordBaseline(overflowKey, overflowFingerprint));
+
+        store.RemoveMissing(new HashSet<string>(StringComparer.Ordinal) { firstKey, overflowKey });
+
+        Assert.IsNull(store.GetLastSuccessfulFingerprint(removedKey));
+        Assert.IsTrue(store.TryRecordBaseline(overflowKey, overflowFingerprint),
+            "Removing an orphan must reopen the physical slot even when an active key was previously untracked.");
+        Assert.AreEqual(overflowFingerprint, store.GetLastSuccessfulFingerprint(overflowKey));
+    }
+
+    [TestMethod]
+    public void ExtractionState_FailureCapacityEvictsSuccessBeforeEarlierExpiredFailure()
+    {
+        using var workspace = new TestWorkspace();
+        var path = Path.Combine(workspace.Path, "state", "extraction-state.json");
+        var store = new ExtractionStateStore(path, maximumEntries: 2);
+        var expiredKey = new string('a', 64);
+        var successKey = new string('b', 64);
+        var newFailureKey = new string('c', 64);
+        var expiredFingerprint = new string('d', 64);
+        var successFingerprint = new string('e', 64);
+        var newFailureFingerprint = new string('f', 64);
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        store.RecordSuccess(expiredKey, expiredFingerprint);
+        store.RecordFailure(expiredKey, expiredFingerprint, now);
+        Assert.IsTrue(store.TryRecordBaseline(successKey, successFingerprint));
+
+        store.RecordFailure(newFailureKey, newFailureFingerprint, now.AddSeconds(31));
+
+        Assert.AreEqual(expiredFingerprint, store.GetLastSuccessfulFingerprint(expiredKey),
+            "An expired failure still carries more retry history than a success-only baseline.");
+        Assert.IsNull(store.GetLastSuccessfulFingerprint(successKey));
+        Assert.IsFalse(store.ShouldAttempt(
+            newFailureKey,
+            newFailureFingerprint,
+            now.AddSeconds(31)));
     }
 
     [TestMethod]
@@ -215,5 +356,16 @@ public sealed class PersistenceSecurityTests
         var recovered = new ExtractionStateStore(path, maximumEntries: 1);
 
         Assert.AreEqual(fingerprint, recovered.GetLastSuccessfulFingerprint(key));
+    }
+
+    private static string ReplaceJsonNumber(string json, string marker, string replacement)
+    {
+        var start = json.IndexOf(marker, StringComparison.Ordinal);
+        Assert.IsTrue(start >= 0);
+        start += marker.Length;
+        var end = start;
+        while (end < json.Length && (json[end] == '-' || char.IsDigit(json[end]))) end++;
+        Assert.IsTrue(end > start);
+        return json.Substring(0, start) + replacement + json.Substring(end);
     }
 }

@@ -1,7 +1,6 @@
 using System;
 using System.Net.Http;
 using Emby.StrmBridge.Configuration;
-using Emby.StrmBridge.Domain;
 
 namespace Emby.StrmBridge.Playback;
 
@@ -50,34 +49,33 @@ public static class SourceBehaviorClassifier
             if (value[offset + index] != HlsSignature[index]) return false;
         return true;
     }
+
+    public static bool IsKnownFileContainer(string? container)
+    {
+        var value = container?.Trim().ToLowerInvariant();
+        return value is "3g2" or "3gp" or "asf" or "avi" or "divx" or "flv" or
+            "m2ts" or "m4v" or "matroska" or "mkv" or "mov" or "mp4" or
+            "mpeg" or "mpegts" or "mpegtsraw" or "mpg" or "mts" or "ogv" or
+            "rm" or "rmvb" or "ts" or "vob" or "webm" or "wmv";
+    }
 }
 
 public static class TransportPlanner
 {
     public static bool CanHandoffRedirect(int statusCode) => statusCode is 200 or 206;
 
-    public static bool RequiresAdaptiveRelay(int statusCode, bool retriedRejectedRedirect)
-    {
-        if (retriedRejectedRedirect) return true;
-        return statusCode is 401 or 403 or 404 or 410 or 429 || statusCode >= 500;
-    }
-
-    public static bool ShouldUseAdaptiveRelay(
-        bool rememberedRelay,
-        int statusCode,
-        bool retriedRejectedRedirect) =>
-        rememberedRelay || RequiresAdaptiveRelay(statusCode, retriedRejectedRedirect);
+    public static bool RequiresAdaptiveRelay(int authoritativeStatusCode) =>
+        authoritativeStatusCode is 401 or 403 or 404 or 408 or 410 or 429 ||
+        authoritativeStatusCode >= 500;
 
     public static GatewayTransportPlan Create(
         PlaybackRoutingMode mode,
         SourceTransportBehavior behavior,
-        PlaybackTicketPurpose purpose,
-        bool unstableRedirect = false)
+        bool relayCurrentResponse = false)
     {
         if (mode == PlaybackRoutingMode.RedirectOnly) return GatewayTransportPlan.Redirect;
         if (behavior == SourceTransportBehavior.HlsManifest) return GatewayTransportPlan.RelayHls;
-        if (mode == PlaybackRoutingMode.Adaptive && purpose == PlaybackTicketPurpose.DirectClient &&
-            !unstableRedirect)
+        if (mode == PlaybackRoutingMode.Adaptive && !relayCurrentResponse)
             return GatewayTransportPlan.Redirect;
         return GatewayTransportPlan.RelayFile;
     }

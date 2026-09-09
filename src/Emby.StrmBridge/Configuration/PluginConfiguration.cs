@@ -26,7 +26,7 @@ public enum PlaybackRoutingMode
 
 public sealed class PluginConfiguration : EditableOptionsBase
 {
-    internal const int CurrentConfigurationVersion = 2;
+    internal const int CurrentConfigurationVersion = 3;
     internal const int MaximumAllowedRedirectHosts = 256;
     internal const int MaximumAllowedRedirectHostTextLength = 64 * 1024;
 
@@ -65,6 +65,10 @@ public sealed class PluginConfiguration : EditableOptionsBase
     [DescriptionL(nameof(PluginStrings.PlaybackModeDescription), typeof(PluginStrings))]
     public PlaybackRoutingMode PlaybackMode { get; set; } = PlaybackRoutingMode.Adaptive;
 
+    [DisplayNameL(nameof(PluginStrings.EnableFastSeek), typeof(PluginStrings))]
+    [DescriptionL(nameof(PluginStrings.EnableFastSeekDescription), typeof(PluginStrings))]
+    public bool EnableFastSeek { get; set; } = true;
+
     [Browsable(false)]
     public int ConfigurationVersion { get; set; } = CurrentConfigurationVersion;
 
@@ -76,6 +80,7 @@ public sealed class PluginConfiguration : EditableOptionsBase
     public bool OnlyMissingMediaInfo { get; set; } = true;
 
     [DisplayNameL(nameof(PluginStrings.EnablePersistence), typeof(PluginStrings))]
+    [DescriptionL(nameof(PluginStrings.EnablePersistenceDescription), typeof(PluginStrings))]
     public bool EnablePersistence { get; set; } = true;
 
     [DisplayNameL(nameof(PluginStrings.MaximumExtractionConcurrency), typeof(PluginStrings))]
@@ -92,6 +97,12 @@ public sealed class PluginConfiguration : EditableOptionsBase
     [MinValue(10)]
     [MaxValue(180)]
     public int GatewayTimeoutSeconds { get; set; } = 120;
+
+    [DisplayNameL(nameof(PluginStrings.DirectRedirectCacheSeconds), typeof(PluginStrings))]
+    [DescriptionL(nameof(PluginStrings.DirectRedirectCacheSecondsDescription), typeof(PluginStrings))]
+    [MinValue(0)]
+    [MaxValue(60)]
+    public int DirectRedirectCacheSeconds { get; set; } = 20;
 
     [DisplayNameL(nameof(PluginStrings.RedirectHopLimit), typeof(PluginStrings))]
     [MinValue(1)]
@@ -155,6 +166,7 @@ public sealed class PluginConfiguration : EditableOptionsBase
         var maximumExtractionConcurrency = NormalizeRange(MaximumExtractionConcurrency, 1, 2, 1);
         var extractionTimeoutSeconds = NormalizeRange(ExtractionTimeoutSeconds, 30, 180, 120);
         var gatewayTimeoutSeconds = NormalizeRange(GatewayTimeoutSeconds, 10, 180, 120);
+        var directRedirectCacheSeconds = NormalizeRange(DirectRedirectCacheSeconds, 0, 60, 20);
         var redirectHopLimit = NormalizeRange(RedirectHopLimit, 1, 8, 5);
         var relayConcurrency = NormalizeRange(RelayConcurrency, 1, 16, 4);
         if (MaximumExtractionConcurrency != maximumExtractionConcurrency)
@@ -170,6 +182,11 @@ public sealed class PluginConfiguration : EditableOptionsBase
         if (GatewayTimeoutSeconds != gatewayTimeoutSeconds)
         {
             GatewayTimeoutSeconds = gatewayTimeoutSeconds;
+            changed = true;
+        }
+        if (DirectRedirectCacheSeconds != directRedirectCacheSeconds)
+        {
+            DirectRedirectCacheSeconds = directRedirectCacheSeconds;
             changed = true;
         }
         if (RedirectHopLimit != redirectHopLimit)
@@ -256,6 +273,10 @@ public sealed class PluginConfiguration : EditableOptionsBase
             context.AddValidationError(nameof(MaximumExtractionConcurrency), PluginStrings.ConcurrencyValidation);
         if (ExtractionTimeoutSeconds is < 30 or > 180 || GatewayTimeoutSeconds is < 10 or > 180)
             context.AddValidationError(nameof(ExtractionTimeoutSeconds), PluginStrings.TimeoutValidation);
+        if (DirectRedirectCacheSeconds is < 0 or > 60)
+            context.AddValidationError(
+                nameof(DirectRedirectCacheSeconds),
+                PluginStrings.DirectRedirectCacheValidation);
         if (RedirectHopLimit is < 1 or > 8 || RelayConcurrency is < 1 or > 16)
             context.AddValidationError(nameof(RedirectHopLimit), PluginStrings.GatewayValidation);
         if ((IncludedLibraryIds ?? Array.Empty<string>()).Any(value => !Guid.TryParse(value, out _)))
@@ -282,6 +303,7 @@ public sealed class PluginConfiguration : EditableOptionsBase
         {
             Enabled = Enabled,
             PlaybackMode = PlaybackMode,
+            EnableFastSeek = EnableFastSeek,
             ConfigurationVersion = ConfigurationVersion,
             ExtractAfterLibraryScan = ExtractAfterLibraryScan,
             OnlyMissingMediaInfo = OnlyMissingMediaInfo,
@@ -289,6 +311,7 @@ public sealed class PluginConfiguration : EditableOptionsBase
             MaximumExtractionConcurrency = MaximumExtractionConcurrency,
             ExtractionTimeoutSeconds = ExtractionTimeoutSeconds,
             GatewayTimeoutSeconds = GatewayTimeoutSeconds,
+            DirectRedirectCacheSeconds = DirectRedirectCacheSeconds,
             RedirectHopLimit = RedirectHopLimit,
             RelayConcurrency = RelayConcurrency,
             IncludedLibraryIds = (IncludedLibraryIds ?? Array.Empty<string>()).ToArray(),

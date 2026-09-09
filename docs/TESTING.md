@@ -1,90 +1,72 @@
-# Testing
+# Testing and release acceptance
 
-## Automated verification
+## Maintained checks
+
+Use the .NET SDK pinned by `global.json`, plus Git, ripgrep and zip/unzip. From the repository root:
 
 ```sh
 ./scripts/verify.sh
 ```
 
-All mutable test state uses repository-local paths:
+This restores and builds Release, verifies formatting, runs the maintained test suite, checks privacy rules and checks whitespace errors. Mutable build state and test results stay in `.local/`.
 
-- `.local/dotnet-home`
-- `.local/nuget/packages`
-- `.local/nuget/http-cache`
-- `.local/build`
-- `.local/test-work`
-- `.local/test-results`
-
-Coverage includes:
-
-- strict STRM input and HMAC source identities
-- media-information extraction, replacement, recovery and clearing
-- configuration normalization, media-library selection, exact hosts, CIDR and subdomain rules
-- PlaybackInfo result processing independent of host patch attachment
-- standard static-video routing for exact STRM media-source matches
-- per-job FFmpeg input routing for exact STRM media-source matches
-- 188-, 192- and 204-byte transport framing, PCR selection and wrap handling
-- adaptive two/three-sample initial calibration, one/two-sample target correction, native and indexed transcode timelines, plan expiry, exact job binding and atomic FFmpeg command mutation
-- compatible cross-session plan sharing, independent waiter cancellation and playback-slot reservation from probes
-- native fallback for dynamic, non-STRM, unmatched and out-of-scope video requests
-- media-source count, order, ID and metadata preservation
-- server-relative route construction with Emby path prefixes
-- random ticket scope, direct-client/server-FFmpeg purpose, user binding, capability access, lifetime and capacity
-- multi-hop relative redirects
-- client User-Agent and Range forwarding
-- redirect-lease reuse across Range requests, expiry, clearing and invalid-target fallback
-- user/device direct-play isolation with per-ticket fallback, generation-safe first-resolution serialization, two-step Range confirmation, 4,096-entry bounds, fast handoff expiry and Adaptive relay fallback
-- final-response lease eligibility, transient-error fallback and request-specific 416 handling
-- one bounded source re-resolution for a rejected fresh redirect target, with no retry for direct sources
-- Adaptive client redirect, server-FFmpeg/HLS relay, RelayOnly transport and relay concurrency
-- HLS signature detection, replayable prefix handling, line and URI-attribute rewriting
-- host detection, administrator notification and automatic retry
-- privacy-safe logging and persistence
-- native Generic UI localization metadata and embedded-resource completeness
-- repeated Simplified Chinese, English and Traditional Chinese editor generation despite `PropertyDescriptor` description caching
-- concurrent request-local editor generation in different UI cultures
-- selectable descriptions, unchanged form values and stable routing-mode identifiers
-- embedded dependency identity verification, allowlisted package contents and DLL byte verification
-
-## Package verification
+To validate and create the release archive in one step:
 
 ```sh
 ./scripts/package.sh
 ```
 
-Packaging verifies:
+Packaging runs the same verification first, then checks the archive contents and produces a SHA-256 file in `artifacts/`. There is no need to run both commands consecutively for the same unchanged tree. The archive contains the single plugin DLL, public documentation and required licenses; local diagnostic evidence and build caches are excluded.
 
-- complete Release build
-- one self-contained `Emby.StrmBridge.dll` with the expected embedded Harmony identity
-- exact archive entry allowlist
-- ZIP integrity
-- current package timestamps and absent extra fields
-- byte identity between built and archived DLLs
-- release-document vendor-term scan
+The maintained test project is `tests/Emby.StrmBridge.Tests/Emby.StrmBridge.Tests.csproj`. Its .NET test runtime is separate from actual-host validation; passing it does not certify the host's ABI or player behavior.
 
-## Emby 4.9.5.0 host matrix
+| Area | Coverage |
+| --- | --- |
+| Scope and source policy | Library selection, exact media-source matching, regular STRM input, URI/trust rules and source changes |
+| Extraction and persistence | Audio/video completeness, mandatory fresh-input evidence, independent fallback, cancellation, external-stream preservation, schema 3 round trips and corrupted backups |
+| HTTP gateway | First-hop redirects, request-profile cache isolation, expiry, Range/validator checks, one authoritative refresh, source backoff and returned-stream cancellation |
+| HLS | Complete-manifest HTTP semantics, nested resources, live-window retirement, VOD retention, atomic rollback, quotas and large-list cleanup cost |
+| Fast positioning | Packet/clock evidence, video selection, strong representation guards, dynamic budgets, shared preparation, command mutation and native recovery |
+| Host lifecycle | Harmony runtime selection, ABI/patch ownership, repeated jobs, startup cooldown and delayed cleanup fencing |
+| Network/privacy/package | Pinned DNS, trust revocation, proxy selection, header boundaries, bounded state and archive allowlist |
 
-1. Confirm `STRM_BRIDGE_PATCH_READY` reports the installed 4.9.5.x ABI and five targets.
-2. Confirm GET and POST PlaybackInfo both retain source count, order and IDs.
-3. Confirm a matching source receives a relative `/StrmBridge/Playback/v2/` URL.
-4. Confirm Emby Web direct play reaches the gateway.
-5. Confirm an external player launched through Emby reaches the same gateway URL.
-6. Exercise a direct-body source with `200` and `206`.
-7. Exercise one-hop and multi-hop redirects.
-8. Confirm `Adaptive` returns a validated 302 for an ordinary client-direct file, relays a server-FFmpeg file, and rewrites and relays HLS. Confirm a rejected redirect reuse selects a short-lived relay decision for that direct-play context. Confirm `RelayOnly` retains server relay for a source that cannot be consumed from the client network context.
-9. Exercise `HEAD`, initial playback, repeated seek, reconnect and resume. For one M2TS direct-play context, confirm the first redirect resolves from the STRM source, the next Range validates reuse, later Range requests report `STRM_BRIDGE_GATEWAY_DIRECT_ROUTE_HIT` without a matching plugin-side CDN pre-read until the 30-second decision expires, and concurrent first requests do not produce gateway-capacity errors.
-10. Exercise HLS master playlist, media playlist, audio, subtitle, key, map and segment resources.
-11. Repeat through HTTPS and an Emby API path prefix.
-12. Request `/Videos/{id}/stream` with the exact media-source ID and `Static=true`; confirm the matching STRM reaches the gateway.
-13. Repeat with a local file, a different media-source ID and `Static=false`; confirm each remains on Emby's native path.
-14. Force an exact STRM source through HLS transcoding; confirm `STRM_BRIDGE_TRANSCODE_INPUT_ROUTED` appears before the gateway event and FFmpeg opens the loopback gateway input.
-15. Repeat transcoding with a local file, a different media-source ID and an out-of-scope library; confirm each keeps the native FFmpeg input.
-16. Resume an eligible remote TS/M2TS after ten seconds, then seek to multiple non-zero positions through both remux and full-transcode playback. Confirm the initial `STRM_BRIDGE_FAST_SEEK_READY` reports two probes for a bounded estimate or three after correction, later targets report one probe or two after the bounded retry, and `STRM_BRIDGE_FAST_SEEK_APPLIED` reports `timeline=native` or `timeline=indexed` on every eligible FFmpeg job. Confirm the formal media request reuses a compatible candidate without changing its User-Agent, no input-side `-ss` or timestamp-seek failure occurs, the output timestamp offset equals each target, the first segment closes within half a segment plus keyframe alignment, subsequent segments keep the native cadence, no tiny catch-up burst occurs, each job has one continuous media-body Range, and playback positions are correct. Repeating the same source and target in another session must reuse the compatible plan without another probe.
-17. Repeat from zero, with a non-TS source, and with an invalid PCR sample; confirm native command behavior.
-18. Switch to `Native` and confirm the original PlaybackInfo, standard-video and FFmpeg input paths remain unchanged.
-19. Stop Emby and confirm the next start reports one clean patch installation.
-20. Run concurrent different-title and same-title playbacks. Cancel one waiter during shared preparation and confirm the other completes; confirm probes do not consume the reserved playback slot.
-21. Audit plugin, Emby and reverse-proxy logs for source URLs, query signatures and tickets.
-22. Open STRM Bridge settings, switch Emby Web between English, Simplified Chinese and Traditional Chinese, and confirm the next native Generic UI request renders the matching titles, labels, descriptions and trusted-host suffixes without changing selected libraries, playback mode or other values. Confirm all descriptions can be selected and copied while the four routing-mode identifiers stay unchanged.
+Add tests for changed contracts at their integration boundary. In particular, large HLS rewrites must not scan all tickets per URI; range validation must cover first authoritative reads as well as cache hits; a fresh probe must not succeed solely because the host returned preexisting fields.
 
-Use synthetic names and credentials for fixtures and reports.
+## Evidence for 0.2.3
+
+The maintained suite has **561 passing tests**. The release has also passed Release build, formatting, privacy and packaging checks. These results describe automated coverage, not completed live acceptance.
+
+Offline checks used actual Emby `4.9.5.0` assemblies, .NET `6.0.36` and the host's bundled `5.1-emby` FFmpeg. Record the loaded DLL fingerprint alongside each offline run; distributed ZIP bytes are verified by the release checksum file.
+
+| Offline check | Recorded result |
+| --- | --- |
+| Technical snapshot round trip | HDR/Dolby Vision and rotation retained |
+| Stable representation, target 40 seconds | First frame at 40.0417 seconds; 479 continuous matching frames |
+| Representation rejection / native recovery | First frame at 40.0 seconds; 480 continuous matching frames |
+| 10,000-URI HLS ticket workload | Initial rewrite 32 ms; refresh 13 ms, versus 7,933/22,005 ms before the cleanup fix |
+
+The HLS measurement covers local ticket bookkeeping, not end-to-end media or network latency. Offline evidence must be rerun when relevant code or the DLL changes. The HLS timings are retained from the prerelease regression of the same implementation; timing values vary by machine and run.
+
+## Release readiness
+
+<a id="implementation-gaps"></a>
+<a id="release-readiness-20260906"></a>
+
+**Release channel: stable (0.2.3).** Automated and actual-host offline checks cover the release implementation. A complete live matrix across supported players and sources has not been recorded; stable-channel publication does not expand that verification coverage. Run the applicable deployment checks below with the installed release.
+
+| Live scenario | Required observation |
+| --- | --- |
+| Install, upgrade and patch coexistence | Health version/BuildId matches the package; six patches install; no competing standard-route prefix; settings and recovery data survive the intended upgrade |
+| Scope and extraction | Selected audio/video STRM extract correctly; complete items skip; force refresh reads current input; restore/clear/orphan cleanup have their documented scope; unrelated media remains native |
+| First open, reopen and repeated seeking | Web and representative third-party clients start, reopen and perform third/later seeks with correct time, frame and audio sync; long playback continues |
+| Direct and relay delivery | Identify the actual media reader and bytes through Emby; verify first-hop cache/bypass behavior and source rejection, expiry, concurrency and cancellation |
+| HLS | VOD seeking and long-running live/event refresh work through nested playlists, keys, maps and subtitles; capacity errors are retryable without disrupting another session |
+| Server-side processing | Remux/transcode preserve target time and selected streams; unsupported profiles use native positioning; representation changes and failed optimized startup recover without stale output cleanup |
+| Network and lifecycle | URL Base, loopback, direct/proxy routing, trust changes, shutdown and overlapping sessions preserve authorization, release resources and avoid stale commits |
+| Thumbnail workaround | If source-limited preview reads cause stalls, disable client seek thumbnails/live previews and retest; record the setting as an acceptance condition |
+
+Record the loaded DLL identity, host/player versions, source capabilities, mode/settings and actual result for each applicable scenario. Keep private captures and signed URLs out of public reports. Compare source reads, redirect-target reads and Emby media bytes separately; HTTP 206 or a successful startup event alone does not prove correct seeking or uninterrupted playback.
+
+## Documentation maintenance
+
+Keep user setup in [INSTALL.md](INSTALL.md), supported behavior and workarounds in [COMPATIBILITY.md](COMPATIBILITY.md), security boundaries in [SECURITY.md](SECURITY.md), and implementation contracts in [STRM_BRIDGE_DESIGN.md](STRM_BRIDGE_DESIGN.md). Update evidence when the tested binary changes. Historical review notes and raw captures are not release documentation.
