@@ -6,9 +6,11 @@
 | --- | --- |
 | Plugin framework | `netstandard2.1` |
 | Compile-time SDK | `MediaBrowser.Server.Core 4.9.1.80` |
-| Playback ABI | Emby Server media-encoding assembly `4.9.5.x`; every required signature must match |
-| Offline host checks | Actual Emby `4.9.5.0` assemblies and bundled `5.1-emby` FFmpeg |
+| Playback ABI | Emby Server media-encoding assembly `4.9.5.x` or `4.10.0.x` with revision ≥ 40; every required signature must match |
+| Offline host checks | Actual Emby `4.9.5.0` and `4.10.0.40` assemblies and bundled `5.1-emby` FFmpeg |
 | Patch runtime | Reuse one compatible loaded Harmony runtime; otherwise use the embedded `Lib.Harmony 2.4.2` fallback |
+
+The 4.9 baseline remains 4.9.5.x; older 4.9 releases, early 4.10 previews, and other release lines are not admitted by this gate. Later revisions in the admitted lines still require structural validation and deployment checks.
 
 Six methods cover PlaybackInfo GET/POST, standard static video, FFmpeg job preparation, command execution and managed-output cleanup. An unsupported version or incompatible signature leaves playback native. Extraction and maintenance are separate from this playback gate, but are not thereby certified on untested Emby versions. Exact integration contracts are in the [design](STRM_BRIDGE_DESIGN.md); release evidence and pending live checks are in [TESTING.md](TESTING.md#release-readiness).
 

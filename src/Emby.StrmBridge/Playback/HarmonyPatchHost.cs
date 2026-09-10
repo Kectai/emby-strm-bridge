@@ -88,12 +88,12 @@ public sealed class HarmonyPatchHost : IDisposable
             stage = "validate-host-abi";
             var version = playbackInfoServiceType.Assembly.GetName().Version ?? new Version(0, 0);
             HostAbi = version.ToString();
-            if (version.Major != 4 || version.Minor != 9 || version.Build != 5 ||
-                videoServiceType.Assembly.GetName().Version != version ||
-                progressiveServiceType.Assembly.GetName().Version != version ||
-                baseStreamingServiceType.Assembly.GetName().Version != version ||
-                ffmpegRunnerType.Assembly.GetName().Version != version ||
-                encodingManagerType.Assembly.GetName().Version != version)
+            if (!IsSupportedHostAbi(version,
+                    videoServiceType.Assembly.GetName().Version,
+                    progressiveServiceType.Assembly.GetName().Version,
+                    baseStreamingServiceType.Assembly.GetName().Version,
+                    ffmpegRunnerType.Assembly.GetName().Version,
+                    encodingManagerType.Assembly.GetName().Version))
             {
                 logger.Warn("STRM_BRIDGE_PATCH_ABI_UNSUPPORTED abi=" + HostAbi);
                 Status = PlaybackPatchStatus.NativeOnly;
@@ -236,6 +236,15 @@ public sealed class HarmonyPatchHost : IDisposable
         }
         return Status;
     }
+
+    // These release lines share the six integration contracts checked below. Keep the
+    // 4.9 baseline and admit the verified 4.10 stable line, not earlier 4.10 previews.
+    // A version match never replaces signature/member checks or patch ownership checks.
+    internal static bool IsSupportedHostAbi(Version version, params Version?[] componentVersions) =>
+        version.Major == 4 &&
+        ((version.Minor == 9 && version.Build == 5 && version.Revision >= 0) ||
+         (version.Minor == 10 && version.Build == 0 && version.Revision >= 40)) &&
+        componentVersions.All(component => component == version);
 
     internal ProgressivePrefixDiagnostics GetProgressivePrefixDiagnostics()
     {

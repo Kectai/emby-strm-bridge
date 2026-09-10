@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4 — 2026-09-10
+
+- Support the Emby 4.10.0 stable line from revision 40 while retaining 4.9.5.x compatibility.
+- Keep strict patch signatures, component version consistency and rollback checks; reject unverified release lines and early previews.
+- Add host-version boundary regressions and an isolated actual-host installation, disposal and snapshot check.
+
 ## 0.2.3 — 2026-09-09
 
 - Add validated first-hop redirects and ticket/profile-scoped caching, configurable from 0–60 seconds, with explicit refresh support.

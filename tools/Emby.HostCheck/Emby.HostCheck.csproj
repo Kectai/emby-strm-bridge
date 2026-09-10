@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Emby.StrmBridge.HostCheck</AssemblyName>
+    <TargetFramework>net6.0</TargetFramework>
+    <CheckEolTargetFramework>false</CheckEolTargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseAppHost>false</UseAppHost>
+    <OutputPath>$(RepositoryRoot).local/host-check/$(Configuration)/</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Emby.StrmBridge">
+      <HintPath>$(RepositoryRoot).local/build/bin/Release/netstandard2.1/Emby.StrmBridge.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MediaBrowser.Model;MediaBrowser.Common;MediaBrowser.Controller;Emby.Web.GenericEdit">
+      <HintPath>$(HostAssemblyDirectory)/%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+  <Target Name="RequireHostAssemblies" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(HostAssemblyDirectory)/Emby.Server.MediaEncoding.dll')"
+           Text="Set HostAssemblyDirectory to an extracted Emby runtime directory. Build the Release plugin first." />
+  </Target>
+</Project>

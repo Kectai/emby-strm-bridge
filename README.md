@@ -8,7 +8,7 @@ Emby Server 的 STRM 媒体信息与播放插件。为所选媒体库中的本�
 
 本项目源于作者的个人使用需求，公开代码供有类似需求的用户参考和使用，随个人需求不定期更新，目前没有固定维护计划。
 
-当前版本为 **0.2.3**正式版。播放补丁适配 Emby Server **4.9.5.x**；安装前请查看[兼容性](docs/COMPATIBILITY.md)和[发布说明](RELEASE_NOTES.md)。
+当前版本为 **0.2.4**正式版。播放补丁适配 Emby Server **4.9.5.x / 4.10.0.40+（4.10.0 分支）**；安装前请查看[兼容性](docs/COMPATIBILITY.md)和[发布说明](RELEASE_NOTES.md)。
 
 ### 功能
 
@@ -77,7 +77,7 @@ An Emby Server plugin for technical media information and video playback of loca
 
 This project serves the author's personal needs and is shared for others with similar setups. Updates follow those needs; there is no fixed maintenance schedule.
 
-The current version is **0.2.3**, a stable release. Playback patches target Emby Server **4.9.5.x**. Read the [compatibility notes](docs/COMPATIBILITY.md) and [release notes](RELEASE_NOTES.md) before installing.
+The current version is **0.2.4**, a stable release. Playback patches target Emby Server **4.9.5.x / 4.10.0.40+ (4.10.0 line)**. Read the [compatibility notes](docs/COMPATIBILITY.md) and [release notes](RELEASE_NOTES.md) before installing.
 
 ### Features and modes
 

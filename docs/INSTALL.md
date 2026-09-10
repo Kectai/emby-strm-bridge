@@ -45,8 +45,10 @@ Check the plugin log for these events; the ABI value reflects the installed host
 
 ```text
 STRM_BRIDGE_HARMONY_RUNTIME shared=<true|false> activeMethods=<count>
-STRM_BRIDGE_PATCH_READY abi=4.9.5.0 targets=6
+STRM_BRIDGE_PATCH_READY abi=4.10.0.40 targets=6
 ```
+
+On Emby 4.9.5.0, the same ready event reports `abi=4.9.5.0`. Version 0.2.4 requires no configuration or snapshot migration when upgrading from 0.2.3.
 
 `shared=true` indicates reuse of a compatible loaded patch runtime. A patch failure includes a stage and fixed reason code. Use administrator Health/Diagnostics to confirm `PluginVersion` and the 12-character `BuildId` identify the loaded DLL. Check `PrefixDiagnosticsAvailable`, `NativePrefixInstalled` and `NativePrefixUncontended`; numeric priority alone does not prove safe coexistence.
 

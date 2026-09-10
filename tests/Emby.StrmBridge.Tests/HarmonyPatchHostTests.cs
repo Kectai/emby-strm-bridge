@@ -9,6 +9,40 @@ namespace Emby.StrmBridge.Tests;
 public sealed class HarmonyPatchHostTests
 {
     [TestMethod]
+    [DataRow("4.9.5.0")]
+    [DataRow("4.9.5.1")]
+    [DataRow("4.10.0.40")]
+    [DataRow("4.10.0.41")]
+    public void HostAbi_AcceptsSupportedReleaseLinesWithMatchingComponents(string value)
+    {
+        var version = Version.Parse(value);
+        Assert.IsTrue(HarmonyPatchHost.IsSupportedHostAbi(version, version, version, version, version, version));
+    }
+
+    [TestMethod]
+    [DataRow("4.8.11.0")]
+    [DataRow("4.9.1.80")]
+    [DataRow("4.9.5")]
+    [DataRow("4.9.6.0")]
+    [DataRow("4.10.0.0")]
+    [DataRow("4.10.0.31")]
+    [DataRow("4.10.1.0")]
+    [DataRow("4.11.0.40")]
+    [DataRow("5.10.0.40")]
+    public void HostAbi_RejectsUntestedLinesAndPreviewBuilds(string value) =>
+        Assert.IsFalse(HarmonyPatchHost.IsSupportedHostAbi(Version.Parse(value)));
+
+    [TestMethod]
+    public void HostAbi_RejectsMixedOrMissingComponentVersions()
+    {
+        var oldVersion = new Version(4, 9, 5, 0);
+        var newVersion = new Version(4, 10, 0, 40);
+        Assert.IsFalse(HarmonyPatchHost.IsSupportedHostAbi(newVersion, newVersion, oldVersion));
+        Assert.IsFalse(HarmonyPatchHost.IsSupportedHostAbi(oldVersion, newVersion, oldVersion));
+        Assert.IsFalse(HarmonyPatchHost.IsSupportedHostAbi(newVersion, newVersion, null));
+    }
+
+    [TestMethod]
     public void PrefixDiagnostics_ReflectLatePatchChangesAndReportOnlyNumericPriorityFacts()
     {
         var target = GetMethod(nameof(Target));

@@ -32,27 +32,45 @@ The maintained test project is `tests/Emby.StrmBridge.Tests/Emby.StrmBridge.Test
 
 Add tests for changed contracts at their integration boundary. In particular, large HLS rewrites must not scan all tickets per URI; range validation must cover first authoritative reads as well as cache hits; a fresh probe must not succeed solely because the host returned preexisting fields.
 
-## Evidence for 0.2.3
+## Actual-host compatibility check
 
-The maintained suite has **561 passing tests**. The release has also passed Release build, formatting, privacy and packaging checks. These results describe automated coverage, not completed live acceptance.
+After building the Release plugin, use the optional host check with an extracted Emby runtime directory. Build it against the 4.9.5.0 baseline, then run the same check and plugin DLL against each target host in a separate .NET 6 process:
 
-Offline checks used actual Emby `4.9.5.0` assemblies, .NET `6.0.36` and the host's bundled `5.1-emby` FFmpeg. Record the loaded DLL fingerprint alongside each offline run; distributed ZIP bytes are verified by the release checksum file.
+```sh
+dotnet build tools/Emby.HostCheck/Emby.HostCheck.csproj -c Release \
+  -p:HostAssemblyDirectory="/path/to/emby-4.9.5-runtime"
+/path/to/dotnet6/dotnet .local/host-check/Release/net6.0/Emby.StrmBridge.HostCheck.dll \
+  "/path/to/target-emby-runtime" \
+  "$PWD/.local/build/bin/Release/netstandard2.1/Emby.StrmBridge.dll"
+```
+
+The check logs the exact plugin fingerprint and host version, verifies all six patch owners, repeats installation/disposal, exercises reflected input-state setters, and round-trips HDR/rotation snapshots. It loads actual host dependencies rather than the compile-time SDK. It does not start Emby, invoke its playback services, open media, or read user configuration. Keep extracted host binaries outside the release package. Player acceptance and actual FFmpeg output checks remain separate.
+
+## Evidence for 0.2.4
+
+The maintained suite has **575 passing tests**. The release has also passed Release build, formatting, privacy and packaging checks. These results describe automated coverage, not completed live acceptance.
+
+Offline checks used actual Emby `4.9.5.0` and `4.10.0.40` assemblies, .NET `6.0.36` and the host's bundled `5.1-emby` FFmpeg. Record the loaded DLL fingerprint alongside each offline run; distributed ZIP bytes are verified by the release checksum file.
 
 | Offline check | Recorded result |
 | --- | --- |
+| Both host versions: six patch targets | Install, repeat install, remove all owned patches, reinstall |
+| Both host versions: reflected input state | Media source identity, paths and protocols writable |
 | Technical snapshot round trip | HDR/Dolby Vision and rotation retained |
 | Stable representation, target 40 seconds | First frame at 40.0417 seconds; 479 continuous matching frames |
 | Representation rejection / native recovery | First frame at 40.0 seconds; 480 continuous matching frames |
 | 10,000-URI HLS ticket workload | Initial rewrite 32 ms; refresh 13 ms, versus 7,933/22,005 ms before the cleanup fix |
 
-The HLS measurement covers local ticket bookkeeping, not end-to-end media or network latency. Offline evidence must be rerun when relevant code or the DLL changes. The HLS timings are retained from the prerelease regression of the same implementation; timing values vary by machine and run.
+The HLS measurement covers local ticket bookkeeping, not end-to-end media or network latency. Offline evidence must be rerun when relevant code or the DLL changes. The patch, snapshot and 40-second positioning/native-recovery checks were repeated on both host versions for 0.2.4. The HLS timings are retained from the 0.2.3 prerelease regression of the same HLS implementation; timing values vary by machine and run.
+
+On an installed 4.10.0.40 host, the 0.2.4 DLL reported all six patches ready. Playback and multiple seeks succeeded; intermittent HTTP 403 also occurred after redirect handoff, including in pre-upgrade logs. A separate RelayOnly run completed multiple seeks successfully. These observations do not establish the rejection trigger or a guaranteed workaround.
 
 ## Release readiness
 
 <a id="implementation-gaps"></a>
 <a id="release-readiness-20260906"></a>
 
-**Release channel: stable (0.2.3).** Automated and actual-host offline checks cover the release implementation. A complete live matrix across supported players and sources has not been recorded; stable-channel publication does not expand that verification coverage. Run the applicable deployment checks below with the installed release.
+**Version: 0.2.4, stable channel.** Automated and actual-host offline checks cover the release implementation. A complete live matrix across supported players and sources has not been recorded; stable-channel publication does not expand that verification coverage. Run the applicable deployment checks below with the installed release.
 
 | Live scenario | Required observation |
 | --- | --- |

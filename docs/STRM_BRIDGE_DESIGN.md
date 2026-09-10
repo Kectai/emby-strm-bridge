@@ -42,8 +42,8 @@ STRM Bridge 是运行在 Emby Server 进程内的轻量插件。它为指定媒�
 
 当前运行与构建基线为：
 
-- Emby Server `4.9.5.x`；
-- Emby 4.9.5 自带的 FFmpeg `5.1-emby`；
+- Emby Server `4.9.5.x`，以及 `4.10.0.x` 的 40 及以后修订版；
+- 已验证 4.9.5.0 与 4.10.0.40 自带的 FFmpeg `5.1-emby`；
 - 插件目标框架 `netstandard2.1`；
 - 单 DLL 安装包，`Lib.Harmony 2.4.2` 作为校验后的回退资源嵌入。
 
@@ -65,9 +65,9 @@ Emby 的 PlaybackInfo 响应包含 `MediaSources`。客户端依据媒体源的�
 - [Emby Video Streaming](https://dev.emby.media/doc/restapi/Video-Streaming.html)
 - [Emby PlaybackInfo API](https://dev.emby.media/reference/RestAPI/MediaInfoService/getItemsByIdPlaybackinfo.html)
 
-#### 4.2 Emby 4.9.5 运行时调用链
+#### 4.2 Emby 4.9 / 4.10 运行时调用链
 
-对 Emby 4.9.5.0 本机程序集的只读检查确认以下调用链：
+对 Emby 4.9.5.0 和 4.10.0.40 实际程序集的只读检查确认以下调用链。两版的六个补丁入口签名与所用状态成员一致；4.10 的进程退出处理有所调整，但插件不挂接该退出方法，失败返回前仍等待子进程结束。
 
 ```text
 PlaybackInfo GET/POST
@@ -94,7 +94,7 @@ PlaybackInfo GET/POST
 
 动态 HLS 拖动会停止不匹配的旧转码任务，以目标分片推导新的 `StartTimeTicks`，随后启动新的 FFmpeg 任务。因此每次拖动都是独立作业边界，插件状态必须按作业隔离。
 
-15 秒是已验证的 Emby 4.9.5 ABI 行为。实现把它作为验收上限，不把该数值当作跨版本 API 保证。
+15 秒是已验证的 Emby 4.9.5.0 / 4.10.0.40 ABI 行为。实现把它作为验收上限，不把该数值当作跨版本 API 保证。
 
 #### 4.3 FFmpeg HTTP 与定位流程
 
@@ -613,7 +613,7 @@ Adaptive 的 HLS 改写／中继路径及其子资源不继承普通文件的首
 | 无外部控制预算的传输调用 | `GatewayTransport.OpenRequestAsync` 创建自身的 `GatewayTimeoutSeconds`，供独立调用及探测使用 |
 | 正文探查与流式读取 | 每次读取单独使用 `GatewayTimeoutSeconds` 空闲超时，正文寿命仍受请求与传输代际取消约束 |
 | TS/M2TS 计划准备 | 按容器平均字节率计算窗口和总量，按实测延迟／读取速率调整 Range；全部样本和最多三次校正共享不可续期的七秒及 32 MiB 安全上限 |
-| Emby FFmpeg 启动 | Emby 4.9.5 自身的 15 秒窗口；插件的定位准备位于该窗口之前 |
+| Emby FFmpeg 启动 | Emby 4.9.5.0 / 4.10.0.40 自身的 15 秒窗口；插件的定位准备位于该窗口之前 |
 
 播放来源退避覆盖 `401/403/404/408/410/429/5xx` 和非取消、非信任拒绝的连接异常。连接失败按 502、地址信任拒绝按 403、网关等待／打开超时按 504 处理；正文已交付后发生超时会中止流，无法回写已经发送的状态码。416 保留本次响应语义，不刷新持久长度，也不进入来源退避。租约失配恢复成功时继续按有效结果交付。
 
@@ -775,7 +775,7 @@ For container byte rate `b`, head sample `H = 512 KiB`, scan window `W = clamp(b
 
 The anchor must have selected-video random-access evidence and a PCR interval no wider than 100 ms, entirely 0.25–12 seconds before the target. Bitrate estimates locate search windows, not the final playback timestamp. Successful plans last two minutes and remain representation-bound. Same-target preparation is shared; cancelling the last waiter removes the pending identity and cancels upstream reads.
 
-Preparation runs before the verified Emby 4.9.5 startup window. The command prefix performs memory-only validation and atomic mutation. If optimized startup returns false after host process shutdown, it can restore the complete native command and retry once within the original budget. Faulted tasks do not launch another process. Adaptive transport-stream starts with a target of at least ten seconds and a device/session identity have bounded same-target startup coordination; failure or cancellation observed after eight seconds opens a non-sliding 30-second cooldown.
+Preparation runs before the verified Emby 4.9.5.0 / 4.10.0.40 startup window. The command prefix performs memory-only validation and atomic mutation. If optimized startup returns false after host process shutdown, it can restore the complete native command and retry once within the original budget. Faulted tasks do not launch another process. Adaptive transport-stream starts with a target of at least ten seconds and a device/session identity have bounded same-target startup coordination; failure or cancellation observed after eight seconds opens a non-sliding 30-second cooldown.
 
 ### Extraction and recovery
 

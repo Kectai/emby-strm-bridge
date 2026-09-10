@@ -6,7 +6,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>Emby.StrmBridge</AssemblyName>
     <RootNamespace>Emby.StrmBridge</RootNamespace>
-    <Version>0.2.3</Version>
+    <Version>0.2.4</Version>
     <Authors>Kectai</Authors>
     <Copyright>Copyright (c) 2026 Kectai</Copyright>
     <Description>Routes selected STRM playback through an in-process Emby gateway.</Description>
