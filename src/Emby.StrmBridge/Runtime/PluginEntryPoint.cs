@@ -107,6 +107,26 @@ public sealed class PluginEntryPoint : IServerEntryPoint, IDisposable
             logManager.GetLogger(Plugin.Instance?.Name ?? "STRM Bridge")
                 .Warn("STRM_BRIDGE_PATCH_DEPENDENCY_FAILED error=" + exception.GetType().Name);
         }
+        try
+        {
+            var subtitleLogger = logManager.GetLogger(Plugin.Instance?.Name ?? "STRM Bridge");
+            var subtitles = new Emby.StrmBridge.Subtitles.SubtitleCoordinator(runtime, applicationHost, applicationPaths, subtitleLogger);
+            runtime.Subtitles = subtitles;
+            var subtitleProcessor = new Emby.StrmBridge.Subtitles.SubtitleRequestProcessor(runtime, libraryManager,
+                mediaSourceManager, authorizationContext,
+                applicationHost.TryResolve<IAuthService>() ?? throw new InvalidOperationException("Subtitle authentication unavailable."),
+                resultFactory, subtitles, subtitleLogger);
+            runtime.SubtitleRequests = subtitleProcessor;
+            var subtitlePatch = new Emby.StrmBridge.Subtitles.SubtitlePatchHost(runtime, resultFactory, subtitleLogger,
+                new Emby.StrmBridge.Subtitles.SharedSubtitleNegotiation(runtime, libraryManager, mediaSourceManager));
+            runtime.SubtitlePatch = subtitlePatch;
+            subtitles.Status = subtitlePatch.Install() ? "Ready" : "NativeOnly";
+        }
+        catch (Exception exception)
+        {
+            logManager.GetLogger(Plugin.Instance?.Name ?? "STRM Bridge")
+                .Warn("STRM_BRIDGE_SUBTITLE_UNAVAILABLE error=" + exception.GetType().Name);
+        }
         maintenance = new MaintenanceService(runtime, logManager);
         runtime.Maintenance = maintenance;
         maintenance.Start();

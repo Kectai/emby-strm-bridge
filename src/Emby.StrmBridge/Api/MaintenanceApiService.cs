@@ -76,6 +76,11 @@ public sealed class MaintenanceApiService : IService, IRequiresRequest
             PluginVersion = GetPluginVersion(),
             BuildId = GetBuildId(),
             Enabled = options.Enabled,
+            SubtitlesEnabled = options.EnableSubtitles,
+            SubtitleStatus = runtime.Subtitles?.Status == "Ready" && runtime.SubtitlePatch?.CanServe != true
+                ? "Unavailable" : runtime.Subtitles?.Status ?? "Unavailable",
+            SubtitleJobs = runtime.Subtitles?.ActiveJobs ?? 0,
+            SubtitleWebResourceStatus = runtime.SubtitlePatch?.ResourceStatus ?? "Unavailable",
             PlaybackMode = options.PlaybackMode.ToString(),
             SelectedLibraryCount = options.IncludedLibraryIds.Length,
             TrustedHostRuleCount = options.AllowedRedirectHosts.Length,
@@ -105,6 +110,11 @@ public sealed class MaintenanceApiService : IService, IRequiresRequest
             PluginVersion = GetPluginVersion(),
             BuildId = GetBuildId(),
             Enabled = options.Enabled,
+            SubtitlesEnabled = options.EnableSubtitles,
+            SubtitleStatus = runtime.Subtitles?.Status == "Ready" && runtime.SubtitlePatch?.CanServe != true
+                ? "Unavailable" : runtime.Subtitles?.Status ?? "Unavailable",
+            SubtitleJobs = runtime.Subtitles?.ActiveJobs ?? 0,
+            SubtitleWebResourceStatus = runtime.SubtitlePatch?.ResourceStatus ?? "Unavailable",
             PlaybackMode = options.PlaybackMode.ToString(),
             PatchStatus = health.PatchStatus.ToString(),
             health.HostAbi,

@@ -30,6 +30,8 @@ Source identities use HMAC rather than persisted plaintext paths or URLs. Extrac
 
 Configuration necessarily persists selected library IDs and normalized trusted/detected hosts or IP rules. Protect configuration and recovery backups with the same filesystem permissions as other Emby plugin data.
 
+Optional subtitles use authenticated playback sessions bound to the user, video playback session, source version and stream metadata. They consume temporary ASS output from the existing video FFmpeg process, without opening another media URL. Output files have generated names below plugin data storage, fixed task/track/file budgets, no static download route, and no reuse across users or playback sessions. Permissions and source identities are rechecked during reads. Invalidation revokes access immediately; files still being written are deleted after video process exit. Browser windows and temporary files contain subtitle text/styles; local server filesystem access has the same trust boundary as Emby transcoding files. Native font attachment URLs retain host behavior. Resource adaptation requires exact known Web fingerprints and never modifies installed Web files. See [subtitle implementation](SUBTITLE_DESIGN.md).
+
 ## Logging and diagnostics
 
 Plugin logs use fixed event/reason codes, mode/status, host ABI, exception type, numeric timing/capacity data and shortened item IDs. They exclude URLs, signatures, local paths, titles, usernames, device names, full User-Agent, authentication headers and FFmpeg command lines. Short item IDs are diagnostic identifiers, not anonymization.
@@ -45,3 +47,5 @@ Transport capacity returns 503 with Retry-After, connection failure 502, connect
 Cancellation remains linked to returned body streams until disposal. Configuration changes prevent stale task commits; shutdown cancels requests and clears tickets, leases and plans. Delayed output cleanup checks the exact registered path, latest job ownership and active jobs before deleting through Emby's filesystem API.
 
 Detailed budgets, cache keys, Range validation, HLS resource limits and retry contracts are maintained in the [design](STRM_BRIDGE_DESIGN.md). Regression and deployment checks are in [TESTING.md](TESTING.md).
+
+字幕时间映射仅读取已绑定视频任务的本地首分片，最多 8 MiB；文件名来自宿主输出，不接受客户端路径。不新增远程读取。解析或等待失败不会回退为独立字幕提取。

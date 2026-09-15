@@ -41,6 +41,12 @@ public sealed class PluginRuntime : IDisposable
 
     public GatewayTransport? Gateway { get; private set; }
 
+    internal Emby.StrmBridge.Subtitles.SubtitleRequestProcessor? SubtitleRequests { get; set; }
+
+    internal Emby.StrmBridge.Subtitles.SubtitleCoordinator? Subtitles { get; set; }
+
+    internal Emby.StrmBridge.Subtitles.SubtitlePatchHost? SubtitlePatch { get; set; }
+
     internal FastSeekCoordinator? FastSeek { get; private set; }
 
     public ExtractionCoordinator? Extraction { get; internal set; }
@@ -48,6 +54,8 @@ public sealed class PluginRuntime : IDisposable
     internal MaintenanceService? Maintenance { get; set; }
 
     public string? DataDirectory { get; private set; }
+
+    internal bool SubtitleInputsReady => playbackPatch?.SubtitleInputsReady == true;
 
     public bool IsInitialized => SourcePolicy is not null && Gateway is not null;
 
@@ -305,6 +313,8 @@ public sealed class PluginRuntime : IDisposable
         previous.Cancel();
         maintenance?.Dispose();
         patch?.Dispose();
+        SubtitlePatch?.Dispose();
+        Subtitles?.Dispose();
         extraction?.CancelAndDrain();
         previous.Dispose();
         Tickets.Clear();

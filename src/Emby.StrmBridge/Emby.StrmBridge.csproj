@@ -6,7 +6,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>Emby.StrmBridge</AssemblyName>
     <RootNamespace>Emby.StrmBridge</RootNamespace>
-    <Version>0.2.4</Version>
+    <Version>0.2.5</Version>
     <Authors>Kectai</Authors>
     <Copyright>Copyright (c) 2026 Kectai</Copyright>
     <Description>Routes selected STRM playback through an in-process Emby gateway.</Description>
@@ -17,6 +17,7 @@
     <PackageReference Include="MediaBrowser.Server.Core" />
   </ItemGroup>
   <ItemGroup>
+    <EmbeddedResource Include="Subtitles/Player.js" />
     <EmbeddedResource Include="$(IntermediateOutputPath)embedded/0Harmony.dll.gz"
                       LogicalName="Emby.StrmBridge.Dependencies.0Harmony.dll.gz" />
     <EmbeddedResource Update="Localization/PluginStrings.zh-Hans.resx">

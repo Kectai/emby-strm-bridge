@@ -52,4 +52,6 @@
   <data name="InvalidLibraryIdError" xml:space="preserve"><value>媒体库 ID 必须是 GUID。</value></data>
   <data name="AuthenticatedUserRequiredError" xml:space="preserve"><value>需要已登录的 Emby 用户。</value></data>
   <data name="AdministratorRequiredError" xml:space="preserve"><value>需要 Emby 管理员权限。</value></data>
+  <data name="EnableSubtitles" xml:space="preserve"><value>内嵌文字字幕（可选）</value></data>
+  <data name="EnableSubtitlesDescription" xml:space="preserve"><value>在受支持的 Emby Web 播放器中自动加载 MKV 内嵌文字字幕。除原生模式外，字幕读取会使用服务器流量。</value></data>
 </root>

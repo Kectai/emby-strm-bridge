@@ -52,4 +52,6 @@
   <data name="InvalidLibraryIdError" xml:space="preserve"><value>The library ID must be a GUID.</value></data>
   <data name="AuthenticatedUserRequiredError" xml:space="preserve"><value>An authenticated Emby user is required.</value></data>
   <data name="AdministratorRequiredError" xml:space="preserve"><value>An Emby administrator is required.</value></data>
+  <data name="EnableSubtitles" xml:space="preserve"><value>Embedded text subtitles (optional)</value></data>
+  <data name="EnableSubtitlesDescription" xml:space="preserve"><value>Stream embedded MKV text subtitles in supported Emby Web players. Subtitle reads use server bandwidth in non-Native modes.</value></data>
 </root>

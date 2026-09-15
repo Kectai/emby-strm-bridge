@@ -42,6 +42,7 @@ public sealed class HarmonyPatchHost : IDisposable
     private readonly ILogger logger;
     private readonly object lifecycleSync = new();
     private MethodInfo? nativeStreamTarget;
+    private MethodInfo[] subtitleInputTargets = Array.Empty<MethodInfo>();
     private HarmonyRuntimeAdapter? harmonyRuntime;
     private bool disposed;
 
@@ -64,6 +65,20 @@ public sealed class HarmonyPatchHost : IDisposable
     }
 
     public PlaybackPatchStatus Status { get; private set; } = PlaybackPatchStatus.NativeOnly;
+
+    internal bool SubtitleInputsReady
+    {
+        get
+        {
+            try
+            {
+                return Status == PlaybackPatchStatus.Ready && harmonyRuntime is not null && subtitleInputTargets.Length == 2 &&
+                    subtitleInputTargets.All(target => harmonyRuntime.GetPatchInfo(target) is { } info &&
+                        info.Prefixes.Any(p => p.Owner == PatchId) && info.Prefixes.All(p => p.Owner == PatchId));
+            }
+            catch { return false; }
+        }
+    }
 
     public string HostAbi { get; private set; } = "unavailable";
 
@@ -164,6 +179,7 @@ public sealed class HarmonyPatchHost : IDisposable
                 jobType.GetProperty("MediaSource")?.PropertyType != typeof(MediaBrowser.Model.Dto.MediaSourceInfo) ||
                 jobType.GetProperty("Path")?.PropertyType != typeof(string))
                 throw new MissingMethodException("Transcode cleanup ABI is unavailable.");
+            subtitleInputTargets = new[] { transcodeInputTarget, ffmpegCommandTarget };
             stage = "attach-patch-bridges";
             TranscodeInputPatchBridge.PrepareResultType(jobType);
             PlaybackPatchBridge.Attach(processor);
@@ -237,7 +253,7 @@ public sealed class HarmonyPatchHost : IDisposable
         return Status;
     }
 
-    // These release lines share the six integration contracts checked below. Keep the
+    // These release lines share the integration contracts checked below. Keep the
     // 4.9 baseline and admit the verified 4.10 stable line, not earlier 4.10 previews.
     // A version match never replaces signature/member checks or patch ownership checks.
     internal static bool IsSupportedHostAbi(Version version, params Version?[] componentVersions) =>
@@ -469,6 +485,30 @@ public static class FfmpegCommandPatchBridge
         FfmpegCommandProcessor? current;
         lock (Sync) current = processor;
         if (current is not null && current.TryApply(__0, __1, out var mutation)) __state = mutation;
+    }
+
+    public static void TextPrefix(object __instance, ref string __0, bool __runOriginal, out object? __state)
+    {
+        FfmpegCommandProcessor? current;
+        lock (Sync) current = processor;
+        __state = __runOriginal ? current?.AttachSubtitles(__instance, ref __0) : null;
+    }
+
+    public static void TextPostfix(object? __state, ref Task<bool> __result)
+    {
+        if (__state is Emby.StrmBridge.Subtitles.SharedSubtitleJob job)
+            __result = ObserveSharedStart(__result, job);
+    }
+
+    private static async Task<bool> ObserveSharedStart(Task<bool> start, Emby.StrmBridge.Subtitles.SharedSubtitleJob job)
+    {
+        try
+        {
+            var ready = await start.ConfigureAwait(false);
+            job.ObserveStart(ready);
+            return ready;
+        }
+        catch { job.ObserveStart(false); throw; }
     }
 
     public static void Postfix(object __instance, object __0, CancellationToken __1, object? __state,

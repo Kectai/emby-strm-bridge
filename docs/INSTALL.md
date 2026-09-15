@@ -80,6 +80,8 @@ All routes require an authenticated Emby administrator. Use the server's normal 
 
 Clear changes stored technical information; it is not an orphan cleanup operation. Media files, STRM files, scraped metadata and existing external subtitles are retained.
 
+The optional subtitle feature is disabled by default. Its playback-session APIs require a logged-in user with playback access, not administrator access. They are separate from the administrator routes above. Exact request fields, setup and large-file limits are in [SUBTITLES.md](SUBTITLES.md). Upgrading from 0.2.4 does not require a snapshot migration.
+
 ## Update, rollback, and uninstall
 
 For an update, stop Emby, back up the existing DLL/configuration/recovery data, replace the DLL and restart. Confirm the loaded version/build and repeat the relevant live checks.
@@ -89,3 +91,5 @@ Version 0.2.3 uses snapshot schema 3. Older snapshots are ignored because they l
 For a temporary playback fallback, select `Native` and save. To roll back the binary, stop Emby before replacing the DLL, restore compatible plugin configuration/recovery backups if necessary, and restart. Binary rollback does not undo technical fields already written to Emby.
 
 To uninstall, stop Emby, remove the plugin DLL and restart, or use Emby's uninstall action and restart. Uninstalling does not delete media or STRM files and does not automatically clear previously written technical information.
+
+视频链路保持六个挂接；字幕单独管理视频输出、Web 资源及播放协商三个挂接。字幕适配失败不再回滚正常的视频补丁；依赖不完整时不会协商共享字幕播放。开启字幕后，符合范围的 Web MKV 经服务端 HLS 播放；更新 DLL 后应强制刷新网页，使设备能力标记与服务端代码同步。

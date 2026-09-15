@@ -69,6 +69,10 @@ public sealed class PluginConfiguration : EditableOptionsBase
     [DescriptionL(nameof(PluginStrings.EnableFastSeekDescription), typeof(PluginStrings))]
     public bool EnableFastSeek { get; set; } = true;
 
+    [DisplayNameL(nameof(PluginStrings.EnableSubtitles), typeof(PluginStrings))]
+    [DescriptionL(nameof(PluginStrings.EnableSubtitlesDescription), typeof(PluginStrings))]
+    public bool EnableSubtitles { get; set; }
+
     [Browsable(false)]
     public int ConfigurationVersion { get; set; } = CurrentConfigurationVersion;
 
@@ -304,6 +308,7 @@ public sealed class PluginConfiguration : EditableOptionsBase
             Enabled = Enabled,
             PlaybackMode = PlaybackMode,
             EnableFastSeek = EnableFastSeek,
+            EnableSubtitles = EnableSubtitles,
             ConfigurationVersion = ConfigurationVersion,
             ExtractAfterLibraryScan = ExtractAfterLibraryScan,
             OnlyMissingMediaInfo = OnlyMissingMediaInfo,

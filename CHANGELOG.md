@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.5 — 2026-09-15
+
+- Add opt-in MKV embedded ASS/SSA/SubRip subtitles for verified Emby 4.9.5.0 and 4.10.0.40 Web resources. Eligible hls.js playback shares one server-side video input with local subtitle output.
+- Preserve automatic selection, manual track changes and silent loading; use the browser continuity clock across repeated seeks and video task restarts.
+- Bound local output, incremental indexing and window reads; isolate stale responses and unusable candidates, recover transient failures and release failed renderers.
+- Isolate optional subtitle patches from the six video playback hooks; require healthy inputs and actual hls.js capability before takeover. Native-HLS-only clients retain host handling.
+- Add actual-host, cross-browser and regression checks; verify current-build Safari, Chrome and IINA playback with repeated seeks.
+
 ## 0.2.4 — 2026-09-10
 
 - Support the Emby 4.10.0 stable line from revision 40 while retaining 4.9.5.x compatibility.

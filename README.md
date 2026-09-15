@@ -8,7 +8,7 @@ Emby Server 的 STRM 媒体信息与播放插件。为所选媒体库中的本�
 
 本项目源于作者的个人使用需求，公开代码供有类似需求的用户参考和使用，随个人需求不定期更新，目前没有固定维护计划。
 
-当前版本为 **0.2.4**正式版。播放补丁适配 Emby Server **4.9.5.x / 4.10.0.40+（4.10.0 分支）**；安装前请查看[兼容性](docs/COMPATIBILITY.md)和[发布说明](RELEASE_NOTES.md)。
+当前版本为 **0.2.5 正式版**。播放补丁适配 Emby Server **4.9.5.x / 4.10.0.40+（4.10.0 分支）**；安装前请查看[兼容性](docs/COMPATIBILITY.md)和[发布说明](RELEASE_NOTES.md)。
 
 ### 功能
 
@@ -46,6 +46,7 @@ STRM 必须是本地普通文件，内容为一条 HTTP(S) URL。动态媒体源
 | 保存恢复快照 | 开启 | 关闭后，成功探测的技术信息仍写入 Emby |
 | 直达重定向缓存时间 | 20 秒 | 范围 0–60；一次性、按 Range 绑定或有效期更短的签名地址设为 0 |
 | 启用有证据的快速定位 | 开启 | 只影响符合条件的 TS/M2TS 服务端定位，可独立关闭 |
+| 内嵌文字字幕（可选） | 关闭 | Emby Web 自动加载 MKV 文字字幕；范围见[字幕说明](docs/SUBTITLES.md) |
 
 **已知缩略图兼容问题：** 部分客户端生成进度条缩略图会增加媒体读取请求，在来源限制并发或请求频率时可能造成持续缓冲或拖动卡住。遇到此类问题，可先关闭客户端的缩略图／实时预览，详见[兼容说明](docs/COMPATIBILITY.md#client-generated-seek-thumbnails)。
 
@@ -77,7 +78,7 @@ An Emby Server plugin for technical media information and video playback of loca
 
 This project serves the author's personal needs and is shared for others with similar setups. Updates follow those needs; there is no fixed maintenance schedule.
 
-The current version is **0.2.4**, a stable release. Playback patches target Emby Server **4.9.5.x / 4.10.0.40+ (4.10.0 line)**. Read the [compatibility notes](docs/COMPATIBILITY.md) and [release notes](RELEASE_NOTES.md) before installing.
+The current stable version is **0.2.5**. Playback patches target Emby Server **4.9.5.x / 4.10.0.40+ (4.10.0 line)**. Read the [compatibility notes](docs/COMPATIBILITY.md) and [release notes](RELEASE_NOTES.md) before installing. Optional MKV text subtitles from the video FFmpeg process are disabled by default; see [subtitle setup and limits](docs/SUBTITLES.md).
 
 ### Features and modes
 

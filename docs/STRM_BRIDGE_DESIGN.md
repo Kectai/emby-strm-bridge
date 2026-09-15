@@ -47,7 +47,7 @@ STRM Bridge 是运行在 Emby Server 进程内的轻量插件。它为指定媒�
 - 插件目标框架 `netstandard2.1`；
 - 单 DLL 安装包，`Lib.Harmony 2.4.2` 作为校验后的回退资源嵌入。
 
-播放补丁安装前执行 ABI 校验，覆盖五处生命周期集成、六个方法：PlaybackInfo GET/POST、标准静态视频、`StartFfMpeg`、`FfmpegRunner.Start`、`DeletePartialStreamFiles`。校验内容包括类型、方法签名、程序集版本、关键命令模型属性和清理所需的作业／文件系统成员。ABI 不匹配时，播放路由进入 `Native` 行为，媒体信息提取和维护任务继续可用。
+播放补丁安装前执行 ABI 校验，覆盖五处生命周期集成、六个方法：PlaybackInfo GET/POST、标准静态视频、`StartFfMpeg`、`FfmpegRunner.Start`、`DeletePartialStreamFiles`。校验内容包括类型、方法签名、程序集版本、关键命令模型属性和清理所需的作业／文件系统成员。ABI 不匹配时，播放路由进入 `Native` 行为，媒体信息提取和维护任务继续可用。 可选字幕的 runner 输出、Web 资源及播放协商使用独立补丁生命周期；字幕 ABI 失败不回滚这六个视频方法。共享字幕协商要求主播放与字幕依赖均健康。
 
 生产程序集不静态引用 `0Harmony`。启动先按 Harmony 2.x 所需 API 结构检查所有已加载程序集，并使用每个候选自己的 detour 注册表区分实际活动的 MonoMod 实现；公共 patch 元数据可能跨 Harmony 程序集共享，不能单独证明 detour 归属。唯一活动候选优先；没有活动候选但只有一个兼容实现时复用该实现；多个活动候选或多个非活动候选均因歧义失败关闭；零候选才加载内嵌回退。选定后，六个补丁的创建、所有权检查、prefix 诊断和按 `PatchId` 卸载始终通过同一个反射适配器完成。选择逻辑不包含插件名、平台、架构、客户端或来源规则，也不修改外部 MonoMod 开关。
 

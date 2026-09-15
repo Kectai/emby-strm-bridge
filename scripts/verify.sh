@@ -23,6 +23,7 @@ dotnet test tests/Emby.StrmBridge.Tests/Emby.StrmBridge.Tests.csproj \
   --no-build --no-restore --configuration Release \
   --disable-build-servers \
   --results-directory "$project_root/.local/test-results"
+node --test tests/subtitle-ui.test.cjs
 "$project_root/scripts/check-privacy.sh"
 
 if git -C "$project_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then

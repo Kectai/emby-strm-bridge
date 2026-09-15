@@ -169,6 +169,9 @@ internal sealed class FfmpegCommandProcessor
         }
     }
 
+    internal Emby.StrmBridge.Subtitles.SharedSubtitleJob? AttachSubtitles(object runner, ref string arguments) =>
+        runtime.SubtitlePatch?.CanServe == true ? runtime.Subtitles?.Shared.Attach(runner, ref arguments) : null;
+
     private async Task<bool> StartNativeIfCurrentAsync(OperationContext operation,
         Func<CancellationToken, Task<bool>> startNative, CancellationToken cancellationToken)
     {

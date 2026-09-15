@@ -1,5 +1,9 @@
 # Compatibility
 
+## Optional embedded text subtitles
+
+Version 0.2.5 adds opt-in MKV text subtitles for exact verified **4.9.5.0 and 4.10.0.40 Web resources**. Only Web playback that the host routes through hls.js is eligible; native-HLS-only playback retains host subtitle handling. Eligible patched Web clients negotiate a shared server-side TS HLS video/subtitle input, using declared codec capabilities and host permissions instead of browser-name rules. Qualifying Web playback now carries video through Emby; third-party client routing is unchanged. Unsupported sources remain native. Actual-host and synthetic browser checks are complemented by recorded Safari, Chrome and IINA live acceptance; they do not cover every media/font combination. See [setup and limits](SUBTITLES.md).
+
 ## Supported baseline
 
 | Component | Target and verification boundary |

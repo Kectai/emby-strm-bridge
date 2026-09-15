@@ -31,6 +31,8 @@ cp "$project_root/docs/STRM_BRIDGE_DESIGN.md" \
   "$project_root/docs/INSTALL.md" \
   "$project_root/docs/SECURITY.md" \
   "$project_root/docs/TESTING.md" \
+  "$project_root/docs/SUBTITLES.md" \
+  "$project_root/docs/SUBTITLE_DESIGN.md" \
   "$stage/docs/"
 find "$stage" -name '.DS_Store' -type f -delete
 # Use one current package timestamp for every entry so source-machine mtimes are not exposed.
@@ -65,7 +67,7 @@ if [ -z "$dated_entries" ] || printf '%s\n' "$dated_entries" | \
 fi
 
 unexpected=$(unzip -Z1 "$archive" | rg -v \
-  '^Emby\.StrmBridge/$|^Emby\.StrmBridge/(Emby\.StrmBridge\.dll|README\.md|LICENSE|CHANGELOG\.md|RELEASE_NOTES\.md|THIRD_PARTY_NOTICES\.md)$|^Emby\.StrmBridge/LICENSES/$|^Emby\.StrmBridge/LICENSES/Lib\.Harmony-LICENSE\.txt$|^Emby\.StrmBridge/docs/$|^Emby\.StrmBridge/docs/(STRM_BRIDGE_DESIGN|COMPATIBILITY|INSTALL|SECURITY|TESTING)\.md$' \
+  '^Emby\.StrmBridge/$|^Emby\.StrmBridge/(Emby\.StrmBridge\.dll|README\.md|LICENSE|CHANGELOG\.md|RELEASE_NOTES\.md|THIRD_PARTY_NOTICES\.md)$|^Emby\.StrmBridge/LICENSES/$|^Emby\.StrmBridge/LICENSES/Lib\.Harmony-LICENSE\.txt$|^Emby\.StrmBridge/docs/$|^Emby\.StrmBridge/docs/(STRM_BRIDGE_DESIGN|COMPATIBILITY|INSTALL|SECURITY|TESTING|SUBTITLES|SUBTITLE_DESIGN)\.md$' \
   || true)
 if [ -n "$unexpected" ]; then
   echo "Package validation failed: the archive contains an unexpected entry."
@@ -74,7 +76,7 @@ if [ -n "$unexpected" ]; then
 fi
 
 entry_count=$(unzip -Z1 "$archive" | wc -l | tr -d ' ')
-if [ "$entry_count" -ne 15 ]; then
+if [ "$entry_count" -ne 17 ]; then
   echo "Package validation failed: the archive allowlist is incomplete."
   exit 1
 fi

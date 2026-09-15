@@ -23,6 +23,8 @@ public static class PluginStrings
     public static string Enabled => Get(nameof(Enabled));
     public static string PlaybackMode => Get(nameof(PlaybackMode));
     public static string PlaybackModeDescription => GetSelectableDescription(nameof(PlaybackModeDescription));
+    public static string EnableSubtitles => Get(nameof(EnableSubtitles));
+    public static string EnableSubtitlesDescription => GetSelectableDescription(nameof(EnableSubtitlesDescription));
     public static string EnableFastSeek => Get(nameof(EnableFastSeek));
     public static string EnableFastSeekDescription => GetSelectableDescription(nameof(EnableFastSeekDescription));
     public static string ExtractAfterLibraryScan => Get(nameof(ExtractAfterLibraryScan));
