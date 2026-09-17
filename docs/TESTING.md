@@ -90,7 +90,7 @@ On an installed 4.10.0.40 host, the 0.2.4 DLL reported all six patches ready. Pl
 <a id="implementation-gaps"></a>
 <a id="release-readiness-20260906"></a>
 
-**Release version: 0.2.5, stable channel.** Automated and actual-host offline checks cover their recorded scope. A complete live matrix across supported players and sources has not been recorded; stable-channel publication does not expand that verification coverage. Run the applicable deployment checks below with the installed build.
+**Release version: 0.2.6, stable channel.** Automated and actual-host offline checks cover their recorded scope. A complete live matrix across supported players and sources has not been recorded; stable-channel publication does not expand that verification coverage. Run the applicable deployment checks below with the installed build.
 
 | Live scenario | Required observation |
 | --- | --- |
@@ -130,3 +130,16 @@ The user confirmed normal real-media playback with the installed preview.19 buil
 Sanitized server records show Safari, Chrome and IINA playback during 22:10–22:15, including reopening and repeated forward/backward position changes. Three subtitle sessions produced 37 shared-output opens; all used hls.js, with a stable mapping within each session even when selecting output from different video jobs. Eleven video FFmpeg jobs shared their media input with subtitle output. The reviewed logs contain no server errors or warnings and no matched FFmpeg HTTP 403/429, conversion, decode or timeout failures. Visual rendering and synchronization acceptance comes from the user's observation, supported by the server-side evidence.
 
 This closes the missing current-build live acceptance for the tested playback scenario. Together with the automated and actual-host checks, the build can proceed to formal release preparation within its documented scope. It does not certify every subtitle/font combination or sustained multi-user load. The release pipeline verifies the final version/tag, committed source and published artifact checksum. Raw logs, URLs, credentials and media titles are not included in release documentation.
+
+### 外挂 ASS/SSA 时间轴回归
+
+`tools/subtitle-external-browser-check.cjs <fixture-directory> <4.9-web-root> <4.10-web-root> <transformed-directory>` 使用本地合成媒体、实际宿主 ASS 加载函数和 hls.js/Octopus，比较原生与修正后的冷续播时钟；随后在已缓冲的连续段内前后跳转六次。测试不连接真实 Emby。合成夹具在播放列表 18 秒处保留 16 秒关键帧，需有 source.ass、cold.ts 和原有 HLS 分片。原生路径复现约 1.98 秒偏差。Chromium/WebKit × 两版网页资源分别检查六次前后跳转后的短字幕颜色与空白间隔，并注入错误工作线程时间确认画布检查能够识别错误。同一连续段只请求一次校时，跳转不重新读取外挂文件。数值映射检查精度为 10 毫秒；它不代表实际显示延迟或视觉同步精度。这是合成回归结论，不能代替用户实片验收。
+
+服务端回归同时核对多个实际封装延迟、用户／播放会话隔离、已完成视频任务、冲突或未知映射和仅校时任务不改视频命令。网页回归覆盖手动字幕延迟、暂停、倍速、未知原点、过期校时响应，以及 4.9/4.10 异步加载完成前切轨的清理。0.2.6 增加失败后的原生时钟恢复、缺失原点的有界等待、切轨复用、输出清理后的校时保留及缓存预算／过期测试。实际宿主 Octopus API 检查确认，校时排除后工作线程立即恢复当前时间、暂停状态和倍速，停止或换轨不会重新启动旧渲染器。短字幕回归同时覆盖有序渲染与同毫秒帧替换。
+
+
+### 外挂字幕实片验收（2026-09-17）
+
+用户确认 0.2.6-preview.1 在 Emby 4.10.0.40 / Safari 中的外挂 ASS 测试正常。已安装 DLL 与验证构建校验值一致。18:49 的 HTTP MKV STRM 续播记录包含一次进度跳变；外挂字幕由宿主正常缓存读取，Clock 请求仅一次且返回 200，实际时间轴映射为 860 ms。视频任务只有一个输入、只有音视频分片输出，没有额外 ASS 提取。该次服务端及 FFmpeg 记录未见匹配的错误、限流或超时。
+
+此项确认本次片源、浏览器及操作；字幕同步的视觉结果依据用户反馈，日志验证的是实际校时路径和请求行为。其他浏览器、两版宿主及反复跳转仍以各自的合成回归记录为依据，不将此次单样本验收泛化到所有片源。

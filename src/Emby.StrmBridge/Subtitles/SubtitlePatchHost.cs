@@ -164,10 +164,11 @@ internal sealed class SubtitlePatchHost : IDisposable
         var arguments = "instance,videoElement,track,item,mediaSource" + (is49 ? "" : ",signal");
         var anchor = "function renderTracksEvents(" + arguments + "){";
         var destruction = "function destroyCustomTrack(instance,videoElement){";
+        var externalAnchor = "function renderWithSubtitlesOctopus(" + arguments + "){";
         var selection = "function setCurrentTrackElement(instance,mediaElement,streamIndex,currentPlayOptions){";
         var manualSelection = is49 ? "self.setSubtitleStreamIndex=function(index){" :
             "HtmlVideoPlayer.prototype.setSubtitleStreamIndex=function(index){";
-        if (source.IndexOf(anchor, StringComparison.Ordinal) < 0 || source.IndexOf(destruction, StringComparison.Ordinal) < 0 || source.IndexOf(selection, StringComparison.Ordinal) < 0 || source.IndexOf(manualSelection, StringComparison.Ordinal) < 0) return null;
+        if (source.IndexOf(externalAnchor, StringComparison.Ordinal) < 0 || source.IndexOf(anchor, StringComparison.Ordinal) < 0 || source.IndexOf(destruction, StringComparison.Ordinal) < 0 || source.IndexOf(selection, StringComparison.Ordinal) < 0 || source.IndexOf(manualSelection, StringComparison.Ordinal) < 0) return null;
         var candidate = "function strmBridgeCandidate(track,mediaSource){return strmBridgeHlsCapable(mediaSource)&&track&&mediaSource&&!track.IsExternal&&track.DeliveryMethod===\"External\"&&/^(ass|ssa|srt|subrip)$/i.test(track.Codec||\"\")&&String(mediaSource.Container).toLowerCase()===\"mkv\"&&String(mediaSource.Protocol).toLowerCase()===\"http\";}";
         var synchronizeSelection = "function strmBridgeSelect(instance,index){var play=instance._currentPlayOptions;var track=play&&(play.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===index;})[0];if(instance.strmBridgeSubtitle||strmBridgeCandidate(track,play&&play.mediaSource)){subtitleTrackIndexToSetOnPlaying=index;if(initialSubtitleTrackTimeout){clearTimeout(initialSubtitleTrackTimeout);initialSubtitleTrackTimeout=null;}}}";
         var wrapper = candidate + synchronizeSelection + "function renderTracksEvents(" + arguments + "){var epoch=instance._strmBridgeEpoch=(instance._strmBridgeEpoch||0)+1;" +
@@ -175,16 +176,42 @@ internal sealed class SubtitlePatchHost : IDisposable
             "if(!strmBridgeCandidate(track,mediaSource))return fallback();" +
             "return Emby.importModule(\"./" + AdapterResource + "\").then(function(adapter){if(instance._strmBridgeEpoch!==epoch)return;return adapter.render({instance:instance,video:videoElement,track:track,item:item,source:mediaSource,epoch:epoch,api:_connectionmanager.default.getApiClient(item),fallback:fallback});},fallback);}" +
             "function renderTracksEventsNative(" + arguments + "){";
+        var externalBegin = source.IndexOf(externalAnchor, StringComparison.Ordinal);
+        var externalEnd = source.IndexOf("function renderAssSsa(", externalBegin, StringComparison.Ordinal);
+        if (externalEnd < 0) return null;
+        var originalExternal = source.Substring(externalBegin, externalEnd - externalBegin);
+        var awaitedExternal = originalExternal;
+        if (is49)
+        {
+            // 4.9 discards both loader promises. Expose renderer completion.
+            awaitedExternal = awaitedExternal.Replace("{loadWebVTT().then(", "{return loadWebVTT().then(")
+                .Replace(";Promise.all([", ";return Promise.all([");
+        }
+        // A previous track's font/content fetch must not install its renderer
+        // after the user has selected another track or stopped playback.
+        awaitedExternal = awaitedExternal.Replace(externalAnchor, externalAnchor + "var sbEpoch=instance._strmBridgeEpoch;")
+            .Replace(".then(function(responses){", ".then(function(responses){if(instance._strmBridgeEpoch!==sbEpoch)return;")
+            // Synchronous blending keeps frames ordered across seek/pause;
+            // asynchronous bitmap decoding can deliver an old cue last.
+            .Replace("lossyRender:null!=window.createImageBitmap", "lossyRender:!strmBridgeClock&&null!=window.createImageBitmap")
+            .Replace("renderMode:null!=window.createImageBitmap", "renderMode:!strmBridgeClock&&null!=window.createImageBitmap");
+        source = source.Replace(originalExternal, awaitedExternal);
+        var externalWrapper = "function renderWithSubtitlesOctopus(" + arguments + "){var epoch=instance._strmBridgeEpoch;" +
+            "function original(correctClock){return renderWithSubtitlesOctopusNative(" + arguments + ",correctClock);}" +
+            "if(!instance._hlsPlayer||!track.IsExternal||!/^ass$|^ssa$/i.test(track.Codec||\"\")||String(mediaSource.Container).toLowerCase()!==\"mkv\"||String(mediaSource.Protocol).toLowerCase()!==\"http\")return original();" +
+            "try{if((new URL(instance._currentPlayOptions.url,document.baseURI).searchParams.get(\"SegmentContainer\")||\"\").toLowerCase()!==\"ts\")return original();}catch(_){return original();}" +
+            "return Emby.importModule(\"./" + AdapterResource + "\").then(function(adapter){if(instance._strmBridgeEpoch!==epoch)return;return original(true).then(function(){if(instance._strmBridgeEpoch===epoch)adapter.bindExternalClock({instance:instance,video:videoElement,track:track,item:item,source:mediaSource,epoch:epoch,api:_connectionmanager.default.getApiClient(item)});});},function(){if(instance._strmBridgeEpoch===epoch)return original();});}" +
+            "function renderWithSubtitlesOctopusNative(" + arguments + ",strmBridgeClock){";
         var initialAnchor = "function startInitialSubtitleTrackTimeout(instance){";
         if (!source.Contains(initialAnchor, StringComparison.Ordinal)) return null;
         var profileAnchor = "_basehtmlplayer.default.call(this),";
         if (source.IndexOf(profileAnchor, StringComparison.Ordinal) < 0) return null;
         var profileWrapper = "function strmBridgeHlsCapable(mediaSource){return window.Worker&&window.ReadableStream&&window.AbortController&&window.TextDecoder&&!_browser.default.chromecast&&_htmlmediahelper.default.enableHlsJsPlayer(mediaSource?mediaSource.RunTimeTicks:null,\"Video\");}function strmBridgeInstallProfile(instance){var getProfile=instance.getDeviceProfile;instance.getDeviceProfile=function(){return getProfile.apply(this,arguments).then(function(profile){if(!strmBridgeHlsCapable(null))return profile;return Object.assign({},profile,{Name:\"" + SharedSubtitleNegotiation.ProfileName + "\"});});};}";
         return source.Replace(initialAnchor, initialAnchor +
-            "var sbPlay=instance._currentPlayOptions,sbTrack=sbPlay&&(sbPlay.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===subtitleTrackIndexToSetOnPlaying;})[0];if(strmBridgeCandidate(sbTrack,sbPlay&&sbPlay.mediaSource)){if(initialSubtitleTrackTimeout){clearTimeout(initialSubtitleTrackTimeout);initialSubtitleTrackTimeout=null;}setCurrentTrackElement(instance,instance._mediaElement,subtitleTrackIndexToSetOnPlaying,sbPlay);return;}").Replace(anchor, profileWrapper + wrapper).Replace(profileAnchor, profileAnchor + "strmBridgeInstallProfile(this),").Replace(manualSelection, manualSelection +
+            "var sbPlay=instance._currentPlayOptions,sbTrack=sbPlay&&(sbPlay.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===subtitleTrackIndexToSetOnPlaying;})[0];if(strmBridgeCandidate(sbTrack,sbPlay&&sbPlay.mediaSource)){if(initialSubtitleTrackTimeout){clearTimeout(initialSubtitleTrackTimeout);initialSubtitleTrackTimeout=null;}setCurrentTrackElement(instance,instance._mediaElement,subtitleTrackIndexToSetOnPlaying,sbPlay);return;}").Replace(externalAnchor, externalWrapper).Replace(anchor, profileWrapper + wrapper).Replace(profileAnchor, profileAnchor + "strmBridgeInstallProfile(this),").Replace(manualSelection, manualSelection +
             "strmBridgeSelect(" + (is49 ? "self" : "this") + ",index);").Replace(selection, selection +
             "if(currentPlayOptions&&mediaElement){var sbTrack=(currentPlayOptions.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===streamIndex;})[0];if(strmBridgeCandidate(sbTrack,currentPlayOptions.mediaSource)){instance.setSubtitleOffset(0);for(var sbI=0;sbI<mediaElement.textTracks.length;sbI++){var sbT=mediaElement.textTracks[sbI];sbT.mode=\"disabled\";removeCueEvents(instance,sbT);}setTrackForCustomDisplay(instance,mediaElement,sbTrack);return;}}").Replace(destruction, destruction +
-            "instance._strmBridgeEpoch=(instance._strmBridgeEpoch||0)+1;if(instance.strmBridgeSubtitle){instance.strmBridgeSubtitle.dispose();instance.strmBridgeSubtitle=null;}");
+            "instance._strmBridgeEpoch=(instance._strmBridgeEpoch||0)+1;if(instance.strmBridgeExternalClock){instance.strmBridgeExternalClock.dispose();instance.strmBridgeExternalClock=null;}if(instance.strmBridgeSubtitle){instance.strmBridgeSubtitle.dispose();instance.strmBridgeSubtitle=null;}");
     }
     public void Dispose()
     {

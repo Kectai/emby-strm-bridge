@@ -1,6 +1,6 @@
-# 内嵌文字字幕
+# Web 文字字幕
 
-适用于 **0.2.5 正式版**。已完成跨浏览器合成媒体检查，并核对验收构建的 Safari、Chrome、IINA 实片播放及多次跳转；验证范围见 [TESTING.md](TESTING.md)。
+**0.2.6 正式版**支持符合范围的 MKV 内嵌文字字幕，并修复外挂 ASS/SSA 在网页续播和跳转后的时间错位、旧帧残留及异常恢复问题。自动化与实片验证范围见 [TESTING.md](TESTING.md)。
 
 ## 使用
 
@@ -12,7 +12,8 @@ Web 开始播放时，插件对符合范围、含支持文字轨道的 MKV 统�
 
 - 网页适配精确匹配 **4.9.5.0 / 4.10.0.40 的已核对原版 Web 资源**；未知或被修改的资源不改写。
 - 所选库中静态 HTTP MKV STRM，视频由 Emby 服务端 FFmpeg 转封装或转码，且存在绑定的播放会话。支持交付方式为 External 的内嵌 ASS/SSA/SubRip。ASS/SSA 复制，SubRip 转为 ASS。
-- 外置字幕、本地视频、PGS/VobSub、烧录轨道、HLS、动态来源和额外来源请求头等情况保留原生处理。第三方播放器直接解析容器时仍使用自身字幕功能。
+- 外挂 ASS/SSA 在上述库、来源和 hls.js 播放条件下校正续播与跳转时间；继续由 Emby 读取字幕及字体，不提取、不改写字幕文件，也不为外挂字幕强制转码。需开启同一个“内嵌文字字幕”开关。
+- 其他外置字幕、本地视频、PGS/VobSub、烧录轨道、HLS、动态来源和额外来源请求头等情况保留原生处理。第三方播放器直接解析容器时仍使用自身字幕功能。
 - 已适配的 Web 客户端通过能力标记参与统一协商，不依赖浏览器名称；需支持 Worker、流式请求，且宿主实际使用 hls.js 播放 MPEG-TS HLS。默认关闭字幕后再选轨也复用当前视频输入。旧缓存页面或不满足能力／权限条件的直连仍无法提供共享字幕。
 - Native 模式关闭本功能。其他视频路由模式不改变共享字幕的本地读取方式。命中的 Web 播放会经 Emby 服务端传输视频。兼容 TS HLS 的音视频允许流复制；不兼容的编码或码率仍由 Emby 按客户端能力和用户权限处理，可能需要编码。没有独立字幕媒体下载。
 - 原生 HLS 专用路径不接管字幕：不修改其播放协商，不建立插件字幕会话，沿用 Emby 自身处理。接管依据宿主能力判断和实际播放实例，不按浏览器名称判断。
@@ -27,7 +28,8 @@ Web 开始播放时，插件对符合范围、含支持文字轨道的 MKV 统�
 | 网页字幕会话 | 64 个，10 分钟无请求后失效 |
 | 视频字幕输出任务 | 最多 8 个运行中任务；局部输出最多保留 64 个，已完成输出按 64 MiB 回收目标和 10 分钟空闲期清理，正在读取的输出暂缓回收 |
 | 并发窗口读取 | 最多 64 个；每次最长 3 分钟；单行字幕最多约 100 万字符 |
-| 每任务文字轨道 | 最多 8 条，超出时不挂接 |
+| 每任务文字轨道 | 内嵌输出最多 8 条；外挂校时不提取轨道，不占提取预算 |
+| 已完成任务校时信息 | 最多 128 份纯元数据，6 小时无请求后清理；清理不重新读取视频 |
 | 每轨临时文件 | FFmpeg 文件限制 16 MiB，最后一个数据包可能略超出；读取另有硬预算 |
 | 已完成临时输出 | 10 分钟无读取后清理，或提前因容量淘汰 |
 | 网页内存 | 有界相邻窗口及仍有效的长事件，最多 16 MiB |
@@ -45,10 +47,13 @@ Web 开始播放时，插件对符合范围、含支持文字轨道的 MKV 统�
 | POST | `/StrmBridge/Subtitles/Sessions` | Id、MediaSourceId、Index、PlaySessionId 绑定播放会话；VideoStartTicks 仅作诊断 |
 | GET | `/StrmBridge/Subtitles/Sessions/{SessionId}/Stream` | StartPositionTicks、EndPositionTicks 指定显示窗口；MSE 另附 MseTimestampOffsetTicks，返回渐进 ASS |
 | DELETE | `/StrmBridge/Subtitles/Sessions/{SessionId}` | 取消所属用户的订阅 |
+| POST | `/StrmBridge/Subtitles/Clock` | 校验用户、来源、外挂轨道及视频会话，返回实际转封装到网页时间轴的偏移；不读取字幕内容 |
 
 400 为非法参数，403 为权限失效，404 为会话失效，409 为来源变化，422 为未接管范围，503 为暂时不可用。视频任务尚未就绪只触发有限重试；已确认的网关直连 MKV 经一次服务端范围检查后遇到 503 不再重试；只有 ReasonCode 为 outside-scope 的 422 才允许原生回退。已经开始输出的响应若失败则中断，不标记为完整字幕。
 
-`STRM_BRIDGE_SUBTITLE_NEGOTIATED` 表示该媒体版本已协商共享 HLS 播放；`STRM_BRIDGE_SUBTITLE_SESSION_BOUND` 记录匹配成功及播放列表/实际输入起点，二者可以不同；`STRM_BRIDGE_SUBTITLE_SESSION_UNAVAILABLE` 表示尚无匹配任务。`STRM_BRIDGE_SUBTITLE_SHARED_ATTACHED` 表示视频命令已挂接字幕输出；`STRM_BRIDGE_SUBTITLE_SHARED_OPEN` 表示网页正在读取对应本地输出。Web 资源状态 Ready 和挂接日志均不等于 Safari 已显示字幕。日志不记录字幕正文、签名 URL 或凭据。SubtitleJobs 表示尚未结束的视频字幕输出任务数。
+`STRM_BRIDGE_SUBTITLE_CLOCK_ATTACHED` 表示仅记录视频时钟；`STRM_BRIDGE_SUBTITLE_EXTERNAL_CLOCK_READY` 表示外挂字幕取得时间映射。
+
+`STRM_BRIDGE_SUBTITLE_NEGOTIATED` 表示该媒体版本已协商共享 HLS 播放；`STRM_BRIDGE_SUBTITLE_SESSION_BOUND` 记录匹配成功及播放列表/实际输入起点，二者可以不同；`STRM_BRIDGE_SUBTITLE_SESSION_UNAVAILABLE` 表示尚无匹配任务。`STRM_BRIDGE_SUBTITLE_SHARED_ATTACHED` 表示视频命令已挂接字幕输出；`STRM_BRIDGE_SUBTITLE_SHARED_OPEN` 表示网页正在读取对应本地输出。Web 资源状态 Ready 和挂接日志均不等于 Safari 已显示字幕。日志不记录字幕正文、签名 URL 或凭据。SubtitleJobs 包括尚未结束的视频字幕输出和外挂字幕时钟任务。
 
 旧准备页面及 API 不恢复，旧独立字幕输入实现已删除。升级或回退后重新加载网页。技术快照 schema 3 与字幕临时输出无关。
 
@@ -59,3 +64,5 @@ Web 开始播放时，插件对符合范围、含支持文字轨道的 MKV 统�
 各浏览器统一使用 WASM 混合渲染，按顺序交付同一毫秒内的字幕帧，避免空白帧覆盖后续字幕更新。尺寸未变化时不重复清空画布。
 
 重复跳转结合本地字幕的开始／结束时间选取输出，避免旧超长事件或局部坏文件阻断新字幕；不将事件最大结束时间视为完整覆盖。局部文件 EOF 不代表整分钟字幕完整，窗口响应标记 partial；网页会有界退避检查后续输出，临时失败自动恢复，权限／来源失效仍停止。首次选轨移除固定 400 ms 等待，并并行加载渲染模块和本地字幕；首次字体解析仍可能产生短暂耗时，不保证零延迟。
+
+外挂 ASS/SSA 的原文件时间不作改写；网页以实际 HLS 连续段原点和视频任务的封装参数换算到原片时间，再应用用户字幕延迟。相同时间原点下的拖动复用校时结果；原点变化时取消旧请求并重新校时。未知映射期间隐藏错误时间的字幕并有限重试，关闭或换轨释放校时器；原生 HLS 专用路径保留宿主行为。

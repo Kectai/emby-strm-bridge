@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6 — 2026-09-17
+
+- Keep external subtitle frames ordered during seeks and replace newer frames produced in the same millisecond.
+- Restore host subtitle playback after failed clock calibration; retain bounded clock metadata after video-output cleanup and reuse calibration across track changes.
+- Correct external ASS/SSA timing during eligible Web HLS resume and seeks using the actual video mux parameters and browser continuity clock. Keep subtitle loading with Emby and do not add media reads.
+- Cancel stale clock requests and preserve manual subtitle delay, pause, track changes and cleanup.
+
 ## 0.2.5 — 2026-09-15
 
 - Add opt-in MKV embedded ASS/SSA/SubRip subtitles for verified Emby 4.9.5.0 and 4.10.0.40 Web resources. Eligible hls.js playback shares one server-side video input with local subtitle output.

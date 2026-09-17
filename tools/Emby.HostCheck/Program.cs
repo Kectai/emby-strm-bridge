@@ -330,6 +330,20 @@ static void CheckSharedRunnerBinding(Assembly hostAssembly, ILogger logger)
         Console.WriteLine("PASS actual Output0.Url binding and browser MSE clock preserved across runner keyframes");
         Console.WriteLine("PASS actual runner command, user, session and seek binding");
         Console.WriteLine("PASS actual HLS 180s segment binds 184.2869822s playlist seek and delivers local ASS");
+        media.MediaStreams[0].IsExternal = true;
+        context.IsExternal = true;
+        context.StreamFingerprint = SubtitleDigest.Streams(media.MediaStreams);
+        context.MseTimestampOffsetTicks = -TimeSpan.FromSeconds(7.9).Ticks;
+        var externalRunner = FormatterServices.GetUninitializedObject(runnerType);
+        commandField.SetValue(externalRunner, command);
+        runnerType.GetField("jobState", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(externalRunner, state);
+        var externalArguments = "-y -i \"" + url + "\" -map 0:0 -sn -segment_format mpegts -segment_start_number 30 -max_delay 5000000 \"" + videoPattern + "\"";
+        var original = externalArguments;
+        var externalJob = output.Attach(externalRunner, ref externalArguments);
+        Require(externalJob is not null && externalArguments == original, "external subtitle changed video command");
+        Require(output.ReadExternalClock(context) == TimeSpan.FromSeconds(2.1).Ticks, "external ASS clock did not use actual host mux mapping");
+        externalJob!.Complete();
+        Console.WriteLine("PASS actual runner external ASS clock, no extra subtitle output or media input");
     }
     finally { runtime.Dispose(); Directory.Delete(root, true); }
 }

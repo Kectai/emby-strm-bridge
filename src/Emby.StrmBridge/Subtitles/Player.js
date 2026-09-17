@@ -82,6 +82,117 @@ define([], function () {
       } finally { writing = false; }
     };
   }
+  // External ASS content and fonts remain owned by the host. Correct only its
+  // renderer clock, using this video's observed MSE origin and server mux map.
+  function bindExternalClock(options) {
+    var instance = options.instance, video = options.video, renderer = instance.currentSubtitlesOctopus;
+    if (!instance._hlsPlayer || !renderer || !options.track.IsExternal) return;
+    // The verified server mapping is for MPEG-TS. Leave fMP4 and unknown
+    // transports on the host clock instead of hiding an unsupported subtitle.
+    try {
+      var containerType = new URL((instance._currentPlayOptions || {}).url, document.baseURI).searchParams.get('SegmentContainer');
+      if (!containerType || containerType.toLowerCase() !== 'ts') return;
+    } catch (_) { return; }
+    if (instance.strmBridgeExternalClock) instance.strmBridgeExternalClock.dispose();
+    var original = {}, closed = false, pending, timeout, animation, timer, key, offset, attempts = 0, retryAt = 0;
+    var revision = 0, rate, lastTime = 0, clockWaitAt;
+    var container = instance.videoSubtitlesElem, visibility = container && container.style.visibility;
+    ['setCurrentTime', 'setIsPaused', 'setRate'].forEach(function (name) { original[name] = renderer[name]; });
+    preserveFrameOrder(renderer);
+    var write = ownClock(renderer);
+    function active() { return !closed && instance._strmBridgeEpoch === options.epoch && instance.currentSubtitlesOctopus === renderer; }
+    function dispose(restorePlayback) {
+      if (closed) return;
+      var resume = restorePlayback === true && active();
+      closed = true; revision++;
+      if (pending) pending.abort();
+      clearTimeout(timeout); clearInterval(timer);
+      if (animation !== undefined) window.cancelAnimationFrame(animation);
+      ['setCurrentTime', 'setIsPaused', 'setRate'].forEach(function (name) { renderer[name] = original[name]; });
+      renderer.timeOffset = -(instance._currentSubtitleOffset || 0) / 1000;
+      if (container) container.style.visibility = visibility;
+      if (instance.strmBridgeExternalClock === handle) instance.strmBridgeExternalClock = null;
+      events.forEach(function (name) { video.removeEventListener(name, tick); });
+      // A live fallback must undo our paused worker, even if the video's playing
+      // event already fired during calibration. Teardown must never revive it.
+      if (resume) {
+        renderer.setRate(video.playbackRate || 1);
+        renderer.setIsPaused(!!video.paused || video.seeking || video.readyState < 3,
+          (video.currentTime || 0) + renderer.timeOffset);
+      }
+    }
+    function request(clock, session) {
+      var current = revision, control = new AbortController(); pending = control; attempts++;
+      timeout = setTimeout(function () { control.abort(); }, 5000);
+      var headers = { 'Content-Type': 'application/json' }, token = options.api.accessToken();
+      if (token) headers['X-Emby-Token'] = token;
+      fetch(options.api.getUrl('StrmBridge/Subtitles/Clock'), { method: 'POST', credentials: 'same-origin', headers: headers, signal: control.signal,
+        body: JSON.stringify({ Id: options.item.Id, MediaSourceId: options.source.Id, Index: options.track.Index,
+          PlaySessionId: session, NativeHlsClock: false, MseTimestampOffsetTicks: clock }) })
+        .then(async function (response) {
+          if (!active() || current !== revision || control.signal.aborted) return;
+          if (response.status === 422) { dispose(true); return; }
+          if (!response.ok) { if (response.status !== 503) attempts = 3; return; }
+          var data = await response.json();
+          if (!active() || current !== revision || control.signal.aborted) return;
+          if (!Number.isSafeInteger(data.TimelineOffsetTicks) || Math.abs(data.TimelineOffsetTicks) > 1200000000) { attempts = 3; return; }
+          offset = data.TimelineOffsetTicks;
+          var cache = instance._strmBridgeExternalClockCache;
+          cache.offsets.set(clock, offset);
+          if (cache.offsets.size > 16) cache.offsets.delete(cache.offsets.keys().next().value);
+        }).catch(function () {}).finally(function () {
+          if (current !== revision) return;
+          clearTimeout(timeout); pending = null; retryAt = Date.now() + attempts * 500;
+          if (active()) {
+            if (offset === undefined && attempts >= 3) { dispose(true); return; }
+            tick();
+          }
+        });
+    }
+    function tick() {
+      if (!active()) { dispose(); return; }
+      var play = instance._currentPlayOptions || {}, session;
+      try { session = new URL(play.url, document.baseURI).searchParams.get('PlaySessionId'); } catch (_) {}
+      if (!instance._hlsPlayer || !session) { dispose(true); return; }
+      var clock = video.seeking ? undefined : mseClock(instance, video.currentTime || 0);
+      if (clock === null || clock === undefined) {
+        if (!video.seeking && video.readyState >= 3) {
+          if (clockWaitAt === undefined) clockWaitAt = Date.now();
+          if (Date.now() - clockWaitAt >= 5000) { dispose(true); return; }
+        } else clockWaitAt = undefined;
+      } else clockWaitAt = undefined;
+      if (clock !== null && clock !== undefined) {
+        var identity = JSON.stringify([options.item.Id, options.source.Id, session]);
+        var cache = instance._strmBridgeExternalClockCache;
+        if (!cache || cache.identity !== identity) cache = instance._strmBridgeExternalClockCache = { identity: identity, offsets: new Map() };
+        var nextKey = identity + ':' + clock;
+        if (key !== nextKey) {
+          revision++; if (pending) pending.abort(); clearTimeout(timeout); pending = null;
+          key = nextKey; offset = cache.offsets.get(clock); attempts = 0; retryAt = 0;
+        }
+        if (offset === undefined && !pending && attempts < 3 && Date.now() >= retryAt) request(clock, session);
+      }
+      var ready = clock !== null && clock !== undefined && offset !== undefined && !video.seeking;
+      if (container) container.style.visibility = ready ? visibility : 'hidden';
+      var changedRate = rate !== video.playbackRate ? video.playbackRate || 1 : null; rate = video.playbackRate;
+      if (ready) {
+        renderer.timeOffset = (play.transcodingOffsetTicks || 0) / 10000000 - offset / 10000000 - (instance._currentSubtitleOffset || 0) / 1000;
+        lastTime = (video.currentTime || 0) + renderer.timeOffset;
+      }
+      // Block both the host's timeupdate and Octopus' independent video listeners.
+      write(!ready || !!video.paused || video.readyState < 3, lastTime, changedRate);
+    }
+    function frame() { animation = undefined; if (!active()) { dispose(); return; } tick(); if (!closed) animation = window.requestAnimationFrame(frame); }
+    var handle = { dispose: dispose }, events = ['timeupdate', 'seeking', 'seeked', 'playing', 'pause', 'waiting', 'ratechange'];
+    instance.strmBridgeExternalClock = handle;
+    events.forEach(function (name) { video.addEventListener(name, tick); });
+    tick();
+    if (!closed) {
+      if (typeof window.requestAnimationFrame === 'function' && typeof window.cancelAnimationFrame === 'function') animation = window.requestAnimationFrame(frame);
+      else timer = setInterval(tick, 50);
+    }
+    return handle;
+  }
   function render(options) {
     var instance = options.instance, video = options.video, api = options.api;
     if (!instance._hlsPlayer) return Promise.resolve().then(function () {
@@ -445,5 +556,5 @@ define([], function () {
     }
     return start().catch(function (error) { if (active()) { diagnostic('start', error); dispose(); } });
   }
-  return { render: render, mseClock: mseClock, ownClock: ownClock, preserveFrameOrder: preserveFrameOrder, parse: parse, merge: merge, activeEvent: activeEvent };
+  return { render: render, bindExternalClock: bindExternalClock, mseClock: mseClock, ownClock: ownClock, preserveFrameOrder: preserveFrameOrder, parse: parse, merge: merge, activeEvent: activeEvent };
 });

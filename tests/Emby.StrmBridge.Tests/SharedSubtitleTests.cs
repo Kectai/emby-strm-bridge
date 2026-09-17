@@ -399,6 +399,117 @@ public sealed class SharedSubtitleTests
         Assert.IsFalse(SharedSubtitleStream.Intersects(Cue, TimeSpan.FromSeconds(29).Ticks, TimeSpan.FromSeconds(60).Ticks));
     }
 
+    [TestMethod]
+    [DataRow(5000000L, -79000000L, 21000000L)]
+    [DataRow(700000L, -14000000L, 0L)]
+    public async Task ExternalAssReadsActualMuxClockWithoutExtractingOrChangingVideo(long delay, long mse, long expected)
+    {
+        using var f = new Fixture();
+        f.Context.IsExternal = true;
+        f.Context.MseTimestampOffsetTicks = mse;
+        var runner = new FakeRunner(f.InputUrl, f.Context, Path.Combine(f.Root, "%d.ts"));
+        var original = "-y -i \"" + f.InputUrl + "\" -segment_format mpegts -segment_start_number 4 -max_delay " + delay;
+        var arguments = original;
+        Assert.IsNotNull(f.Output.Attach(runner, ref arguments));
+        Assert.AreEqual(original, arguments, "External tracks must never become FFmpeg outputs.");
+        Assert.AreEqual(0, Directory.GetFiles(f.Root, "*.ass", SearchOption.AllDirectories).Length);
+        Assert.AreEqual(expected, f.Output.ReadExternalClock(f.Context));
+        Assert.AreEqual(0, f.Runtime.Gateway!.ActiveRequests);
+        var problem = await Assert.ThrowsExactlyAsync<SubtitleProblem>(() => f.Output.OpenAsync(f.Context, CancellationToken.None));
+        Assert.AreEqual("outside-scope", problem.Reason, "Clock access must not grant a subtitle stream.");
+        var user = f.Context.UserId; f.Context.UserId = Guid.NewGuid();
+        Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+        f.Context.UserId = user;
+        runner.Exit();
+        Assert.AreEqual(expected, f.Output.ReadExternalClock(f.Context), "Buffered video can outlive its FFmpeg runner.");
+        f.Context.PlaySessionId = "another-play";
+        Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+    }
+
+    [TestMethod]
+    public void ExternalClockRejectsUnknownOrConflictingRunnerMappings()
+    {
+        using var f = new Fixture(); f.Context.IsExternal = true;
+        var unknown = "-y -i \"" + f.InputUrl + "\" video.ts";
+        Assert.IsNull(f.Output.Attach(f.Runner(), ref unknown));
+        foreach (var delay in new[] { 5000000, 700000 })
+        {
+            var runner = new FakeRunner(f.InputUrl, f.Context, Path.Combine(f.Root, "%d.ts"));
+            var arguments = "-y -i \"" + f.InputUrl + "\" -segment_format mpegts -segment_start_number 4 -max_delay " + delay;
+            Assert.IsNotNull(f.Output.Attach(runner, ref arguments));
+            runner.Exit();
+        }
+        var problem = Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+        Assert.AreEqual("timeline-unavailable", problem.Reason);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ExternalClockIsIndependentOfExtractionTrackBudget(bool embedded)
+    {
+        using var f = new Fixture(); f.Context.IsExternal = true;
+        var streams = Enumerable.Range(1, 10).Select(i => new MediaStream
+        { Index = i, Type = MediaStreamType.Subtitle, Codec = "ass", IsExternal = !embedded || i == 1 }).ToList();
+        var runner = new FakeRunner(f.InputUrl, f.Context, Path.Combine(f.Root, "%d.ts"), streams);
+        var original = "-y -i \"" + f.InputUrl + "\" -segment_format mpegts -segment_start_number 4 -max_delay 700000";
+        var arguments = original;
+        Assert.IsNotNull(f.Output.Attach(runner, ref arguments));
+        Assert.AreEqual(original, arguments);
+        Assert.AreEqual(14000000L, f.Output.ReadExternalClock(f.Context));
+        runner.Exit();
+    }
+
+    [TestMethod]
+    public void CompletedExternalClockSurvivesFileCleanupButKeepsAuthorizationAndInvalidation()
+    {
+        using var f = new Fixture(); f.Context.IsExternal = true;
+        var runner = new FakeRunner(f.InputUrl, f.Context, Path.Combine(f.Root, "%d.ts"));
+        var arguments = "-y -i \"" + f.InputUrl + "\" -segment_format mpegts -segment_start_number 4 -max_delay 700000";
+        var job = f.Output.Attach(runner, ref arguments)!;
+        runner.Exit();
+        typeof(SharedSubtitleJob).GetProperty("LastUsed", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(job, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(11));
+        typeof(SharedSubtitleOutput).GetMethod("Sweep", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(f.Output, null);
+        Assert.AreEqual(0, Directory.GetDirectories(f.Root).Length, "Only clock metadata survives, not runner outputs.");
+        Assert.AreEqual(14000000L, f.Output.ReadExternalClock(f.Context));
+        var user = f.Context.UserId; f.Context.UserId = Guid.NewGuid();
+        Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+        f.Context.UserId = user;
+        f.Context.Index = 2;
+        Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+        f.Context.Index = 1;
+        f.Output.Clear();
+        Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+    }
+
+    [TestMethod]
+    public void RetainedExternalClockBudgetAndExpiryAreBounded()
+    {
+        using var f = new Fixture(); f.Context.IsExternal = true;
+        var sweep = typeof(SharedSubtitleOutput).GetMethod("Sweep", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var lastUsed = typeof(SharedSubtitleJob).GetProperty("LastUsed", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        for (var i = 0; i < SharedSubtitleOutput.MaximumRetainedClocks + 1; i++)
+        {
+            f.Context.PlaySessionId = "play-" + i;
+            var runner = new FakeRunner(f.InputUrl, f.Context, Path.Combine(f.Root, "%d.ts"));
+            var arguments = "-y -i \"" + f.InputUrl + "\" -segment_format mpegts -segment_start_number 4 -max_delay 700001";
+            var job = f.Output.Attach(runner, ref arguments)!;
+            f.Context.MseTimestampOffsetTicks = -50001;
+            var before = f.Output.ReadExternalClock(f.Context);
+            runner.Exit(); lastUsed.SetValue(job, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(11)); sweep.Invoke(f.Output, null);
+            Assert.AreEqual(before, f.Output.ReadExternalClock(f.Context), "Retention preserves unrounded mux parameters.");
+        }
+        var clocks = (List<ExternalSubtitleClock>)typeof(SharedSubtitleOutput).GetField("clocks", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(f.Output)!;
+        Assert.AreEqual(SharedSubtitleOutput.MaximumRetainedClocks, clocks.Count);
+        f.Context.PlaySessionId = "play-0";
+        Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+        f.Context.PlaySessionId = "play-" + SharedSubtitleOutput.MaximumRetainedClocks;
+        foreach (var clock in clocks) clock.LastUsed = DateTimeOffset.UtcNow - SharedSubtitleOutput.ClockRetention - TimeSpan.FromMinutes(1);
+        Assert.ThrowsExactly<SubtitleProblem>(() => f.Output.ReadExternalClock(f.Context));
+        Assert.AreEqual(0, clocks.Count);
+    }
+
     private sealed class Fixture : IDisposable
     {
         private readonly TestWorkspace workspace = new();
@@ -440,20 +551,21 @@ public sealed class SharedSubtitleTests
         private readonly object command;
         private readonly object jobState;
         public event EventHandler<GenericEventArgs<int>>? Exited;
-        internal FakeRunner(string url, SubtitleRequestContext context)
+        internal FakeRunner(string url, SubtitleRequestContext context, string? output = null, List<MediaStream>? streams = null)
         {
             command = new
             {
                 Input0 = new { Url = url, Options = new { ss = TimeSpan.FromTicks(context.VideoStartTicks) } },
+                Output0 = new { Url = output },
                 Options = new { copyts = true, start_at_zero = true }
             };
             var media = new MediaSourceInfo
             {
                 Id = context.MediaSourceId,
                 Container = "mkv",
-                MediaStreams = new List<MediaStream> {
+                MediaStreams = streams ?? new List<MediaStream> {
                     new() { Index = 0, Type = MediaStreamType.Video, Codec = "h264" },
-                    new() { Index = 1, Type = MediaStreamType.Subtitle, Codec = "ass" } }
+                    new() { Index = 1, Type = MediaStreamType.Subtitle, Codec = "ass", IsExternal = context.IsExternal } }
             };
             context.StreamFingerprint = SubtitleDigest.Streams(media.MediaStreams);
             jobState = new

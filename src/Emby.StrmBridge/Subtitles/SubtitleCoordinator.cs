@@ -24,6 +24,7 @@ internal sealed class SubtitleRequestContext
     // Informational playlist seek hint; HLS segment starts intentionally differ.
     internal long VideoStartTicks;
     internal bool NativeHlsClock;
+    internal bool IsExternal;
     internal long? MseTimestampOffsetTicks;
     internal string PlaySessionId = string.Empty;
     internal string MediaSourceId = string.Empty;
@@ -54,7 +55,7 @@ internal sealed class SubtitleCoordinator : IDisposable
     }
     internal SubtitlePlaybackSession CreateSession(SubtitleRequestContext context)
     {
-        if (context.NativeHlsClock) throw new SubtitleProblem("outside-scope");
+        if (context.NativeHlsClock || context.IsExternal) throw new SubtitleProblem("outside-scope");
         if (string.IsNullOrEmpty(context.PlaySessionId) || !Shared.HasSession(context))
             throw new SubtitleProblem("video-input-unavailable");
         lock (sync)
@@ -95,6 +96,13 @@ internal sealed class SubtitleCoordinator : IDisposable
         var linked = CancellationTokenSource.CreateLinkedTokenSource(token, sessionToken, operation.CancellationToken, lifetime.Token);
         try { var stream = await Shared.OpenAsync(context, linked.Token).ConfigureAwait(false); stream.RequestLifetime = linked; return stream; }
         catch { linked.Dispose(); throw; }
+    }
+    internal long ReadExternalClock(SubtitleRequestContext context)
+    {
+        if (!CheckAccess(context)) throw new SubtitleProblem("authorization-changed");
+        var offset = Shared.ReadExternalClock(context);
+        logger.Debug("STRM_BRIDGE_SUBTITLE_EXTERNAL_CLOCK_READY timeline_offset_ms=" + offset / 10000);
+        return offset;
     }
     private bool CheckAccess(SubtitleRequestContext request)
     {

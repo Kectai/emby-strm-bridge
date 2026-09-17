@@ -109,3 +109,42 @@ async function checkProfileMarker(version) {
  console.log('PASS Web capability negotiation marker and unsupported-engine guard '+version);
 }
 (async()=>{for(const v of ['4.9.5.0','4.10.0.40'])await checkProfileMarker(v);})().catch(e=>{console.error(e);process.exitCode=1;});
+
+// External ASS keeps the host's loader; only its observable HLS clock is bound.
+async function checkExternalClockDispatch(version) {
+ const src=fs.readFileSync(require('node:path').join(process.argv[2] || '.local/subtitle-implementation','web-'+version+'.js'),'utf8');
+ const start=src.indexOf('function renderWithSubtitlesOctopus('),end=src.indexOf('function renderWithSubtitlesOctopusNative(',start);
+ assert.ok(start>=0&&end>start);
+ let native=0,clocks=0,imports=0;const renderFlags=[];
+ const scope={URL,document:{baseURI:'http://localhost/web/index.html'},Emby:{importModule:async()=>{imports++;return{bindExternalClock:()=>clocks++};}},
+   renderWithSubtitlesOctopusNative:async(...args)=>{native++;renderFlags.push(args.at(-1));},_connectionmanager:{default:{getApiClient:()=>({})}}};
+ vm.createContext(scope);vm.runInContext(src.slice(start,end),scope);
+ const instance={_hlsPlayer:{},_strmBridgeEpoch:1,_currentPlayOptions:{url:'http://localhost/master.m3u8?SegmentContainer=ts'}};
+ const track={IsExternal:true,Codec:'ass'},media={Container:'mkv',Protocol:'Http'};
+ await scope.renderWithSubtitlesOctopus(instance,{},track,{},media);assert.equal(native,1);assert.equal(clocks,1);assert.equal(renderFlags[0],true);
+ for(const [player,t,m] of [[instance,{...track,IsExternal:false},media],[{},track,media],[instance,track,{...media,Protocol:'File'}],[instance,{...track,Codec:'srt'},media]])
+   await scope.renderWithSubtitlesOctopus(player,{},t,{},m);
+ assert.equal(native,5);assert.equal(clocks,1);assert.equal(imports,1);assert.ok(renderFlags.slice(1).every(v=>v===undefined));
+ let release;scope.Emby.importModule=()=>new Promise(r=>{release=r;});
+ const delayed=scope.renderWithSubtitlesOctopus(instance,{},track,{},media);instance._strmBridgeEpoch++;
+ release({bindExternalClock:()=>clocks++});await delayed;assert.equal(native,5);assert.equal(clocks,1);
+ console.log('PASS external ASS host loading, clock-only dispatch, scope and stale-import exclusion '+version);
+}
+(async()=>{for(const v of ['4.9.5.0','4.10.0.40'])await checkExternalClockDispatch(v);})().catch(e=>{console.error(e);process.exitCode=1;});
+
+async function checkExternalLoaderEpoch(version) {
+ const src=fs.readFileSync(require('node:path').join(process.argv[2] || '.local/subtitle-implementation','web-'+version+'.js'),'utf8');
+ const begin=src.indexOf('function renderWithSubtitlesOctopusNative('),end=src.indexOf('function renderAssSsa(',begin);
+ let release,constructed=0;
+ const scope={window:{},_browser:{default:{}},fetch:()=>{},getTextTrackUrl:()=>'/fixture.ass',loadWebVTT:async()=>{},
+   fetchSubtitleContent:async()=>'',getFallbackFontUrl:async()=>'/fixture.woff2',
+   Emby:{importModule:()=>new Promise(resolve=>{release=()=>resolve(function(){constructed++;});})}};
+ vm.createContext(scope);vm.runInContext(src.slice(begin,end),scope);
+ const instance={_strmBridgeEpoch:1};
+ const pending=scope.renderWithSubtitlesOctopusNative(instance,{},{},{},{});
+ assert.equal(typeof pending?.then,'function','Both host loaders must expose renderer completion.');
+ await new Promise(resolve=>setImmediate(resolve));instance._strmBridgeEpoch++;
+ release();await pending;assert.equal(constructed,0);
+ console.log('PASS stale native ASS content/font response cannot recreate a closed track '+version);
+}
+(async()=>{for(const v of ['4.9.5.0','4.10.0.40'])await checkExternalLoaderEpoch(v);})().catch(e=>{console.error(e);process.exitCode=1;});

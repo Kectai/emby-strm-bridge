@@ -23,6 +23,8 @@ internal sealed class SharedSubtitleOutput : IDisposable
 {
     internal const int MaximumJobs = 8;
     internal const int MaximumRetainedJobs = 64;
+    internal const int MaximumRetainedClocks = 128;
+    internal static readonly TimeSpan ClockRetention = TimeSpan.FromHours(6);
     internal const long MaximumRetainedBytes = 64 * 1024 * 1024;
     internal const int MaximumTracks = 8;
     internal const int MaximumReaders = 64;
@@ -30,6 +32,7 @@ internal sealed class SharedSubtitleOutput : IDisposable
     private static readonly TimeSpan MaximumOpenWait = TimeSpan.FromSeconds(10);
     private readonly object sync = new();
     private readonly List<SharedSubtitleJob> jobs = new();
+    private readonly List<ExternalSubtitleClock> clocks = new();
     private readonly PluginRuntime runtime;
     private readonly ILogger logger;
     private readonly string directory;
@@ -85,7 +88,11 @@ internal sealed class SharedSubtitleOutput : IDisposable
                 !runtime.Tickets.MatchesTranscodeInput(ticket, payload.ItemId, source.Id, userId.ToString("N"),
                     payload.Source, runtime.Generation)) return null;
             var tracks = (source.MediaStreams ?? new List<MediaStream>()).Where(IsTextTrack).ToArray();
-            if (tracks.Length == 0 || tracks.Length > MaximumTracks || tracks.Select(t => t.Index).Distinct().Count() != tracks.Length)
+            var external = (source.MediaStreams ?? new List<MediaStream>()).Where(IsExternalAssTrack).Select(t => t.Index).ToArray();
+            // The extraction budget does not apply to host-loaded sidecars.
+            if (tracks.Length > MaximumTracks) tracks = Array.Empty<MediaStream>();
+            if ((tracks.Length == 0 && external.Length == 0) ||
+                tracks.Select(t => t.Index).Concat(external).Distinct().Count() != tracks.Length + external.Length)
                 return null;
             var exitEvent = runner.GetType().GetEvent("Exited");
             if (exitEvent?.EventHandlerType != typeof(EventHandler<GenericEventArgs<int>>)) return null;
@@ -94,16 +101,17 @@ internal sealed class SharedSubtitleOutput : IDisposable
             var hasAudio = source.MediaStreams!.Any(stream => stream.Type == MediaStreamType.Audio &&
                 System.Text.RegularExpressions.Regex.IsMatch(originalArguments, @"(^|\s)-map\s+0:" + stream.Index + @"(\s|$)"));
             var timeline = SharedSubtitleTimeline.Create(arguments, Property(Property(command, "Output0"), "Url") as string, requestedStart, hasAudio);
+            if (tracks.Length == 0 && timeline is null) return null;
             lock (sync)
             {
                 if (disposed || jobs.Any(j => ReferenceEquals(j.Runner, runner))) return null;
                 foreach (var old in jobs.Where(j => j.Completed && !j.HasReaders).OrderBy(j => j.LastUsed).ToArray())
                 {
                     if (jobs.Count < MaximumRetainedJobs && jobs.Where(j => j.Completed).Sum(j => j.OutputBytes) <= MaximumRetainedBytes) break;
-                    old.Revoke(); old.Dispose(); jobs.Remove(old);
+                    RetainClock(old); old.Revoke(); old.Dispose(); jobs.Remove(old);
                 }
                 if (jobs.Count >= MaximumRetainedJobs || jobs.Count(j => !j.Completed) >= MaximumJobs) return null;
-                job = new SharedSubtitleJob(directory, runner, payload, userId, playSession!, start, requestedStart, tracks, SubtitleDigest.Streams(source.MediaStreams!), timeline);
+                job = new SharedSubtitleJob(directory, runner, payload, userId, playSession!, start, requestedStart, tracks, SubtitleDigest.Streams(source.MediaStreams!), timeline, external);
                 var captured = job;
                 EventHandler<GenericEventArgs<int>> handler = (_, _) => captured.Complete();
                 exitEvent.AddEventHandler(runner, handler);
@@ -111,7 +119,8 @@ internal sealed class SharedSubtitleOutput : IDisposable
                 jobs.Add(job);
                 arguments += job.OutputArguments;
             }
-            logger.Info("STRM_BRIDGE_SUBTITLE_SHARED_ATTACHED tracks=" + tracks.Length + " start_ms=" + start / 10000);
+            logger.Info((tracks.Length == 0 ? "STRM_BRIDGE_SUBTITLE_CLOCK_ATTACHED" : "STRM_BRIDGE_SUBTITLE_SHARED_ATTACHED") +
+                " tracks=" + tracks.Length + " start_ms=" + start / 10000);
             return job;
         }
         catch (Exception exception)
@@ -120,6 +129,32 @@ internal sealed class SharedSubtitleOutput : IDisposable
             if (job is not null) { job.Complete(); job.Revoke(); lock (sync) jobs.Remove(job); }
             logger.Warn("STRM_BRIDGE_SUBTITLE_SHARED_SKIPPED error=" + exception.GetType().Name);
             return null;
+        }
+    }
+
+    // External ASS stays on SubtitleService. Only the source-to-MSE clock is read
+    // here; no subtitle file, media request or additional FFmpeg input is opened.
+    internal long ReadExternalClock(SubtitleRequestContext context)
+    {
+        if (!context.IsExternal || context.NativeHlsClock) throw new SubtitleProblem("outside-scope");
+        if (!context.MseTimestampOffsetTicks.HasValue) throw new SubtitleProblem("timeline-unavailable");
+        lock (sync)
+        {
+            PruneClocks();
+            var candidates = disposed ? Array.Empty<SharedSubtitleJob>() : jobs.Where(j => j.Matches(context)).ToArray();
+            var retained = disposed ? Array.Empty<ExternalSubtitleClock>() : clocks.Where(c => c.Matches(context)).ToArray();
+            if (candidates.Length == 0 && retained.Length == 0) throw new SubtitleProblem("video-input-unavailable");
+            if (candidates.Any(j => j.Timeline is null) || retained.Any(c => !c.MuxDelay.HasValue))
+                throw new SubtitleProblem("timeline-unavailable");
+            // Retain only authenticated clock metadata after output-file cleanup.
+            // Old and new runners must still agree, including after eviction.
+            var offsets = candidates.Select(j => j.Timeline!.MapMseOffset(context.MseTimestampOffsetTicks.Value))
+                .Concat(retained.Select(c => SharedSubtitleTimeline.MapMseOffset(c.MuxDelay!.Value, context.MseTimestampOffsetTicks.Value)))
+                .Distinct().ToArray();
+            if (offsets.Length != 1) throw new SubtitleProblem("timeline-unavailable");
+            foreach (var job in candidates) job.Touch();
+            foreach (var clock in retained) clock.LastUsed = DateTimeOffset.UtcNow;
+            return offsets[0];
         }
     }
 
@@ -145,7 +180,7 @@ internal sealed class SharedSubtitleOutput : IDisposable
     }
     private async Task<SharedSubtitleStream> OpenWithinDeadlineAsync(SubtitleRequestContext context, CancellationToken cancellation, CancellationToken requestCancellation)
     {
-        if (context.NativeHlsClock) throw new SubtitleProblem("outside-scope");
+        if (context.NativeHlsClock || context.IsExternal) throw new SubtitleProblem("outside-scope");
         if (!context.MseTimestampOffsetTicks.HasValue)
             throw new SubtitleProblem("timeline-unavailable");
         // A video seek may start a new runner just after the browser requests subtitles.
@@ -223,25 +258,43 @@ internal sealed class SharedSubtitleOutput : IDisposable
 
     internal void Clear()
     {
-        lock (sync) foreach (var job in jobs) job.Revoke();
+        lock (sync)
+        {
+            clocks.Clear();
+            foreach (var job in jobs) job.Revoke();
+        }
         Sweep();
+    }
+    private void PruneClocks()
+    {
+        clocks.RemoveAll(c => !runtime.IsOperationCurrent(c.Generation) || DateTimeOffset.UtcNow - c.LastUsed > ClockRetention);
+    }
+    private void RetainClock(SharedSubtitleJob job)
+    {
+        if (disposed || job.Revoked || !runtime.IsOperationCurrent(job.Generation)) return;
+        var clock = job.CopyExternalClock();
+        if (clock is null) return;
+        PruneClocks();
+        if (clocks.Count >= MaximumRetainedClocks) clocks.Remove(clocks.OrderBy(c => c.LastUsed).First());
+        clocks.Add(clock);
     }
     private void Sweep()
     {
         lock (sync)
         {
+            PruneClocks();
             foreach (var job in jobs.ToArray())
             {
                 if (!runtime.IsOperationCurrent(job.Generation)) job.Revoke();
                 if (job.Completed && (job.Revoked || DateTimeOffset.UtcNow - job.LastUsed > TimeSpan.FromMinutes(10)))
                 {
-                    job.Revoke(); job.Dispose(); jobs.Remove(job);
+                    RetainClock(job); job.Revoke(); job.Dispose(); jobs.Remove(job);
                 }
             }
             foreach (var job in jobs.Where(j => j.Completed && !j.HasReaders).OrderBy(j => j.LastUsed).ToArray())
             {
                 if (jobs.Where(j => j.Completed).Sum(j => j.OutputBytes) <= MaximumRetainedBytes) break;
-                job.Revoke(); job.Dispose(); jobs.Remove(job);
+                RetainClock(job); job.Revoke(); job.Dispose(); jobs.Remove(job);
             }
         }
     }
@@ -250,7 +303,7 @@ internal sealed class SharedSubtitleOutput : IDisposable
         lock (sync)
         {
             if (disposed) return;
-            disposed = true; maintenance.Dispose();
+            disposed = true; maintenance.Dispose(); clocks.Clear();
             // Do not stop the video process or unlink files it is still writing.
             foreach (var job in jobs) job.Revoke();
         }
@@ -259,6 +312,9 @@ internal sealed class SharedSubtitleOutput : IDisposable
     internal static bool IsTextTrack(MediaStream stream) => stream.Index >= 0 &&
         stream.Type == MediaStreamType.Subtitle && !stream.IsExternal &&
         stream.Codec?.ToLowerInvariant() is "ass" or "ssa" or "srt" or "subrip";
+    internal static bool IsExternalAssTrack(MediaStream stream) => stream.Index >= 0 &&
+        stream.Type == MediaStreamType.Subtitle && stream.IsExternal &&
+        stream.Codec?.ToLowerInvariant() is "ass" or "ssa";
     private static object? Property(object? value, string name) => value?.GetType()
         .GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(value);
     private static object? Field(object value, string name) => value.GetType()
@@ -281,6 +337,7 @@ internal sealed class SharedSubtitleJob : IDisposable
     private readonly string directory;
     private readonly FileStream owner;
     private readonly Dictionary<int, string> files = new();
+    private readonly HashSet<int> externalTracks;
     private readonly Dictionary<int, SharedSubtitleCoverage> coverage = new();
     private readonly TicketPayload payload;
     private readonly Guid user;
@@ -317,9 +374,10 @@ internal sealed class SharedSubtitleJob : IDisposable
     internal string OutputArguments { get; }
 
     internal SharedSubtitleJob(string root, object runner, TicketPayload payload, Guid user, string playSession,
-        long start, long requestedStart, IEnumerable<MediaStream> tracks, string streamFingerprint, SharedSubtitleTimeline? timeline = null)
+        long start, long requestedStart, IEnumerable<MediaStream> tracks, string streamFingerprint, SharedSubtitleTimeline? timeline = null, IEnumerable<int>? externalTracks = null)
     {
         this.streamFingerprint = streamFingerprint; Timeline = timeline;
+        this.externalTracks = new HashSet<int>(externalTracks ?? Array.Empty<int>());
         Runner = runner; this.payload = payload; this.user = user; this.playSession = playSession; Start = start; RequestedStart = requestedStart;
         directory = Path.Combine(root, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
@@ -350,7 +408,8 @@ internal sealed class SharedSubtitleJob : IDisposable
     }
     internal bool Matches(SubtitleRequestContext context) => !Revoked && context.Generation == Generation &&
         user == context.UserId && payload.ItemId == context.ItemId && payload.MediaSourceId == context.MediaSourceId &&
-        playSession == context.PlaySessionId && streamFingerprint == context.StreamFingerprint && payload.Source.HasSameFileVersion(context.Source) && files.ContainsKey(context.Index);
+        playSession == context.PlaySessionId && streamFingerprint == context.StreamFingerprint && payload.Source.HasSameFileVersion(context.Source) &&
+        (context.IsExternal ? externalTracks.Contains(context.Index) : files.ContainsKey(context.Index));
     // The playlist seek is not a job identifier: DynamicHlsService replaces it
     // with the requested segment's start before starting FFmpeg. The URL also
     // stays unchanged during a native HLS seek. Use the actual display window.
@@ -370,6 +429,10 @@ internal sealed class SharedSubtitleJob : IDisposable
             return stream;
         }
     }
+    internal void Touch() { lock (sync) { LastUsed = DateTimeOffset.UtcNow; } }
+    internal ExternalSubtitleClock? CopyExternalClock() => externalTracks.Count == 0 ? null :
+        new ExternalSubtitleClock(payload, user, playSession, streamFingerprint, externalTracks, Timeline?.MuxDelay);
+
     internal void ObserveStart(bool ready)
     {
         if (!ready) Revoke();
@@ -521,4 +584,26 @@ internal sealed class SharedSubtitleStream : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
+// No runner, output files, readers or process handles survive in this bounded cache.
+internal sealed class ExternalSubtitleClock
+{
+    private readonly TicketPayload payload;
+    private readonly Guid user;
+    private readonly string session;
+    private readonly string fingerprint;
+    private readonly HashSet<int> tracks;
+    internal int Generation => payload.RuntimeGeneration;
+    internal long? MuxDelay { get; }
+    internal DateTimeOffset LastUsed { get; set; } = DateTimeOffset.UtcNow;
+    internal ExternalSubtitleClock(TicketPayload payload, Guid user, string session, string fingerprint, IEnumerable<int> tracks, long? muxDelay)
+    {
+        this.payload = payload; this.user = user; this.session = session; this.fingerprint = fingerprint;
+        this.tracks = new HashSet<int>(tracks); MuxDelay = muxDelay;
+    }
+    internal bool Matches(SubtitleRequestContext context) => context.IsExternal && context.Generation == Generation &&
+        context.UserId == user && context.ItemId == payload.ItemId && context.MediaSourceId == payload.MediaSourceId &&
+        context.PlaySessionId == session && context.StreamFingerprint == fingerprint && tracks.Contains(context.Index) &&
+        payload.Source.HasSameFileVersion(context.Source);
 }

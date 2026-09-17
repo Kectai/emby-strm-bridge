@@ -601,3 +601,177 @@ test('invalid UTF-8 terminates the current subtitle while network read failures 
     assert.equal(h.calls.filter(c => c.options.method === 'GET').length, reads);
   } finally { h.options.instance.strmBridgeSubtitle?.dispose(); }
 });
+
+function externalClockHarness() {
+  let adapter;
+  let now = 0;
+  const requests = [], responses = [], times = [], events = new Map();
+  const video = { currentTime: 975.2, paused: false, seeking: false, readyState: 4, playbackRate: 1,
+    addEventListener(name, fn) { events.set(name, fn); }, removeEventListener(name) { events.delete(name); } };
+  const renderer = { worker: {}, timeOffset: 0, setCurrentTime(time) { times.push(time); },
+    setIsPaused(paused, time) { this.paused = paused; this.setCurrentTime(time); }, setRate(rate) { this.rate = rate; },
+    onTimeUpdate(time) { this.setCurrentTime(time + this.timeOffset); } };
+  const instance = { _strmBridgeEpoch: 1, currentSubtitlesOctopus: renderer, videoSubtitlesElem: { style: { visibility: '' } },
+    _currentPlayOptions: { url: 'http://localhost/master.m3u8?PlaySessionId=fixture&SegmentContainer=ts&api_key=private-value' },
+    _hlsPlayer: { streamController: { fragPlaying: { start: 0, duration: 2000, cc: 0 }, initPTS: [{ baseTime: 711000, timescale: 90000 }] } } };
+  vm.runInNewContext(source, { define: (_, make) => { adapter = make(); }, Date: { now: () => now }, window: {}, document: { baseURI: 'http://localhost/web/index.html' },
+    AbortController, URL, setInterval, clearInterval, setTimeout, clearTimeout,
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      const queued = responses.shift(); if (queued) return await queued;
+      const clock = JSON.parse(options.body).MseTimestampOffsetTicks;
+      return { ok: true, status: 200, json: async () => ({ TimelineOffsetTicks: 100000000 + clock }) };
+    } });
+  const options = { instance, video, epoch: 1, item: { Id: 'item' }, source: { Id: 'source' }, track: { Index: 2, IsExternal: true },
+    api: { getUrl: x => 'http://localhost/' + x, accessToken: () => 'fixture-only' } };
+  return { adapter, options, instance, renderer, video, requests, responses, times, events, advance(ms) { now += ms; } };
+}
+
+test('external ASS uses source clock at resume and cached seeks, without opening subtitle sessions', async () => {
+  const h = externalClockHarness(); const native = h.renderer.setCurrentTime;
+  const handle = h.adapter.bindExternalClock(h.options);
+  try {
+    await sleep(20);
+    assert.ok(Math.abs(h.times.at(-1) - 973.1) < 1e-6, 'Native 975.2 s must map back to source 973.1 s.');
+    h.renderer.onTimeUpdate(1);
+    assert.ok(Math.abs(h.times.at(-1) - 973.1) < 1e-6, 'A stale host callback must not undo the corrected clock.');
+    h.instance._currentSubtitleOffset = 500;
+    for (const time of [1300, 120, 975, 1500, 200]) {
+      h.video.seeking = true; h.video.currentTime = time; h.events.get('seeking')();
+      assert.equal(h.instance.videoSubtitlesElem.style.visibility, 'hidden');
+      h.video.seeking = false; h.events.get('seeked')();
+      assert.ok(Math.abs(h.times.at(-1) - (time - 2.1 - .5)) < 1e-6);
+    }
+    assert.equal(h.requests.length, 1, 'Cached seeks within a continuity reuse the actual clock.');
+    const body = JSON.parse(h.requests[0].options.body);
+    assert.equal(body.PlaySessionId, 'fixture'); assert.equal(body.MseTimestampOffsetTicks, -79000000);
+    assert.ok(h.requests.every(r => r.url.endsWith('/Clock')));
+    assert.ok(!h.requests[0].options.body.includes('private-value'));
+  } finally { handle.dispose(); }
+  assert.equal(h.events.size, 0); assert.equal(h.renderer.setCurrentTime, native);
+  assert.equal(h.instance.videoSubtitlesElem.style.visibility, '');
+});
+
+test('external ASS ignores an obsolete clock response after a new MSE continuity', async () => {
+  const h = externalClockHarness(); let finish;
+  h.responses.push(new Promise(resolve => { finish = resolve; }));
+  const handle = h.adapter.bindExternalClock(h.options);
+  try {
+    h.instance._hlsPlayer.streamController.initPTS[0].baseTime = 864000;
+    h.events.get('timeupdate')(); await sleep(20);
+    assert.equal(h.requests[0].options.signal.aborted, true);
+    assert.ok(Math.abs(h.times.at(-1) - 974.8) < 1e-6);
+    finish({ ok: true, status: 200, json: async () => ({ TimelineOffsetTicks: 21000000 }) }); await sleep(20);
+    assert.ok(Math.abs(h.times.at(-1) - 974.8) < 1e-6);
+    h.instance._currentPlayOptions.transcodingOffsetTicks = 250000000;
+    h.events.get('timeupdate')(); await sleep(20);
+    assert.ok(Math.abs(h.times.at(-1) - 974.8) < 1e-6, 'Transcoding offset must be applied exactly once.');
+  } finally { handle.dispose(); }
+});
+
+test('external ASS waits for actual fragment origin and respects pause, rate and teardown', async () => {
+  const h = externalClockHarness(); delete h.instance._hlsPlayer.streamController.initPTS[0];
+  const handle = h.adapter.bindExternalClock(h.options);
+  try {
+    await sleep(20); assert.equal(h.requests.length, 0); assert.equal(h.renderer.paused, true);
+    h.instance._hlsPlayer.streamController.initPTS[0] = { baseTime: 711000, timescale: 90000 };
+    h.events.get('playing')(); await sleep(20);
+    h.video.paused = true; h.events.get('pause')(); assert.equal(h.renderer.paused, true);
+    h.video.playbackRate = 1.5; h.events.get('ratechange')(); assert.equal(h.renderer.rate, 1.5);
+    h.instance._strmBridgeEpoch++; h.events.get('timeupdate')();
+    assert.equal(h.instance.strmBridgeExternalClock, null); assert.equal(h.events.size, 0);
+  } finally { handle.dispose(); }
+});
+
+test('external ASS excluded sources restore host handling; native HLS never requests a clock', async () => {
+  const h = externalClockHarness(); h.responses.push({ ok: false, status: 422 });
+  const handle = h.adapter.bindExternalClock(h.options); await sleep(20);
+  assert.equal(h.instance.strmBridgeExternalClock, null); assert.equal(h.events.size, 0);
+  assert.equal(h.instance.videoSubtitlesElem.style.visibility, '');
+  assert.equal(h.renderer.paused, false, 'Live fallback resumes the worker without waiting for another playing event.');
+  assert.equal(h.renderer.rate, h.video.playbackRate);
+  assert.equal(h.times.at(-1), h.video.currentTime);
+  delete h.instance._hlsPlayer;
+  assert.equal(h.adapter.bindExternalClock(h.options), undefined);
+  assert.equal(h.requests.length, 1); handle.dispose();
+});
+
+
+test('external ASS fMP4 and unknown transports retain native timing without clock requests', () => {
+  for (const query of ['SegmentContainer=mp4', 'SegmentContainer=m4s', '']) {
+    const h = externalClockHarness(), native = h.renderer.setCurrentTime;
+    h.instance._currentPlayOptions.url = 'http://localhost/master.m3u8?PlaySessionId=fixture&' + query;
+    assert.equal(h.adapter.bindExternalClock(h.options), undefined);
+    assert.equal(h.requests.length, 0); assert.equal(h.renderer.setCurrentTime, native);
+    assert.equal(h.instance.videoSubtitlesElem.style.visibility, '');
+  }
+});
+
+
+test('external ASS transient failures are bounded and restore live host playback', async () => {
+  const h = externalClockHarness();
+  h.instance._currentSubtitleOffset = 500;
+  h.video.playbackRate = 1.5;
+  h.responses.push(...Array.from({ length: 3 }, () => ({ ok: false, status: 503 })));
+  const handle = h.adapter.bindExternalClock(h.options);
+  try {
+    for (let i = 0; i < 3; i++) {
+      await sleep(20);
+      h.advance(2000);
+      h.events.get('timeupdate')?.();
+    }
+    await sleep(20);
+    assert.equal(h.requests.length, 3);
+    assert.equal(h.instance.strmBridgeExternalClock, null);
+    assert.equal(h.instance.videoSubtitlesElem.style.visibility, '');
+    assert.equal(h.renderer.paused, false);
+    assert.equal(h.renderer.rate, 1.5);
+    assert.equal(h.times.at(-1), h.video.currentTime - .5);
+    h.renderer.onTimeUpdate(100);
+    assert.equal(h.times.at(-1), 99.5, 'Host owns the clock after retry exhaustion.');
+  } finally { handle.dispose(); }
+});
+
+test('external ASS cached calibration survives track changes and is isolated by playback identity', async () => {
+  const h = externalClockHarness();
+  let handle = h.adapter.bindExternalClock(h.options);
+  try {
+    await sleep(20); handle.dispose();
+    h.instance._strmBridgeEpoch++; h.options.epoch++;
+    h.options.track.Index = 3;
+    handle = h.adapter.bindExternalClock(h.options); await sleep(20);
+    assert.equal(h.requests.length, 1);
+    assert.ok(Math.abs(h.times.at(-1) - 973.1) < 1e-6);
+    h.options.source.Id = 'different-source';
+    h.events.get('timeupdate')(); await sleep(20);
+    assert.equal(h.requests.length, 2);
+    h.instance._currentPlayOptions.url = h.instance._currentPlayOptions.url.replace('fixture', 'next-play');
+    h.events.get('timeupdate')(); await sleep(20);
+    assert.equal(h.requests.length, 3);
+  } finally { handle.dispose(); }
+});
+
+test('external ASS teardown ignores late fallback responses and never resumes a dead renderer', async () => {
+  const h = externalClockHarness(); let finish;
+  h.responses.push(new Promise(resolve => { finish = resolve; }));
+  const handle = h.adapter.bindExternalClock(h.options);
+  const writes = h.times.length;
+  h.instance._strmBridgeEpoch++;
+  handle.dispose();
+  finish({ ok: false, status: 422 }); await sleep(20);
+  assert.equal(h.times.length, writes);
+  assert.equal(h.renderer.paused, true);
+  assert.equal(h.events.size, 0);
+});
+
+
+test('external ASS missing MSE origin has a bounded wait during playable video', () => {
+  const h = externalClockHarness(); delete h.instance._hlsPlayer.streamController.initPTS[0];
+  const handle = h.adapter.bindExternalClock(h.options);
+  h.advance(6000); h.events.get('timeupdate')();
+  assert.equal(h.instance.strmBridgeExternalClock, null);
+  assert.equal(h.instance.videoSubtitlesElem.style.visibility, '');
+  assert.equal(h.renderer.paused, false);
+  assert.equal(h.requests.length, 0);
+  handle.dispose();
+});

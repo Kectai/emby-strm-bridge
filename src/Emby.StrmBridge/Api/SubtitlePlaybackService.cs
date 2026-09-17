@@ -20,6 +20,16 @@ public sealed class CreateStrmBridgeSubtitleSession
     public long StartPositionTicks { get; set; }
     public long? EndPositionTicks { get; set; }
 }
+[Route("/StrmBridge/Subtitles/Clock", "POST")]
+public sealed class GetStrmBridgeExternalSubtitleClock
+{
+    public string Id { get; set; } = "";
+    public string MediaSourceId { get; set; } = "";
+    public string PlaySessionId { get; set; } = "";
+    public int Index { get; set; } = -1;
+    public bool NativeHlsClock { get; set; } = true;
+    public long? MseTimestampOffsetTicks { get; set; }
+}
 [Route("/StrmBridge/Subtitles/Sessions/{SessionId}/Stream", "GET")]
 public sealed class GetStrmBridgeSubtitleWindow
 {
@@ -53,6 +63,22 @@ public sealed class SubtitlePlaybackService : IService, IRequiresRequest
         catch (SubtitleBusyException) { return Error(503, "busy"); }
         catch (SubtitleProblem problem) { return Error(SubtitleRequestProcessor.ProblemStatus(problem.Reason), problem.Reason); }
         catch (ArgumentException) { return Error(400, "invalid-source"); }
+    }
+    public object Post(GetStrmBridgeExternalSubtitleClock request)
+    {
+        RequireUser();
+        var runtime = Plugin.Runtime;
+        if (runtime?.SubtitlePatch?.CanServe != true) return Error(422, "outside-scope");
+        try
+        {
+            var context = runtime.SubtitleRequests?.Resolve(Request, request, externalClock: true);
+            if (context is null) return Error(422, "outside-scope");
+            context.MseTimestampOffsetTicks = request.MseTimestampOffsetTicks;
+            var offset = runtime.Subtitles!.ReadExternalClock(context);
+            return new { TimelineOffsetTicks = offset };
+        }
+        catch (SubtitleProblem problem) { return Error(SubtitleRequestProcessor.ProblemStatus(problem.Reason), problem.Reason); }
+        catch (ArgumentException) { return Error(400, "invalid-clock"); }
     }
     public async Task<object> Get(GetStrmBridgeSubtitleWindow request)
     {

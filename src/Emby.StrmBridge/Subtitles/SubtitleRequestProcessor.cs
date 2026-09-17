@@ -38,7 +38,7 @@ internal sealed class SubtitleRequestProcessor
         this.authorization = authorization; this.results = results; this.coordinator = coordinator; this.logger = logger;
     }
 
-    internal SubtitleRequestContext? Resolve(IRequest http, object request)
+    internal SubtitleRequestContext? Resolve(IRequest http, object request, bool externalClock = false)
     {
         var operation = runtime.BeginOperation();
         var options = runtime.GetOptionsSnapshot();
@@ -65,7 +65,7 @@ internal sealed class SubtitleRequestProcessor
         var index = (int?)Property(request, "Index") ?? -1;
         var subtitle = media.MediaStreams?.FirstOrDefault(stream => stream.Type == MediaStreamType.Subtitle && stream.Index == index);
         if (subtitle is null) throw new ArgumentException("Subtitle stream unavailable.");
-        if (subtitle.IsExternal) return null;
+        if (subtitle.IsExternal != externalClock || (externalClock && !SharedSubtitleOutput.IsExternalAssTrack(subtitle))) return null;
         var codec = subtitle.Codec?.ToLowerInvariant() ?? string.Empty;
         if (codec is not ("ass" or "ssa" or "srt" or "subrip")) return null;
         var sourceItem = string.IsNullOrWhiteSpace(media.ItemId) ? item : ResolveItem(media.ItemId);
@@ -95,6 +95,7 @@ internal sealed class SubtitleRequestProcessor
             Index = index,
             StreamFingerprint = SubtitleDigest.Streams(media.MediaStreams!),
             Codec = codec,
+            IsExternal = subtitle.IsExternal,
             Start = start,
             End = end,
         };

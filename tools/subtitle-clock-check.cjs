@@ -87,5 +87,35 @@ async function check(root) {
     instance.strmBridgeSubtitle?.dispose(); body?.close();
     assert.equal(frames.size, 0); assert.ok(workers.every(w => w.terminated));
   }
+
+  // Use the actual shipped renderer API for live fallback, including a playing
+  // event swallowed during calibration. No future video event may be required.
+  let finishClock;
+  context.fetch = () => new Promise(resolve => { finishClock = resolve; });
+  video.currentTime = 101; video.seeking = false; video.paused = false;
+  const externalCanvas = element(), externalParent = element(); externalParent.appendChild(externalCanvas);
+  const external = new Octopus({ video, canvas: externalCanvas, canvasParent: externalParent, subContent: '', workerUrl: 'fixture-worker.js' });
+  const externalWorker = workers.at(-1); externalWorker.ready();
+  const externalInstance = { _strmBridgeEpoch: 2, currentSubtitlesOctopus: external, videoSubtitlesElem: element(),
+    _currentSubtitleOffset: 500, _currentPlayOptions: { url: 'http://localhost/master.m3u8?PlaySessionId=external&SegmentContainer=ts' },
+    _hlsPlayer: { streamController: { fragPlaying: { start: 0, duration: 200, cc: 0 }, initPTS: [{ baseTime: 0, timescale: 90000 }] } } };
+  const handle = adapter.bindExternalClock({ instance: externalInstance, epoch: 2, video, item: { Id: 'fixture' }, source: { Id: 'source' },
+    track: { Index: 2, IsExternal: true }, api: { getUrl: x => 'http://localhost/' + x, accessToken: () => 'fixture' } });
+  try {
+    for (const fn of events.get('playing') || []) fn();
+    assert.equal(externalWorker.messages.filter(m => m.target === 'video' && m.isPaused !== undefined).at(-1).isPaused, true);
+    finishClock({ ok: false, status: 422 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(externalInstance.strmBridgeExternalClock, null);
+    const state = externalWorker.messages.filter(m => m.target === 'video' && m.isPaused !== undefined).at(-1);
+    assert.equal(state.isPaused, false); assert.equal(state.currentTime, 100.5);
+    assert.equal(externalWorker.messages.filter(m => m.target === 'video' && m.rate !== undefined).at(-1).rate, 1.5);
+    const begin = workerSource.indexOf('self.getCurrentTime=function()'), end = workerSource.indexOf(',self.setCurrentTime=', begin);
+    const clock = { lastCurrentTime: state.currentTime, lastCurrentTimeReceivedAt: 1000, _isPaused: state.isPaused, rate: 1.5, setIsPaused() {} };
+    vm.runInNewContext(workerSource.slice(begin, end), { self: clock, Date: { now: () => 1200 }, console: quiet });
+    assert.equal(clock.getCurrentTime(), 100.8, 'Worker must continue advancing after live fallback.');
+    console.log('PASS actual Octopus external fallback restores advancing worker clock and rate: ' + path.basename(root));
+  } finally { handle.dispose(); external.dispose(); }
+
 }
 (async () => { for (const root of process.argv.slice(2)) await check(root); })().catch(e => { console.error(e); process.exitCode = 1; });

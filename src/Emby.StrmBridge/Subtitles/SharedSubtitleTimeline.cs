@@ -92,6 +92,9 @@ internal sealed class SharedSubtitleTimeline
         finally { gate.Release(); }
     }
 
+    internal long MuxDelay => muxDelay;
+    internal long MapMseOffset(long timestampOffset) => MapMseOffset(muxDelay, timestampOffset);
+
     internal static long MapMseOffset(long muxDelay, long timestampOffset)
     {
         // hls.js keeps initPTS for a continuity across FFmpeg runner restarts.
