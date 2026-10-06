@@ -76,9 +76,12 @@ static void Run(string hostDirectory, string pluginPath, string? fixtureDirector
 
     for (var cycle = 0; cycle < 2; cycle++)
     {
-        using var subtitlePatch = new SubtitlePatchHost(new PluginRuntime(), UninitializedResultFactory(), logger);
+        var resources = webDirectory is null ? null : new FixtureWebResources(webDirectory);
+        using var subtitlePatch = new SubtitlePatchHost(new PluginRuntime(), resources?.Results ?? UninitializedResultFactory(), logger);
         Require(subtitlePatch.Install(), "subtitle patch installation failed");
         Require(subtitlePatch.Install(), "subtitle repeat installation failed");
+        Require(!subtitlePatch.CanServe, "missing video hooks unexpectedly enabled subtitles");
+        resources?.CheckAliases(adapted: false);
     }
     Console.WriteLine("PASS subtitle Web patch install/dispose");
     // Optional subtitle failure or late contention must not remove the six video hooks.
@@ -96,11 +99,22 @@ static void Run(string hostDirectory, string pluginPath, string? fixtureDirector
         var foreign = HarmonyRuntimeAdapter.Select(foreignOwner, EmbeddedAssemblyLoader.EnsureHarmonyLoaded);
         try
         {
-            using (var subtitle = new SubtitlePatchHost(runtime, UninitializedResultFactory(), logger))
+            var resources = webDirectory is null ? null : new FixtureWebResources(webDirectory);
+            runtime.UpdateOptions(new Emby.StrmBridge.Configuration.PluginConfiguration { EnableSubtitles = true }, false);
+            using (var subtitle = new SubtitlePatchHost(runtime, resources?.Results ?? UninitializedResultFactory(), logger))
             {
                 Require(subtitle.Install() && subtitle.CanServe, "complete subtitle hooks not ready");
+                resources?.CheckAliases(adapted: true);
+                foreach (var (enabled, subtitles) in new[] { (false, true), (true, false) })
+                {
+                    runtime.UpdateOptions(new Emby.StrmBridge.Configuration.PluginConfiguration { Enabled = enabled, EnableSubtitles = subtitles }, false);
+                    resources?.CheckAliases(adapted: false);
+                }
+                runtime.UpdateOptions(new Emby.StrmBridge.Configuration.PluginConfiguration { EnableSubtitles = true }, false);
                 foreign.Patch(target, typeof(FixtureSubtitleConflict).GetMethod(nameof(FixtureSubtitleConflict.Prefix)));
                 Require(!subtitle.CanServe, "late foreign prefix must disable subtitle takeover");
+                resources?.CheckAliases(adapted: false);
+                resources?.CheckDelegates(SubtitlePatchHost.PlayerResource, SubtitlePatchHost.AdapterResource, HlsCompatibilityPatch.Resource);
             }
             using var unavailable = new SubtitlePatchHost(runtime, UninitializedResultFactory(), logger);
             Require(!unavailable.Install() && !unavailable.CanServe, "contended subtitle hook accepted");
@@ -111,6 +125,7 @@ static void Run(string hostDirectory, string pluginPath, string? fixtureDirector
         finally { foreign.UnpatchAll(foreignOwner); }
     }
     Console.WriteLine("PASS optional subtitle contention/failure preserves six video hooks and rejects takeover");
+    if (webDirectory is not null) Console.WriteLine("PASS virtual Web resources retain original content after missing hooks, disabled settings and late contention");
     using (var resource = typeof(Emby.StrmBridge.Plugin).Assembly.GetManifestResourceStream("Emby.StrmBridge.Subtitles.Player.js"))
     {
         Require(resource is not null, "automatic subtitle player module missing");
@@ -183,6 +198,18 @@ static void CheckSubtitleFixture(string hostDirectory, Assembly hostAssembly, st
         Require(transformed is not null && transformed.Contains("renderTracksEventsNative"), "known Web resource did not transform");
         Require(SubtitlePatchHost.Transform(original + " ") is null, "modified Web resource accepted");
         File.WriteAllText(Path.Combine(fixtureDirectory, "web-" + version + ".js"), transformed);
+        var hlsOriginal = File.ReadAllText(Path.Combine(webDirectory, HlsCompatibilityPatch.Resource));
+        var hlsPatched = HlsCompatibilityPatch.Transform(hlsOriginal);
+        Require(hlsPatched is not null, "known HLS library could not be patched");
+        Require(HlsCompatibilityPatch.Transform(hlsOriginal + " ") is null, "modified HLS library accepted");
+        File.WriteAllText(Path.Combine(fixtureDirectory, "hls-" + version + ".js"), hlsPatched);
+        Require(HlsCompatibilityPatch.CanAdapt(webDirectory), "HLS dependency chain is not verified");
+        var baseOriginal = File.ReadAllText(Path.Combine(webDirectory, HlsCompatibilityPatch.BaseResource));
+        var basePatched = HlsCompatibilityPatch.TransformBase(baseOriginal);
+        Require(basePatched is not null && basePatched.Contains(HlsCompatibilityPatch.VersionedResource), "base player did not select versioned HLS");
+        Require(HlsCompatibilityPatch.TransformBase(baseOriginal + " ") is null, "modified base player accepted");
+        Require(transformed!.Contains("./../strmbridge/basehtmlplayer-hls-v1.js"), "player retained cached base dependency");
+        File.WriteAllText(Path.Combine(fixtureDirectory, "base-" + version + ".js"), basePatched);
         Console.WriteLine("PASS exact Web resource adaptation and unknown revision guard");
     }
     if (Environment.GetEnvironmentVariable("STRM_BRIDGE_WEB_ONLY") == "1") return;
@@ -402,6 +429,81 @@ static T Uninitialized<T>() => (T)FormatterServices.GetUninitializedObject(typeo
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+// Invoke the real resource prefix in the isolated host process. The response
+// factory captures bytes/headers without starting a server or opening user media.
+public sealed class FixtureWebResources
+{
+    private readonly string directory;
+    private readonly FixtureWebService service;
+    private int statusCode;
+    private int responses;
+    public MediaBrowser.Controller.Net.IHttpResultFactory Results { get; }
+
+    public FixtureWebResources(string directory)
+    {
+        this.directory = directory;
+        var response = DispatchProxy.Create<MediaBrowser.Model.Services.IResponse, FixtureProxy>();
+        ((FixtureProxy)(object)response).Handler = (method, args) =>
+        {
+            if (method.Name == "set_StatusCode") statusCode = (int)args![0]!;
+            return null;
+        };
+        var request = DispatchProxy.Create<MediaBrowser.Model.Services.IRequest, FixtureProxy>();
+        ((FixtureProxy)(object)request).Handler = (method, _) => method.Name == "get_Response" ? response : null;
+        service = new FixtureWebService(directory, request);
+        Results = DispatchProxy.Create<MediaBrowser.Controller.Net.IHttpResultFactory, FixtureProxy>();
+        ((FixtureProxy)(object)Results).Handler = (method, args) =>
+        {
+            if (method.Name != "GetResult") throw new InvalidOperationException("Unexpected result factory call.");
+            responses++;
+            return new FixtureWebResult(Encoding.UTF8.GetString(((ReadOnlyMemory<byte>)args![1]!).Span),
+                (string)args[2]!, (IDictionary<string, string>)args[3]!);
+        };
+    }
+
+    public void CheckAliases(bool adapted)
+    {
+        foreach (var (alias, original) in new[] {
+            (HlsCompatibilityPatch.VersionedResource, HlsCompatibilityPatch.Resource),
+            (HlsCompatibilityPatch.VersionedBaseResource, HlsCompatibilityPatch.BaseResource) })
+        {
+            var source = File.ReadAllText(Path.Combine(directory, original));
+            var expected = !adapted ? source : original == HlsCompatibilityPatch.Resource
+                ? HlsCompatibilityPatch.Transform(source) : HlsCompatibilityPatch.TransformBase(source);
+            statusCode = responses = 0;
+            Task<object> result = Task.FromResult(new object());
+            if (SubtitlePatchHost.Prefix(service, new FixtureWebRequest(alias), true, ref result))
+                throw new InvalidOperationException("Virtual resource fell through to a nonexistent host file: " + alias);
+            var captured = (FixtureWebResult)result.GetAwaiter().GetResult();
+            if (responses != 1 || statusCode != 200 || captured.Content != expected ||
+                captured.ContentType != "application/javascript; charset=utf-8" || captured.Headers["Cache-Control"] != "no-store")
+                throw new InvalidOperationException("Invalid virtual resource response: " + alias);
+            // Respect an earlier prefix that has already supplied the response.
+            CheckDelegates(false, alias);
+        }
+        CheckDelegates("modules/strmbridge/not-owned.js", HlsCompatibilityPatch.VersionedResource + "/../other.js");
+    }
+
+    public void CheckDelegates(params string[] names) => CheckDelegates(true, names);
+
+    private void CheckDelegates(bool runOriginal, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            statusCode = responses = 0;
+            var previous = Task.FromResult(new object());
+            var result = previous;
+            if (!SubtitlePatchHost.Prefix(service, new FixtureWebRequest(name), runOriginal, ref result) ||
+                !ReferenceEquals(previous, result) || responses != 0 || statusCode != 0)
+                throw new InvalidOperationException("Resource delegation modified an unrelated response: " + name);
+        }
+    }
+
+    public sealed record FixtureWebService(string DashboardUIPath, MediaBrowser.Model.Services.IRequest Request);
+    public sealed record FixtureWebRequest(string ResourceName);
+    public sealed record FixtureWebResult(string Content, string ContentType, IDictionary<string, string> Headers);
 }
 
 public class LogProxy : DispatchProxy

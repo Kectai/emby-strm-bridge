@@ -148,3 +148,102 @@ async function checkExternalLoaderEpoch(version) {
  console.log('PASS stale native ASS content/font response cannot recreate a closed track '+version);
 }
 (async()=>{for(const v of ['4.9.5.0','4.10.0.40'])await checkExternalLoaderEpoch(v);})().catch(e=>{console.error(e);process.exitCode=1;});
+
+// Real host selection + playback-manager startup, with delayed HLS/metadata.
+// No native extraction should start while the intended HLS player is loading.
+async function checkLoadingSelection(version) {
+ const path=require('node:path');
+ const src=fs.readFileSync(path.join(process.argv[2] || '.local/subtitle-implementation','web-'+version+'.js'),'utf8');
+ // Supply original host web roots to exercise the manager as well as the player.
+ const root=process.argv[version.startsWith('4.9')?3:4];
+ if (!root) return;
+ const managerPath=path.join(root,'modules/common/playback/playbackmanager.js');
+ assert.ok(fs.existsSync(managerPath),'Supply both original host web roots for the startup check.');
+ const manager=fs.readFileSync(managerPath,'utf8'),starts=[],playerData={};let imports=0;
+ const scope={window:{Worker:1,ReadableStream:1,AbortController:1,TextDecoder:1},console:{log(){}},
+   isNativeLG:false,_browser:{default:{}},_htmlmediahelper:{default:{enableHlsJsPlayer:()=>true}},
+   sortMediaStreamTextTracks:()=>0,getMediaStreamSubtitleTracks:s=>s.MediaStreams,
+   removeCueEvents:()=>{},addCueEvents:()=>{},setCueAppearance:()=>{},enableChunkedResponse:()=>false,
+   _connectionmanager:{default:{getApiClient:()=>({})}},
+   Emby:{importModule:async()=>{imports++;return{render:async o=>{
+     starts.push(o.track.Index);o.instance.strmBridgeSubtitle={dispose(){}};
+   }};}},renderTracksEventsNative:()=>{throw Error('premature native subtitle fallback');},
+   subtitleTrackIndexToSetOnPlaying:-1,initialSubtitleTrackTimeout:null,clearTimeout,setTimeout,
+   HtmlVideoPlayer:function(){},getPlayerData:()=>playerData,_events:{default:{trigger(){}}}};
+ vm.createContext(scope);
+ const wrapper=src.indexOf('function strmBridgeHlsCapable('),native=src.indexOf('function renderTracksEventsNative(',wrapper);
+ vm.runInContext(src.slice(wrapper,native),scope);
+ const d=src.indexOf('function destroyCustomTrack(');vm.runInContext(src.slice(d,src.indexOf('function ',d+10)),scope);
+ const c=src.indexOf('function setTrackForCustomDisplay('),t=src.indexOf('function startInitialSubtitleTrackTimeout(',c);
+ vm.runInContext(src.slice(c,t),scope);
+ const tracks=[2,3].map(Index=>({Index,Type:'Subtitle',Codec:'ass',IsExternal:false,DeliveryMethod:'External'}));
+ const source={Container:'mkv',Protocol:'Http',MediaStreams:tracks,DefaultSubtitleStreamIndex:-1};
+ const p={_mediaElement:{textTracks:[],readyState:0},customTrackIndex:-1,setSubtitleOffset(){},
+   _currentPlayOptions:{url:'/fixture/master.m3u8',item:{Id:'fixture'},mediaSource:source}};
+ scope.self=p;
+ const setter=version.startsWith('4.9')?'self.setSubtitleStreamIndex=function(index){':'HtmlVideoPlayer.prototype.setSubtitleStreamIndex=function(index){';
+ const i=src.indexOf(setter);vm.runInContext(src.slice(i,src.indexOf('},',i)+1)+';',scope);
+ const select=version.startsWith('4.9')?p.setSubtitleStreamIndex:scope.HtmlVideoPlayer.prototype.setSubtitleStreamIndex;
+ const marker='this.boundonInitialSubtitleTrackTimeout=',j=src.indexOf(marker)+marker.length,k=src.indexOf('}.bind(this)',j)+1;
+ const startup=vm.runInContext('('+src.slice(j,k)+')',scope);
+ select.call(p,2);select.call(p,3);startup.call(p);await new Promise(setImmediate);
+ assert.equal(imports,0,'loading must not start either subtitle renderer');assert.equal(p.customTrackIndex,-1);
+ select.call(p,-1);assert.equal(scope.subtitleTrackIndexToSetOnPlaying,-1,'off cancels a queued choice without an active renderer');
+ p._hlsPlayer={};p._mediaElement.readyState=4;startup.call(p);await new Promise(setImmediate);
+ assert.deepEqual(starts,[],'cancelled startup must remain off');
+ p._mediaElement.readyState=0;select.call(p,2);select.call(p,3);startup.call(p);await new Promise(setImmediate);
+ assert.equal(imports,0,'HLS creation alone does not imply metadata/job readiness');
+ p._mediaElement.readyState=4;startup.call(p);await new Promise(setImmediate);
+ assert.deepEqual(starts,[3],'apply only the latest queued track');
+ scope.self.getPlayerState=()=>({PlayState:{}});
+ const m=manager.indexOf('function onPlaybackStarted('),n=manager.indexOf('function onPlayQueueStartedFromSelfManagingPlayer(',m);
+ assert.ok(m>=0&&n>m);vm.runInContext(manager.slice(m,n),scope);
+ await scope.onPlaybackStarted(p,{command:'fixture'},{mediaSource:source,item:{}},source,false,false);
+ assert.equal(playerData.subtitleStreamIndex,3,'startup must not reset the menu to the original off default');
+ p._started=true;p._mediaElement.readyState=0;
+ select.call(p,2);await new Promise(setImmediate);assert.deepEqual(starts,[3,2],'metadata loss after playback must not queue behind a startup callback that has already fired');
+ select.call(p,-1);await scope.onPlaybackStarted(p,{command:'fixture'},{mediaSource:source,item:{}},source,false,false);
+ assert.equal(playerData.subtitleStreamIndex,-1,'explicit off is retained by the manager');
+ // Cover every three-choice combination, including leaving and reentering
+ // bridge rendering. Native VTT tracks execute the real host selection path.
+ const external=[4,5].map(Index=>({Index,Type:'Subtitle',Codec:'subrip',DeliveryFormat:'vtt',
+   IsExternal:true,DeliveryMethod:'External',IsTextSubtitleStream:true}));
+ source.MediaStreams.push(...external);
+ p._mediaElement.textTracks=external.map(t=>({id:'textTrack'+t.Index,label:'external',mode:'disabled'}));
+ scope.destroyCustomTrack(p,p._mediaElement);
+ p._started=false;p._hlsPlayer=null;p._mediaElement.readyState=0;
+ select.call(p,2);select.call(p,4);select.call(p,-1);
+ assert.equal(source.DefaultSubtitleStreamIndex,-1,'embedded -> external -> off must not retain the external default');
+ startup.call(p);
+ assert.ok(p._mediaElement.textTracks.every(t=>t.mode==='disabled'),'startup must not reenable external subtitles after off');
+ const choices=[-1,2,3,4,5];let combinations=0;
+ for(const a of choices)for(const b of choices)for(const last of choices){
+   scope.destroyCustomTrack(p,p._mediaElement);
+   p._started=false;p._hlsPlayer=null;p._mediaElement.readyState=0;
+   source.DefaultSubtitleStreamIndex=scope.subtitleTrackIndexToSetOnPlaying=-1;
+   for(const index of [a,b,last])select.call(p,index);
+   assert.equal(source.DefaultSubtitleStreamIndex,last,'runtime default must retain the last manual choice');
+   p._hlsPlayer={};p._mediaElement.readyState=4;p._started=true;
+   startup.call(p);await new Promise(setImmediate);
+   await scope.onPlaybackStarted(p,{command:'fixture'},{mediaSource:source,item:{}},source,false,false);
+   assert.equal(playerData.subtitleStreamIndex,last,'startup menu must agree with the last manual choice');
+   assert.equal(p.customTrackIndex,last===2||last===3?last:-1);
+   for(const t of p._mediaElement.textTracks)
+     assert.equal(t.mode,t.id==='textTrack'+last?'hidden':'disabled','startup reenabled an obsolete native track');
+   combinations++;
+ }
+ // The reused player must not keep synchronization ownership for another source.
+ scope.destroyCustomTrack(p,p._mediaElement);
+ const previousDefault=source.DefaultSubtitleStreamIndex;
+ const nativeSource={Container:'mkv',Protocol:'Http',MediaStreams:external,DefaultSubtitleStreamIndex:-1};
+ p._currentPlayOptions={mediaSource:nativeSource};scope.subtitleTrackIndexToSetOnPlaying=-1;
+ select.call(p,4);
+ assert.equal(nativeSource.DefaultSubtitleStreamIndex,-1,'a source without bridge tracks retains native initialization');
+ assert.equal(scope.subtitleTrackIndexToSetOnPlaying,-1);
+ assert.equal(source.DefaultSubtitleStreamIndex,previousDefault,'the previous play source must not be modified');
+ p._currentPlayOptions=null;scope.strmBridgeSelect(p,-1);
+ assert.equal(scope.subtitleTrackIndexToSetOnPlaying,-1,'a stopped player must not retain selection ownership');
+ console.log('PASS '+combinations+' mixed embedded/external/off sequences and next-source isolation '+version);
+ console.log('PASS queued subtitle switching/off, HLS metadata readiness and actual playback-manager menu state '+version);
+}
+(async()=>{for(const v of ['4.9.5.0','4.10.0.40'])await checkLoadingSelection(v);})().catch(e=>{console.error(e);process.exitCode=1;});

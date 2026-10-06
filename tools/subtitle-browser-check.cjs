@@ -3,7 +3,7 @@ const { chromium, webkit, firefox } = require('playwright');
 const http = require('node:http'), fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const [fixture, web49, web410] = process.argv.slice(2).map(p => path.resolve(p));
 if (!fixture || !web49 || !web410) throw Error('Usage: subtitle-browser-check.cjs <fixture> <web49> <web410>');
-const player = fs.readFileSync('src/Emby.StrmBridge/Subtitles/Player.js');
+const player = fs.readFileSync(process.env.SUBTITLE_TEST_ADAPTER || 'src/Emby.StrmBridge/Subtitles/Player.js');
 const sockets = new Set(), results = [];
 let webRoot, posts = [], streamCount = 0, streamOffsets = [], coldServed = false;
 const cold = process.env.SUBTITLE_TEST_COLD === '1';
@@ -36,7 +36,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/web/index.html') {
     res.setHeader('Content-Type', 'text/html');
-    res.end('<html><body style="margin:0;background:black"><div style="position:relative;width:640px;height:360px"><video style="width:640px;height:360px" width="640" height="360" muted playsinline></video></div></body></html>'); return;
+    res.end('<html><head><link rel="stylesheet" href="/web/modules/htmlvideoplayer/style.css"></head><body style="margin:0;background:black"><div class="htmlVideoPlayerContainer"><video class="htmlvideoplayer" width="640" height="360" muted playsinline></video></div></body></html>'); return;
   }
   if (url.pathname === '/adapter.js') { res.setHeader('Content-Type', 'application/javascript'); res.end(player); return; }
   let base, relative;
@@ -46,7 +46,7 @@ const server = http.createServer(async (req, res) => {
   if (cold && relative === 'segment3.ts') { relative = 'cold.ts'; coldServed = true; }
   const file = path.resolve(base, relative);
   if (!file.startsWith(base + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404).end(); return; }
-  res.setHeader('Content-Type', ({ '.js': 'application/javascript', '.wasm': 'application/wasm', '.woff2': 'font/woff2', '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t' })[path.extname(file)] || 'application/octet-stream');
+  res.setHeader('Content-Type', ({ '.js': 'application/javascript', '.css': 'text/css', '.wasm': 'application/wasm', '.woff2': 'font/woff2', '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t' })[path.extname(file)] || 'application/octet-stream');
   if (process.env.SUBTITLE_CLOCK_TRACE && file.endsWith('subtitles-octopus-worker.js')) {
     res.end(fs.readFileSync(file, 'utf8') + ';self.addEventListener("message",function(e){if(e.data.target==="video"&&self.getCurrentTime)postMessage({target:"clock-proof",value:self.getCurrentTime(),paused:self._isPaused,rate:self.rate,at:Date.now()});});'); return;
   }
@@ -57,6 +57,12 @@ async function visible(page) {
   await page.waitForFunction(() => {
     const canvas = document.querySelector('canvas');
     if (!canvas?.width || !canvas.height) return false;
+    // Pixel data alone can pass with a canvas painted outside the viewport.
+    // A cold page has the player CSS but has never loaded the native VTT CSS.
+    const layer = canvas.parentElement.getBoundingClientRect();
+    const frame = canvas.getBoundingClientRect(), video = document.querySelector('video').getBoundingClientRect();
+    if (layer.width <= 0 || layer.height <= 0 || frame.left < video.left - 1 || frame.top < video.top - 1 ||
+        frame.right > video.right + 1 || frame.bottom > video.bottom + 1) return false;
     const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
     let pixels = 0; for (let i = 3; i < data.length; i += 4) if (data[i]) pixels++;
     return pixels > 100;
@@ -147,7 +153,7 @@ async function visible(page) {
             results.push({ engine, version, firstVisibleTime: initial.time, seekAndReselect: true, silent: true, streamingBeforeEof: true, repeatedSeeks: true, coldKeyframe: cold, forcedMse: forceMse, mseOffsets: streamOffsets });
             console.log('PASS ' + engine + ' / Emby ' + version + ': HLS + real libass/WASM, first cue, seek, late selection, silent');
           } catch (error) {
-            console.log('FAILED',engine,version,JSON.stringify(await page.evaluate(() => { const v=document.querySelector('video'),r=instance.currentSubtitlesOctopus,c=document.querySelector('canvas');return {time:v.currentTime,paused:v.paused,ready:v.readyState,canvas:c&&[c.width,c.height],workerActive:r?.workerActive,offset:r?.timeOffset,workers:window.workerEvidence,media:window.mediaEvidence}; })),errors,streamOffsets);
+            console.log('FAILED',engine,version,JSON.stringify(await page.evaluate(() => { const v=document.querySelector('video'),r=instance.currentSubtitlesOctopus,c=document.querySelector('canvas');return {time:v.currentTime,paused:v.paused,ready:v.readyState,canvas:c&&[c.width,c.height],canvasRect:c&&c.getBoundingClientRect().toJSON(),layerRect:c&&c.parentElement.getBoundingClientRect().toJSON(),videoRect:v.getBoundingClientRect().toJSON(),layerCss:c&&c.parentElement.style.cssText,workerActive:r?.workerActive,offset:r?.timeOffset,workers:window.workerEvidence,media:window.mediaEvidence}; })),errors,streamOffsets);
             await page.screenshot({path:path.join(fixture,'failed-'+engine+'-'+version+'.png')}); throw error;
           } finally { await page.evaluate(() => { window.instance?.strmBridgeSubtitle?.dispose(); window.instance?._hlsPlayer?.destroy(); }).catch(() => {}); await page.close(); }
         }

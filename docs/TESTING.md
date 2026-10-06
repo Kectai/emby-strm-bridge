@@ -90,7 +90,7 @@ On an installed 4.10.0.40 host, the 0.2.4 DLL reported all six patches ready. Pl
 <a id="implementation-gaps"></a>
 <a id="release-readiness-20260906"></a>
 
-**Release version: 0.2.6, stable channel.** Automated and actual-host offline checks cover their recorded scope. A complete live matrix across supported players and sources has not been recorded; stable-channel publication does not expand that verification coverage. Run the applicable deployment checks below with the installed build.
+**Release version: 0.2.7, stable channel.** Automated and actual-host offline checks cover their recorded scope. A complete live matrix across supported players and sources has not been recorded; stable-channel publication does not expand that verification coverage. Run the applicable deployment checks below with the installed build.
 
 | Live scenario | Required observation |
 | --- | --- |
@@ -104,6 +104,16 @@ On an installed 4.10.0.40 host, the 0.2.4 DLL reported all six patches ready. Pl
 | Thumbnail workaround | If source-limited preview reads cause stalls, disable client seek thumbnails/live previews and retest; record the setting as an acceptance condition |
 
 Record the loaded DLL identity, host/player versions, source capabilities, mode/settings and actual result for each applicable scenario. Keep private captures and signed URLs out of public reports. Compare source reads, redirect-target reads and Emby media bytes separately; HTTP 206 or a successful startup event alone does not prove correct seeking or uninterrupted playback.
+
+## Safari seek regression
+
+`Emby.HostCheck` verifies the exact player/HLS resources, rejects unknown revisions and checks virtual resource fallback when hooks or settings are unavailable. Run these checks on its exported scripts:
+
+- `node tools/hls-compat-check.cjs <transformed-hls.js> [...]`: MSE/MMS selection, seek recovery, endstreaming races and listener cleanup.
+- `node tools/hls-module-cache-check.cjs <HostCheck-output-directory>`: startup with stale host AMD modules already cached.
+- `node tools/hls-cache-browser-check.cjs <HostCheck-output-directory> <synthetic-HLS-fixture-directory> <dashboard-ui-directory>`: the actual AMD loader, video startup and seek in headless WebKit; requires Playwright and its WebKit runtime.
+
+After upgrading, reload the playback page. Live acceptance must include seeking outside the buffered range after buffering has paused, repeated forward/backward seeks and reopening playback. Synthetic MMS events do not replace actual Safari verification.
 
 ## Documentation maintenance
 
@@ -143,3 +153,9 @@ This closes the missing current-build live acceptance for the tested playback sc
 用户确认 0.2.6-preview.1 在 Emby 4.10.0.40 / Safari 中的外挂 ASS 测试正常。已安装 DLL 与验证构建校验值一致。18:49 的 HTTP MKV STRM 续播记录包含一次进度跳变；外挂字幕由宿主正常缓存读取，Clock 请求仅一次且返回 200，实际时间轴映射为 860 ms。视频任务只有一个输入、只有音视频分片输出，没有额外 ASS 提取。该次服务端及 FFmpeg 记录未见匹配的错误、限流或超时。
 
 此项确认本次片源、浏览器及操作；字幕同步的视觉结果依据用户反馈，日志验证的是实际校时路径和请求行为。其他浏览器、两版宿主及反复跳转仍以各自的合成回归记录为依据，不将此次单样本验收泛化到所有片源。
+
+## Subtitle selection during startup
+
+Pass both original Web roots after the fixture directory to `tools/subtitle-web-check.cjs`. Each host runs all 125 three-choice combinations across two embedded tracks, two external tracks and Off, checking delayed startup, menu state and isolation from the next source.
+
+The browser check uses the actual player CSS without preloading VTT styles and requires visible pixels within a nonzero video overlay. Live acceptance starts in a new page with subtitles off: select subtitles while loading, switch between embedded/external/Off, then verify rendering and the menu without resizing or opening developer tools.

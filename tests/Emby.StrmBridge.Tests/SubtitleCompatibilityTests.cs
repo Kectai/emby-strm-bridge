@@ -12,6 +12,12 @@ public sealed class SubtitleCompatibilityTests
     public void UnknownWebResourcesAreNeverRewritten() => Assert.IsNull(SubtitlePatchHost.Transform("function renderAssSsa(){}"));
 
     [TestMethod]
+    public void UnknownHlsResourcesAreNeverRewritten() => Assert.IsNull(HlsCompatibilityPatch.Transform("preferManagedMediaSource:!0,"));
+
+    [TestMethod]
+    public void UnknownHlsBaseResourcesAreNeverRewritten() => Assert.IsNull(HlsCompatibilityPatch.TransformBase("Emby.importModule(\"./modules/hlsjs/hls.js\")"));
+
+    [TestMethod]
     public void MissingPlaybackInputs_NeverNegotiatesSharedHls()
     {
         using var runtime = new PluginRuntime();

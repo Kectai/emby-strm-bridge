@@ -506,6 +506,12 @@ define([], function () {
       if (!active()) { dispose(); return; }
       container = document.createElement('div');
       container.className = 'videoSubtitles htmlvideo-subtitles-canvas-parent flex align-items-flex-start justify-content-center';
+      // This branch never loads the host's VTT module/styles. Give our overlay
+      // its own video-sized bounds before Octopus measures it; otherwise the
+      // absolute canvas leaves a zero-sized, incorrectly anchored parent on a
+      // cold page. Do not rely on a later viewport resize to realign subtitles.
+      container.style.top = container.style.right = container.style.bottom = container.style.left = '0';
+      container.style.pointerEvents = 'none';
       video.parentNode.appendChild(container); instance.videoSubtitlesElem = container;
       var canvas = document.createElement('canvas'); canvas.className = 'htmlvideo-subtitles-canvas'; container.appendChild(canvas);
       var fonts = (options.source.MediaStreams || []).filter(function (s) { return s.Type === 'Attachment' && s.DeliveryUrl && /^(ttf|otf|)$/i.test(s.Codec || ''); })

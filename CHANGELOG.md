@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.7 — 2026-10-06
+
+- Fix Safari playback remaining stuck after seeking outside the buffered range.
+- Keep subtitle choices made during video loading, including turning subtitles off.
+- Fix embedded subtitles appearing only after a window resize on a freshly opened Web player.
+- Preserve Web player loading when optional subtitle integration becomes unavailable.
+
 ## 0.2.6 — 2026-09-17
 
 - Keep external subtitle frames ordered during seeks and replace newer frames produced in the same millisecond.

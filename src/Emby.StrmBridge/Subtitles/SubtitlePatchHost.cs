@@ -120,9 +120,16 @@ internal sealed class SubtitlePatchHost : IDisposable
     public static bool Prefix(object __instance, object __0, bool __runOriginal, ref Task<object> __result)
     {
         var handler = Volatile.Read(ref active);
-        if (!__runOriginal || handler is null || !handler.CanServe) return true;
+        if (!__runOriginal || handler is null) return true;
         var name = __0.GetType().GetProperty("ResourceName")?.GetValue(__0) as string;
-        if (name != PlayerResource && name != AdapterResource) return true;
+        var virtualResource = name == HlsCompatibilityPatch.VersionedResource || name == HlsCompatibilityPatch.VersionedBaseResource;
+        if (name != PlayerResource && name != AdapterResource && name != HlsCompatibilityPatch.Resource &&
+            !virtualResource) return true;
+        // Already loaded pages still depend on these aliases after optional
+        // subtitle hooks become unavailable. Keep serving original host scripts,
+        // while stopping all adaptation and leaving native resource routes alone.
+        var canServe = handler.CanServe;
+        if (!canServe && !virtualResource) return true;
         try
         {
             var request = __instance.GetType().GetProperty("Request")?.GetValue(__instance) as IRequest;
@@ -137,15 +144,31 @@ internal sealed class SubtitlePatchHost : IDisposable
             else
             {
                 var options = handler.runtime.GetOptionsSnapshot();
-                if (!options.Enabled || !options.EnableSubtitles) return true;
+                var enabled = canServe && options.Enabled && options.EnableSubtitles;
+                if (!enabled && !virtualResource) return true;
                 var directory = (string)__instance.GetType().GetProperty("DashboardUIPath")!.GetValue(__instance)!;
-                var path = Path.Combine(directory, PlayerResource.Replace('/', Path.DirectorySeparatorChar));
+                // Do not make the player depend on virtual resources unless the
+                // whole dependency chain is verified for this host installation.
+                if (name == PlayerResource && !HlsCompatibilityPatch.CanAdapt(directory))
+                { Volatile.Write(ref handler.resourceStatus, "Unsupported"); handler.logger.Warn("STRM_BRIDGE_HLS_RESOURCE_UNSUPPORTED"); return true; }
+                var sourceName = name == HlsCompatibilityPatch.VersionedResource ? HlsCompatibilityPatch.Resource :
+                    name == HlsCompatibilityPatch.VersionedBaseResource ? HlsCompatibilityPatch.BaseResource : name!;
+                var path = Path.Combine(directory, sourceName.Replace('/', Path.DirectorySeparatorChar));
                 if (!File.Exists(path) || new FileInfo(path).Length > 1024 * 1024) return true;
                 var source = File.ReadAllText(path);
-                var transformed = Transform(source);
+                var isHls = sourceName == HlsCompatibilityPatch.Resource || sourceName == HlsCompatibilityPatch.BaseResource;
+                var transformed = !enabled ? source : sourceName == HlsCompatibilityPatch.Resource ? HlsCompatibilityPatch.Transform(source) :
+                    sourceName == HlsCompatibilityPatch.BaseResource ? HlsCompatibilityPatch.TransformBase(source) : Transform(source);
+                // A previously loaded player can still request its virtual
+                // dependency after settings/host files change. Retain native loading.
+                if (transformed is null && virtualResource) transformed = source;
                 if (transformed is null)
-                { Volatile.Write(ref handler.resourceStatus, "Unsupported"); handler.logger.Warn("STRM_BRIDGE_SUBTITLE_WEB_RESOURCE_UNSUPPORTED"); return true; }
-                Volatile.Write(ref handler.resourceStatus, "Ready");
+                {
+                    if (!isHls) Volatile.Write(ref handler.resourceStatus, "Unsupported");
+                    handler.logger.Warn(isHls ? "STRM_BRIDGE_HLS_RESOURCE_UNSUPPORTED" : "STRM_BRIDGE_SUBTITLE_WEB_RESOURCE_UNSUPPORTED");
+                    return true;
+                }
+                if (!isHls) Volatile.Write(ref handler.resourceStatus, "Ready");
                 content = Encoding.UTF8.GetBytes(transformed);
             }
             request.Response.StatusCode = 200;
@@ -161,6 +184,7 @@ internal sealed class SubtitlePatchHost : IDisposable
         var digest = SubtitleDigest.Compute(source);
         var is49 = digest == "203a794fdd9fb401cade4d95af93bc33167c12aabf64ae9533caa571e15a548c";
         if (!is49 && digest != "4ac47f6b4f7c2d87b4e8db8a2ea6442cc6dc075c22bdd5e6161c5a5bbc900702") return null;
+        source = source.Replace("./../htmlvideoplayer/basehtmlplayer.js", "./../strmbridge/basehtmlplayer-hls-v1.js");
         var arguments = "instance,videoElement,track,item,mediaSource" + (is49 ? "" : ",signal");
         var anchor = "function renderTracksEvents(" + arguments + "){";
         var destruction = "function destroyCustomTrack(instance,videoElement){";
@@ -170,7 +194,13 @@ internal sealed class SubtitlePatchHost : IDisposable
             "HtmlVideoPlayer.prototype.setSubtitleStreamIndex=function(index){";
         if (source.IndexOf(externalAnchor, StringComparison.Ordinal) < 0 || source.IndexOf(anchor, StringComparison.Ordinal) < 0 || source.IndexOf(destruction, StringComparison.Ordinal) < 0 || source.IndexOf(selection, StringComparison.Ordinal) < 0 || source.IndexOf(manualSelection, StringComparison.Ordinal) < 0) return null;
         var candidate = "function strmBridgeCandidate(track,mediaSource){return strmBridgeHlsCapable(mediaSource)&&track&&mediaSource&&!track.IsExternal&&track.DeliveryMethod===\"External\"&&/^(ass|ssa|srt|subrip)$/i.test(track.Codec||\"\")&&String(mediaSource.Container).toLowerCase()===\"mkv\"&&String(mediaSource.Protocol).toLowerCase()===\"http\";}";
-        var synchronizeSelection = "function strmBridgeSelect(instance,index){var play=instance._currentPlayOptions;var track=play&&(play.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===index;})[0];if(instance.strmBridgeSubtitle||strmBridgeCandidate(track,play&&play.mediaSource)){subtitleTrackIndexToSetOnPlaying=index;if(initialSubtitleTrackTimeout){clearTimeout(initialSubtitleTrackTimeout);initialSubtitleTrackTimeout=null;}}}";
+        // Keep all manual choices (including external/off) synchronized for the
+        // current bridge-capable source, even after its renderer is released.
+        // Derive scope from the current play options, not the selected track or
+        // sticky player state, so an external/off hop cannot lose the choice and
+        // a later source cannot inherit it. The host rereads this per-play default
+        // in onPlaybackStarted; no user preference or library metadata is changed.
+        var synchronizeSelection = "function strmBridgeSelect(instance,index){var play=instance._currentPlayOptions;if(!play)return;var source=play.mediaSource;if(instance.strmBridgeSubtitle||(source.MediaStreams||[]).some(function(t){return t.Type===\"Subtitle\"&&strmBridgeCandidate(t,source);})){subtitleTrackIndexToSetOnPlaying=index;source.DefaultSubtitleStreamIndex=index;if(initialSubtitleTrackTimeout){clearTimeout(initialSubtitleTrackTimeout);initialSubtitleTrackTimeout=null;}}}";
         var wrapper = candidate + synchronizeSelection + "function renderTracksEvents(" + arguments + "){var epoch=instance._strmBridgeEpoch=(instance._strmBridgeEpoch||0)+1;" +
             "function fallback(){if(instance._strmBridgeEpoch===epoch)return renderTracksEventsNative(" + arguments + ");}" +
             "if(!strmBridgeCandidate(track,mediaSource))return fallback();" +
@@ -207,10 +237,13 @@ internal sealed class SubtitlePatchHost : IDisposable
         var profileAnchor = "_basehtmlplayer.default.call(this),";
         if (source.IndexOf(profileAnchor, StringComparison.Ordinal) < 0) return null;
         var profileWrapper = "function strmBridgeHlsCapable(mediaSource){return window.Worker&&window.ReadableStream&&window.AbortController&&window.TextDecoder&&!_browser.default.chromecast&&_htmlmediahelper.default.enableHlsJsPlayer(mediaSource?mediaSource.RunTimeTicks:null,\"Video\");}function strmBridgeInstallProfile(instance){var getProfile=instance.getDeviceProfile;instance.getDeviceProfile=function(){return getProfile.apply(this,arguments).then(function(profile){if(!strmBridgeHlsCapable(null))return profile;return Object.assign({},profile,{Name:\"" + SharedSubtitleNegotiation.ProfileName + "\"});});};}";
+        // Initial addtrack/manual events can precede HLS creation and metadata.
+        // Let the existing onStartedPlaying hook apply the queued choice instead
+        // of falling back to native extraction and caching a false selected state.
         return source.Replace(initialAnchor, initialAnchor +
             "var sbPlay=instance._currentPlayOptions,sbTrack=sbPlay&&(sbPlay.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===subtitleTrackIndexToSetOnPlaying;})[0];if(strmBridgeCandidate(sbTrack,sbPlay&&sbPlay.mediaSource)){if(initialSubtitleTrackTimeout){clearTimeout(initialSubtitleTrackTimeout);initialSubtitleTrackTimeout=null;}setCurrentTrackElement(instance,instance._mediaElement,subtitleTrackIndexToSetOnPlaying,sbPlay);return;}").Replace(externalAnchor, externalWrapper).Replace(anchor, profileWrapper + wrapper).Replace(profileAnchor, profileAnchor + "strmBridgeInstallProfile(this),").Replace(manualSelection, manualSelection +
             "strmBridgeSelect(" + (is49 ? "self" : "this") + ",index);").Replace(selection, selection +
-            "if(currentPlayOptions&&mediaElement){var sbTrack=(currentPlayOptions.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===streamIndex;})[0];if(strmBridgeCandidate(sbTrack,currentPlayOptions.mediaSource)){instance.setSubtitleOffset(0);for(var sbI=0;sbI<mediaElement.textTracks.length;sbI++){var sbT=mediaElement.textTracks[sbI];sbT.mode=\"disabled\";removeCueEvents(instance,sbT);}setTrackForCustomDisplay(instance,mediaElement,sbTrack);return;}}").Replace(destruction, destruction +
+            "if(currentPlayOptions&&mediaElement){var sbTrack=(currentPlayOptions.mediaSource.MediaStreams||[]).filter(function(t){return t.Type===\"Subtitle\"&&t.Index===streamIndex;})[0];if(strmBridgeCandidate(sbTrack,currentPlayOptions.mediaSource)){if(!instance._started&&(currentPlayOptions.url||\"\").indexOf(\".m3u8\")!==-1&&(!instance._hlsPlayer||mediaElement.readyState<1))return;instance.setSubtitleOffset(0);for(var sbI=0;sbI<mediaElement.textTracks.length;sbI++){var sbT=mediaElement.textTracks[sbI];sbT.mode=\"disabled\";removeCueEvents(instance,sbT);}setTrackForCustomDisplay(instance,mediaElement,sbTrack);return;}}").Replace(destruction, destruction +
             "instance._strmBridgeEpoch=(instance._strmBridgeEpoch||0)+1;if(instance.strmBridgeExternalClock){instance.strmBridgeExternalClock.dispose();instance.strmBridgeExternalClock=null;}if(instance.strmBridgeSubtitle){instance.strmBridgeSubtitle.dispose();instance.strmBridgeSubtitle=null;}");
     }
     public void Dispose()
